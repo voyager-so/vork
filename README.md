@@ -456,10 +456,6 @@ vork --version
 vork help
 ```
 
-These dependency commands are for Ubuntu with sudo. In a root container, omit
-`sudo`; without administrator access, arrange for the dependencies to be installed.
-The installer itself runs in your user account without root.
-
 The installer verifies SHA256SUMS, installs under `%LOCALAPPDATA%\Programs\vork`,
 runs `vork setup`, and adds that folder to your user PATH so new windows find `vork`;
 the `$env:Path` line above covers the current one. `VORK_NO_MODIFY_PATH=1` or a custom
@@ -478,10 +474,10 @@ Add that folder to your user PATH, open a new PowerShell window, and run
 with no output until `Shader setup completed`; that isn't a hang. Keep all bundled
 runtime companions beside the executable.
 
-The separately downloadable `install.sh` downloads the release from GitHub; to install an archive you already
-have without downloading again, use the manual steps below.
-
 ### Manual archive install (Linux or Mac)
+
+The separately downloadable `install.sh` downloads the release from GitHub; to install an archive you already
+have without downloading again, use these steps.
 
 Download your platform's `.tar.gz` and `SHA256SUMS` from the release page into a
 new empty folder. In that folder, verify and install the entire archive:
