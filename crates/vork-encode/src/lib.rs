@@ -10,6 +10,8 @@
 mod constants;
 pub mod gpu_memory;
 mod pipe;
+#[cfg(target_os = "linux")]
+mod vaapi;
 pub use vork_time::Time;
 use anyhow::{Context, Result, ensure};
 use constants::*;
@@ -247,6 +249,8 @@ impl PreparedEncoder {
             }
         }
         let mut codec = "libx264";
+        #[cfg(target_os = "linux")]
+        let mut vaapi_device = None;
         #[cfg(target_os = "macos")]
         if !prores && matches!(gpu.backend, Backend::HardwareReadback) {
             codec = "h264_videotoolbox";
@@ -262,12 +266,27 @@ impl PreparedEncoder {
                 }
             }
         }
+        // AMD has no NVENC; FFmpeg's VAAPI encoder is the hardware equivalent.
+        #[cfg(target_os = "linux")]
+        if !prores && codec == "libx264" {
+            match vaapi::probe(width, height) {
+                Ok(device) => {
+                    codec = "h264_vaapi";
+                    vaapi_device = Some(device);
+                }
+                Err(error) => eprintln!("FFmpeg VAAPI unavailable; using software libx264: {error:#}"),
+            }
+        }
         if prores {
             codec = "prores_ks";
         }
         require_ffmpeg_encoder(codec)?;
         eprintln!("Video encoder: FFmpeg {codec} (readback)");
         let mut command = Command::new("ffmpeg");
+        #[cfg(target_os = "linux")]
+        if let Some(device) = &vaapi_device {
+            command.args(vaapi::device_arguments(device));
+        }
         command.args([
             "-v",
             "error",
@@ -309,10 +328,21 @@ impl PreparedEncoder {
             command.args(["-b:v", &settings.hardware_bitrate.to_string()]);
         }
         // Set both frame and stream properties: encoders may prefer the
-        // converted frame's colour tags over the output codec options.
+        // converted frame's colour tags over the output codec options. VAAPI
+        // converts to NV12 and uploads inside the same filter chain.
+        let mut filter = String::from(
+            "scale=out_color_matrix=bt709:out_range=tv,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+        );
+        #[cfg(target_os = "linux")]
+        let hardware_frames = vaapi_device.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let hardware_frames = false;
+        if hardware_frames {
+            filter.push_str(",format=nv12,hwupload");
+        }
         command.args([
             "-vf",
-            "scale=out_color_matrix=bt709:out_range=tv,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
+            filter.as_str(),
             "-color_range",
             "tv",
             "-color_primaries",
@@ -322,14 +352,18 @@ impl PreparedEncoder {
             "-colorspace",
             "bt709",
         ]);
-        let mut child = command
-            .args([
+        if !hardware_frames {
+            command.args([
                 "-pix_fmt",
                 if prores {
                     PRORES_PIXEL_FORMAT
                 } else {
                     "yuv420p"
                 },
+            ]);
+        }
+        let mut child = command
+            .args([
                 "-bf",
                 "0",
                 "-g",
@@ -394,6 +428,11 @@ pub fn probe_ffmpeg_nvenc(width: u32, height: u32) -> Result<()> {
     ensure!(output.status.success(), "FFmpeg h264_nvenc initialization failed ({}): {}",
         output.status, String::from_utf8_lossy(&output.stderr).trim());
     Ok(())
+}
+/// Test FFmpeg's VAAPI against the installed driver, returning the render node it used.
+#[cfg(target_os = "linux")]
+pub fn probe_ffmpeg_vaapi(width: u32, height: u32) -> Result<std::path::PathBuf> {
+    vaapi::probe(width, height)
 }
 
 // Check before opening the rawvideo pipe so codec errors retain their cause.

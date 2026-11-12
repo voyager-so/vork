@@ -463,8 +463,11 @@ A custom `PREFIX` leaves startup files alone unless you also set `VORK_MODIFY_PA
 which adds `PREFIX/bin` using the same shell startup files as the default install.
 For example: `PREFIX="$HOME/tools/vork" VORK_MODIFY_PATH=1 sh install.sh`.
 `VORK_NO_MODIFY_PATH=1` always prevents PATH edits, including when opt-in is set. Linux MP4 needs ffmpeg even when NVENC encodes frames, because ffmpeg
-muxes the stream. Native NVENC is attempted on NVIDIA; otherwise encoding uses a
-readback fallback. Older GPUs and software Vulkan adapters are unsupported.
+muxes the stream. Native NVENC is attempted on NVIDIA; on AMD, FFmpeg VAAPI
+(h264_vaapi) is used when the first `ffmpeg` on PATH provides it, with libx264 as
+fallback, and `VORK_VAAPI_DEVICE=/dev/dri/renderDNNN` selects the render node;
+otherwise encoding uses a readback fallback. Older GPUs and software Vulkan
+adapters are unsupported.
 A100, H100, H200, B200 and B300 lack the required hardware ray tracing; recency
 alone does not make an NVIDIA GPU suitable. Containers also need working NVIDIA
 Vulkan driver discovery; passing through a GPU alone may not be sufficient.

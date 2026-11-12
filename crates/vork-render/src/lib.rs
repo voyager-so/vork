@@ -565,7 +565,7 @@ impl Renderer {
             }
         }
         if cfg!(target_os = "linux") {
-            report!("Video: native NVENC is attempted on NVIDIA; FFmpeg readback encoding is the fallback. Native encoder initialization is checked when opening video output.");
+            report!("Video: native NVENC is attempted on NVIDIA; AMD uses FFmpeg VAAPI when the installed FFmpeg provides it, otherwise libx264 readback. Encoder initialization is checked when opening video output.");
         }
         if cfg!(target_os = "windows") {
             report!("Video: FFmpeg NVENC after readback when usable; otherwise software libx264. MOV uses software prores_ks.");
@@ -582,6 +582,11 @@ impl Renderer {
                     } else {
                         report!("FFmpeg h264_nvenc: not installed; readback MP4 uses libx264 if available");
                     }
+                }
+                #[cfg(target_os = "linux")]
+                if self.adapter_info.vendor != constants::NVIDIA_VENDOR_ID {
+                    if listing.contains("h264_vaapi") { tool_report::encoder_probe(out, "FFmpeg h264_vaapi", vork_encode::probe_ffmpeg_vaapi(256, 256).map(|_| ()), verbose)?; }
+                    else { report!("FFmpeg h264_vaapi: not installed; readback MP4 uses libx264 if available"); }
                 }
                 report!("FFmpeg libx264: {}; {}", if listing.contains("libx264") { "fallback available (listed; initialization checked when opening output)" } else if cfg!(target_os = "macos") { "libx264 fallback absent (optional; native VideoToolbox MP4 needs no FFmpeg)" } else { "WARNING: libx264 missing; install ffmpeg with libx264 (Windows: ffmpeg-release-essentials.zip from https://www.gyan.dev/ffmpeg/builds/) and add bin to PATH" }, if cfg!(target_os = "linux") { "required for MP4 muxing, including native NVENC" } else if cfg!(target_os = "macos") { "optional for native VideoToolbox MP4" } else { "required for MP4/MOV" });
                 report!("FFmpeg prores_ks: {}", if listing.contains("prores_ks") { "MOV available (listed; initialization checked when opening output)" } else { "prores_ks unavailable; install an ffmpeg build with prores_ks" });
