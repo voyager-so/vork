@@ -528,7 +528,7 @@ pub(crate) fn adapter_help() -> &'static str {
     } else if cfg!(target_os = "windows") {
         "No supported ray-tracing GPU. For slow CPU rendering, install a Vulkan loader and a recent Mesa lavapipe Vulkan driver (with its ICD manifest), then set VORK_GPU=cpu (or --gpu cpu). Windows CPU rendering has not been qualified."
     } else {
-        "No supported ray-tracing GPU. For slow CPU rendering, install recent Mesa Vulkan drivers (mesa-vulkan-drivers on Debian/Ubuntu; mesa-vulkan-drivers or vulkan-swrast elsewhere) and set VORK_GPU=cpu (or --gpu cpu)."
+        "No supported ray-tracing GPU (NVIDIA, or AMD on a Vulkan driver with ray queries such as Mesa RADV). For slow CPU rendering, install recent Mesa Vulkan drivers (mesa-vulkan-drivers on Debian/Ubuntu; mesa-vulkan-drivers or vulkan-swrast elsewhere) and set VORK_GPU=cpu (or --gpu cpu)."
     }
 }
 

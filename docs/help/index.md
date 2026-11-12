@@ -1,5 +1,5 @@
 vork — headless 3D rendering from scene JSON.
-Supported GPUs: Apple Silicon (Metal) and recent NVIDIA (Vulkan).
+Supported GPUs: Apple Silicon (Metal), recent NVIDIA (Vulkan), and AMD GPUs on a Vulkan driver that exposes ray queries and storage buffer arrays (tested with Mesa RADV on RDNA3).
 Linux CPU rendering: opt in with --gpu cpu or VORK_GPU=cpu; see vork help limits.
 Unknown fields are errors; omit anything at its default.
 

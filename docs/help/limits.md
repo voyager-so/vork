@@ -1,6 +1,7 @@
 LIMITS
-Supported GPUs: Apple Silicon Metal and recent NVIDIA Vulkan with hardware ray
-tracing and storage buffer arrays. AMD and Intel GPUs are unsupported.
+Supported GPUs: Apple Silicon Metal, recent NVIDIA Vulkan and AMD Vulkan with
+hardware ray tracing and storage buffer arrays (tested on Mesa RADV, RDNA3).
+Intel GPUs are unsupported.
 CPU rendering requires the explicit opt-in below. Run vork setup to check the
 adapter. Windows x64 ships install.ps1;
 macOS and Linux provide install.sh as a separate release asset.
@@ -48,8 +49,9 @@ transmitted shadows, light off-axis receivers, or test scattered-direction block
 
 On Apple Silicon, solid glass and heavy interiors can still abort with exit code 4
 and "Impacting Interactivity". A retry can succeed; lower resolution is not a reliable
-fix. For thin panes use geometry_thin_walled: true. Try std/path or a supported NVIDIA
-GPU for repeated failures; path is slower and is not a universal workaround.
+fix. For thin panes use geometry_thin_walled: true. Try std/path or a supported
+NVIDIA or AMD GPU for repeated failures; path is slower and is not a universal
+workaround.
 Dense imported transmitting geometry has not been qualified on Metal. Large scenes
 with dense transparency can lose the device in final even at small resolutions;
 try path and test the full shot before committing to a batch.

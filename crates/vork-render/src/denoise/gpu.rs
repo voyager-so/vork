@@ -13,6 +13,70 @@ const EXTERNAL_HANDLE: ash::vk::ExternalMemoryHandleTypeFlags = ash::vk::Externa
 const OIDN_EXTERNAL_TYPE: u32 = 1;
 #[cfg(target_os = "windows")]
 const OIDN_EXTERNAL_TYPE: u32 = 4;
+// OIDN device types that can share Vulkan memory, most preferred first. CUDA
+// stays first so NVIDIA hosts keep selecting the backend they used before;
+// HIP follows on Linux so AMD hosts can use the same zero-copy path.
+#[cfg(target_os = "linux")]
+const GPU_BACKENDS: &[(i32, &str, Identity)] = &[
+    (3, "CUDA", Identity::VulkanUuid),
+    (4, "HIP", Identity::PciAddress),
+];
+#[cfg(target_os = "windows")]
+const GPU_BACKENDS: &[(i32, &str, Identity)] = &[(3, "CUDA", Identity::VulkanUuid)];
+#[cfg(target_os = "linux")]
+const GPU_BACKENDS_LABEL: &str = "CUDA or HIP";
+#[cfg(target_os = "windows")]
+const GPU_BACKENDS_LABEL: &str = "CUDA";
+
+/// How an OIDN backend names the renderer's adapter.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Identity {
+    /// The backend reports the 16-byte UUID Vulkan exposes (CUDA).
+    VulkanUuid,
+    /// OIDN's HIP backend names an AMD device by its hardware UUID, which RADV
+    /// does not expose (RADV derives its own Vulkan UUID), so HIP devices are
+    /// matched by PCI address, which both OIDN and VK_EXT_pci_bus_info report.
+    #[cfg(target_os = "linux")]
+    PciAddress,
+}
+
+/// `domain:bus:device.function`, the PCI address spelling used in diagnostics.
+#[cfg(target_os = "linux")]
+fn pci_bdf(address: [u32; 4]) -> String {
+    format!("{:04x}:{:02x}:{:02x}.{:x}", address[0], address[1], address[2], address[3])
+}
+
+/// A zero PCI address means the driver left the properties unset; no real
+/// device lives at 0000:00:00.0.
+#[cfg(target_os = "linux")]
+fn set_pci(address: [u32; 4]) -> Option<[u32; 4]> {
+    (address != [0; 4]).then_some(address)
+}
+
+/// The adapter's `domain:bus:device.function`, if its Vulkan driver reports it
+/// through VK_EXT_pci_bus_info. An all-zero address means the driver left the
+/// struct unset, so it yields `None`.
+#[cfg(target_os = "linux")]
+fn adapter_pci(instance: &ash::Instance, physical: ash::vk::PhysicalDevice) -> Option<[u32; 4]> {
+    let mut pci = ash::vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+    let mut properties = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut pci);
+    unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+    set_pci([pci.pci_domain, pci.pci_bus, pci.pci_device, pci.pci_function])
+}
+
+/// The physical device's `domain:bus:device.function`, if OIDN reports it.
+/// Only the HIP backend populates this; CUDA devices may leave it unset.
+#[cfg(target_os = "linux")]
+fn oidn_pci(api: &Api, index: i32) -> Option<[u32; 4]> {
+    if unsafe { (api.physical_int)(index, c"pciAddressSupported".as_ptr()) } == 0 { return None; }
+    Some([
+        unsafe { (api.physical_int)(index, c"pciDomain".as_ptr()) } as u32,
+        unsafe { (api.physical_int)(index, c"pciBus".as_ptr()) } as u32,
+        unsafe { (api.physical_int)(index, c"pciDevice".as_ptr()) } as u32,
+        unsafe { (api.physical_int)(index, c"pciFunction".as_ptr()) } as u32,
+    ])
+}
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
 unsafe extern "system" { fn CloseHandle(handle: Handle) -> i32; }
@@ -52,21 +116,47 @@ pub(super) fn select(api: &Api, r: &Renderer) -> std::result::Result<Handle, Str
         let mut id = vk::PhysicalDeviceIDProperties::default();
         let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
         unsafe { instance.get_physical_device_properties2(hal.raw_physical_device(), &mut properties); }
-        for index in 0..unsafe { (api.physical_count)() } {
-            if unsafe { (api.physical_int)(index, c"type".as_ptr()) } != 3 { continue; }
-            let mut bytes = 0;
-            let uuid = unsafe { (api.physical_data)(index, c"uuid".as_ptr(), &mut bytes) };
-            if bytes == 16 && !uuid.is_null() && unsafe { std::slice::from_raw_parts(uuid.cast::<u8>(), 16) } == id.device_uuid {
-                let handle = committed(unsafe { (api.new_by_id)(index) }, "CUDA")?;
+        #[cfg(target_os = "linux")]
+        let adapter = adapter_pci(instance, hal.raw_physical_device());
+        let count = unsafe { (api.physical_count)() };
+        #[cfg(target_os = "linux")]
+        let mut hip_seen = false;
+        for &(device_type, label, identity) in GPU_BACKENDS {
+            for index in 0..count {
+                if unsafe { (api.physical_int)(index, c"type".as_ptr()) } != device_type { continue; }
+                #[cfg(target_os = "linux")]
+                if device_type == 4 { hip_seen = true; }
+                let matching = match identity {
+                    Identity::VulkanUuid => {
+                        let mut bytes = 0;
+                        let uuid = unsafe { (api.physical_data)(index, c"uuid".as_ptr(), &mut bytes) };
+                        if bytes != 16 || uuid.is_null() { continue; }
+                        let uuid = unsafe { std::slice::from_raw_parts(uuid.cast::<u8>(), 16) };
+                        uuid == id.device_uuid
+                    }
+                    #[cfg(target_os = "linux")]
+                    Identity::PciAddress => adapter.is_some() && oidn_pci(api, index) == adapter,
+                };
+                if !matching { continue; }
+                let handle = committed(unsafe { (api.new_by_id)(index) }, label)?;
                 let supported = unsafe { (api.device_int)(handle, c"externalMemoryTypes".as_ptr()) };
                 if supported as u32 & OIDN_EXTERNAL_TYPE == 0 {
                     unsafe { (api.release_device)(handle); }
-                    return Err("OIDN's CUDA device cannot import Vulkan memory".into());
+                    return Err(format!("OIDN's {label} device cannot import Vulkan memory"));
                 }
                 return Ok(handle);
             }
         }
-        return Err("OIDN found no CUDA device matching it".into());
+        #[cfg(target_os = "linux")]
+        return Err(match adapter {
+            Some(address) if hip_seen =>
+                format!("OIDN found no {GPU_BACKENDS_LABEL} device matching it at PCI {}", pci_bdf(address)),
+            Some(address) =>
+                format!("OIDN found no {GPU_BACKENDS_LABEL} device matching it at PCI {}; for AMD, OIDN's HIP backend needs the ROCm runtime", pci_bdf(address)),
+            None => format!("OIDN found no {GPU_BACKENDS_LABEL} device matching it; its Vulkan driver reports no PCI address (VK_EXT_pci_bus_info)"),
+        });
+        #[cfg(target_os = "windows")]
+        return Err(format!("OIDN found no {GPU_BACKENDS_LABEL} device matching it"));
     }
     #[cfg(target_os = "macos")]
     if let Some(hal) = unsafe { r.device.as_hal::<wgpu::hal::api::Metal>() } {
@@ -448,5 +538,37 @@ mod tests {
         }
         }
         Ok(())
+    }
+}
+
+#[cfg(all(test, any(target_os = "linux", target_os = "windows")))]
+mod backend_tests {
+    use super::*;
+
+    #[test]
+    fn cuda_remains_the_preferred_backend() {
+        assert_eq!(GPU_BACKENDS.first().map(|(kind, ..)| *kind), Some(3),
+            "NVIDIA hosts must keep selecting CUDA before any other backend");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn hip_backend_is_registered_on_linux() {
+        assert!(GPU_BACKENDS.iter().any(|&(kind, ..)| kind == 4),
+            "AMD hosts need OIDN's HIP device type");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pci_bdf_formats_the_device_address() {
+        assert_eq!(pci_bdf([0, 3, 0, 0]), "0000:03:00.0");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unset_pci_address_is_not_a_device() {
+        assert_eq!(set_pci([0, 0, 0, 0]), None,
+            "an unset PCI address must not resolve to 0000:00:00.0");
+        assert_eq!(set_pci([0, 3, 0, 0]), Some([0, 3, 0, 0]));
     }
 }

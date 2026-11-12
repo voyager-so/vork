@@ -95,8 +95,9 @@ cargo +1.96 build --release --workspace --locked
 .\target\release\vork.exe help
 ```
 
-Rendering requires a supported NVIDIA Vulkan driver on Windows and Linux, or
-Apple Silicon Metal on macOS. For binary installation on Windows use install.ps1;
+Rendering requires a supported NVIDIA Vulkan driver on Windows and Linux, an AMD
+Vulkan driver with ray queries on Linux (Mesa RADV), or Apple Silicon Metal on
+macOS. For binary installation on Windows use install.ps1;
 see README.md (Install). The compiled help and scene JSON are identical on every platform.
 
 ## Runtime dependencies

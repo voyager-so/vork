@@ -181,9 +181,9 @@ initial impulse and limited secondary spray.
 
 ## No suitable GPU? Use the cloud
 
-Rendering requires Apple Silicon or an NVIDIA GPU with Vulkan ray queries.
-Scene authoring and `vork help` work without a GPU. On your own NVIDIA Linux
-machine, you can use the [Docker runtime](docs/REMOTE-GPU.md).
+Rendering requires Apple Silicon or an NVIDIA or AMD GPU with Vulkan ray
+queries. Scene authoring and `vork help` work without a GPU. On your own NVIDIA
+or AMD Linux machine, you can use the [Docker runtime](docs/REMOTE-GPU.md).
 Or render on Voyager's cloud GPUs with [vork cloud](https://voyager.so/vork/cloud).
 
 ## Give it to an agent
@@ -224,7 +224,7 @@ Final approximates indirect lighting and can darken interiors, including glossy
 bounces. More samples do not restore omitted transport; try path and inspect.
 Draft and final use 4 and 8 samples with bundled OIDN denoising by default; use `--set denoise=false` to turn it
 off. `--set samples=N` overrides the profile budget (1..4096); more samples means cleaner and slower.
-Without a fast GPU denoiser (NVIDIA or Apple GPU), draft and final say so and use 16 and 32 samples undenoised;
+Without a fast GPU denoiser (NVIDIA, AMD with ROCm, or Apple GPU), draft and final say so and use 16 and 32 samples undenoised;
 `--set denoise=true` runs the slow CPU denoiser anyway.
 For a particular field, ask `vork help field node.target`. Help topics include
 exact fields with `--all`. Images, video and control passes come from the same
@@ -423,7 +423,7 @@ Binary packages are available from [GitHub Releases](https://github.com/voyager-
 for Linux, Windows and Mac. Keep the entire install folder together: Slang, OIDN,
 libraries, examples, SDKs and licence texts are runtime companions to the binary.
 
-- **Linux:** x64, glibc 2.35+ and libstdc++ with `GLIBCXX_3.4.30` (Ubuntu 22.04+), a recent NVIDIA GPU and its hardware-ray-tracing Vulkan driver.
+- **Linux:** x64, glibc 2.35+ and libstdc++ with `GLIBCXX_3.4.30` (Ubuntu 22.04+), a recent NVIDIA GPU and its hardware-ray-tracing Vulkan driver, or an AMD GPU on a Vulkan driver that exposes ray queries (Mesa RADV).
 - **Windows:** x64 Windows 10/11, a recent NVIDIA GPU and its hardware-ray-tracing Vulkan driver.
 - **Mac:** Apple Silicon with Metal, macOS 26 for the bundled Slang toolchain. Older macOS versions are unqualified. Intel Macs are unsupported. H.264 uses system VideoToolbox.
 
@@ -439,7 +439,8 @@ also need `xz-utils` to unpack Node's `.tar.xz` download.
 
 ### Linux
 
-Install the NVIDIA driver for your GPU first. On Ubuntu 22.04+:
+Install the NVIDIA driver for your GPU first, or for AMD the Mesa RADV driver
+(plus the ROCm runtime for GPU denoising). On Ubuntu 22.04+:
 
 ```sh
 sudo apt-get update

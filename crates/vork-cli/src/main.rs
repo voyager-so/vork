@@ -218,7 +218,7 @@ fn run() -> Result<()> {
                 None => error,
             };
             eprintln!("GPU: {error:#}");
-            eprintln!("Rendering requires ray queries and storage buffer arrays; see the platform-specific device diagnostic above. A container needs host graphics-driver libraries and device access; Docker does not provide a GPU on its own. On your own NVIDIA Linux machine, use the Docker runtime: docs/REMOTE-GPU.md. Scene authoring and `vork help` work without a GPU.");
+            eprintln!("Rendering requires ray queries and storage buffer arrays; see the platform-specific device diagnostic above. A container needs host graphics-driver libraries and device access; Docker does not provide a GPU on its own. On your own NVIDIA or AMD Linux machine, use the Docker runtime: docs/REMOTE-GPU.md. Scene authoring and `vork help` work without a GPU.");
             error.context(vork_render::failure::FailureKind::Device)
         })?;
         let device_s = start.elapsed().as_secs_f64();

@@ -1,10 +1,10 @@
-# Run on your own NVIDIA GPU
+# Run on your own NVIDIA or AMD GPU
 
-Rendering requires Apple Silicon or an NVIDIA GPU with Vulkan ray queries.
+Rendering requires Apple Silicon or an NVIDIA or AMD GPU with Vulkan ray queries.
 Authoring scenes and `vork help` do not need a GPU. Docker requires a suitable
 GPU on its host; it does not provide one.
 
-The Docker runtime below targets your own Linux x86-64 NVIDIA machine. Use a
+The Docker runtime below targets your own Linux x86-64 NVIDIA or AMD machine. Use a
 matching Linux release archive and SHA256 from its `SHA256SUMS`. There is no
 official registry image to pull yet. See [BUILD.md](BUILD.md) for source builds.
 Put scene.json and all its assets in the job directory, keeping relative paths.
@@ -59,3 +59,10 @@ shaders, the Preview License and all release notices accompany the executable.
 The GPL Blender bridge is excluded. Ubuntu OS utilities retain their own
 licenses, including GPL; the FFmpeg license check applies to its configured
 binaries.
+
+## Docker on an AMD host
+
+Use Linux x86-64 with Mesa RADV on the host, and pass `--device /dev/dri
+--device /dev/kfd`. The container needs Mesa's Vulkan driver, and the ROCm 7.x
+runtime for GPU denoising; without it vork uses the CPU denoiser. Tested
+bare-metal on an RX 7900 XTX; the container path is untested.

@@ -42,7 +42,7 @@ by Apple's command line tools on macOS). If bindgen cannot find it, set
 Other Linux distributions need equivalent C/C++ build tools, libclang and Python 3.12+
 (or a Python release with backported `tarfile.data_filter`). Rendering also
 needs a working Vulkan driver; building and GPU-free commands do not need a GPU.
-For your own NVIDIA Linux machine, a [Docker runtime](REMOTE-GPU.md) is available.
+For your own NVIDIA or AMD Linux machine, a [Docker runtime](REMOTE-GPU.md) is available.
 
 Install Rust 1.96, matching CI, through rustup (https://rustup.rs):
 
