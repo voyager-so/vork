@@ -8,8 +8,15 @@ pub(crate) fn record_fields_entry(binding:u32, read_only:bool)->wgpu::BindGroupL
     entry.count=std::num::NonZeroU32::new(constants::VISIBILITY_REFLECTION_WORDS);
     entry
 }
-pub(crate) fn record_fields(buffer:&wgpu::Buffer, bytes:u64)->Vec<wgpu::BufferBinding<'_>> {
-    (0..constants::VISIBILITY_REFLECTION_WORDS).map(|field|wgpu::BufferBinding {buffer,offset:u64::from(field)*bytes,size:std::num::NonZeroU64::new(bytes)}).collect()
+/// One binding per record field. Fields are packed `per_buffer` at a time, so the
+/// complete array may exceed the device's single-allocation limit.
+pub(crate) fn record_fields(buffers:&[wgpu::Buffer], bytes:u64, per_buffer:u32)->Vec<wgpu::BufferBinding<'_>> {
+    let per_buffer=per_buffer.max(1);
+    (0..constants::VISIBILITY_REFLECTION_WORDS).map(|field|{
+        let chunk=(field/per_buffer) as usize;
+        let offset=u64::from(field%per_buffer)*bytes;
+        wgpu::BufferBinding {buffer:&buffers[chunk],offset,size:std::num::NonZeroU64::new(bytes)}
+    }).collect()
 }
 /// One retained hit-shading specialization for the complete installed scene.
 pub(crate) fn pipeline(r: &Renderer, cached: &std::sync::Arc<crate::pipelines::CachedPipelines>, features: crate::forward_variant::FeatureMask, probes: bool, mode: &crate::pipelines::VariantCompile) -> Result<crate::pipelines::Drawn<wgpu::ComputePipeline>> {
@@ -51,7 +58,7 @@ impl Resources {
         }
         let v=decoupled.context("reflections need decoupled receiver guides")?;
         let (slots,reflection_records,reflection_guides)=(&v.slots,&v.reflection_records,&v.reflection_guides);
-        let record_fields=record_fields(reflection_records,v.reflection_field_bytes);
+        let record_fields=record_fields(reflection_records,v.reflection_field_bytes,v.reflection_fields_per_buffer);
         let batch=constants::REFLECTION_BATCH_SAMPLES;
         let samples=v.samples();
         let chunks=samples.div_ceil(batch);
@@ -319,7 +326,7 @@ struct TestReflectionFields {StructuredBuffer<uint> buffers[REG_VISIBILITY_REFLE
         let mut fields=vec![0u32;field_bytes as usize/4*VISIBILITY_REFLECTION_WORDS as usize];
         for record in 0..count {for word in 0..VISIBILITY_REFLECTION_WORDS as usize {fields[word*field_bytes as usize/4+record]=records[record*VISIBILITY_REFLECTION_WORDS as usize+word];}}
         let records=crate::init(d,"reflection record fixture",bytemuck::cast_slice(&fields),wgpu::BufferUsages::STORAGE);
-        let record_fields=record_fields(&records,field_bytes);
+        let record_fields=record_fields(std::slice::from_ref(&records),field_bytes,VISIBILITY_REFLECTION_WORDS);
         let film:Vec<u32>=(0..7).flat_map(|i|crate::sampling::offset(i,7).map(f32::to_bits)).collect();
         let film=crate::init(d,"reflection film fixture",bytemuck::cast_slice(&film),wgpu::BufferUsages::STORAGE);
         let groups=17u32;

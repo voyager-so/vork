@@ -45,8 +45,7 @@ fn visibility_pool(limits: &wgpu::Limits, shape: ViewShape, extent: [u32; 2], sa
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
         let bindings=view_bindings_with_pool(shape, extent, samples, mid);
-        if bindings.iter().all(|(_, bytes)| *bytes <= limit)
-            && bindings[3].1*u64::from(VISIBILITY_REFLECTION_WORDS)<=limits.max_buffer_size {
+        if bindings.iter().all(|(_, bytes)| *bytes <= limit) {
             lo = mid;
         } else {
             hi = mid - 1;
@@ -87,12 +86,18 @@ fn view_bindings_with_pool(shape: ViewShape, [w, h]: [u32; 2], samples: u32, poo
     [("visibility slots", slots), ("camera evaluation metadata", metadata), ("subsurface records", subsurface),
         ("reflection record field", reflections), ("reflection guides", guides)]
 }
+/// Fields packed into each reflection-record allocation. The complete array may
+/// exceed the device's single-buffer limit, so it is split into several buffers.
+fn reflection_fields_per_buffer(field_bytes:u64,max_buffer_size:u64)->u32 {
+    (max_buffer_size/field_bytes.max(1)).clamp(1,u64::from(VISIBILITY_REFLECTION_WORDS)) as u32
+}
+
 /// Check the camera view's whole-frame bindings against the device, at install
 /// before any per-frame resource exists and again when the view is created.
 pub(crate) fn check_view(limits: &wgpu::Limits, extent: [u32; 2], samples: u32, shape: ViewShape) -> Result<[u64; 5]> {
     let sizes=gpu_memory::frame_bindings(limits, extent, samples, |extent, samples| view_bindings(limits, shape, extent, samples))?;
-    let allocation=sizes[3]*u64::from(VISIBILITY_REFLECTION_WORDS);
-    ensure!(allocation<=limits.max_buffer_size,"{}", crate::gpu_memory::limit_message("reflection record fields", format_args!("{allocation} bytes at {}x{}",extent[0],extent[1]), format_args!("max_buffer_size={} bytes",limits.max_buffer_size), "lower the resolution, or use --profile std/path"));
+    // Record fields are separate bindings packed across allocations
+    // (reflection_fields_per_buffer), so the complete array need not fit one buffer.
     Ok(sizes)
 }
 
@@ -109,7 +114,6 @@ pub(crate) fn check_packet_minimum(limits:&wgpu::Limits,extent:[u32;2],samples:u
     for (label,bytes) in fields {gpu_memory::storage_binding(limits,label,bytes, "reduce resolution or choose --profile std/draft for a lower sample and reflection budget")?;}
     let (label,bytes)=view_bindings_with_pool(shape,extent,samples,0)[4];
     gpu_memory::storage_binding(limits,label,bytes, "reduce resolution or choose --profile std/draft for a lower sample and reflection budget")?;
-    ensure!(fields[3].1*u64::from(VISIBILITY_REFLECTION_WORDS)<=limits.max_buffer_size,"{}", crate::gpu_memory::limit_message("camera packet reflection allocation", format_args!("{} bytes",fields[3].1*u64::from(VISIBILITY_REFLECTION_WORDS)), format_args!("max_buffer_size={} bytes",limits.max_buffer_size), "reduce resolution or choose --profile std/draft for a lower sample and reflection budget"));
     Ok(())
 }
 
@@ -127,8 +131,7 @@ fn camera_packet_rows(limits:&wgpu::Limits,shape:ViewShape,[w,h]:[u32;2],samples
             +u64::from(materials)*24+header
             +evaluations*(u64::from(words)*16+16+u64::from(indirect_words)*4)
     };
-    let fits_bindings=|sizes:[(&str,u64);5]|sizes.iter().all(|(_,b)|*b<=limits.max_storage_buffer_binding_size.min(limits.max_buffer_size))
-        && sizes[3].1*u64::from(VISIBILITY_REFLECTION_WORDS)<=limits.max_buffer_size;
+    let fits_bindings=|sizes:[(&str,u64);5]|sizes.iter().all(|(_,b)|*b<=limits.max_storage_buffer_binding_size.min(limits.max_buffer_size));
     let records=if shape.table_only {u64::from(w)*u64::from(h)*u64::from(VISIBILITY_SLOTS)+visibility_pool(limits,shape,[w,h],samples)}
         else {u64::from(w)*u64::from(h)*u64::from(samples)};
     let evaluations=records.min(evaluation_budget(limits,memory,words)).min(work_limit);
@@ -764,8 +767,9 @@ pub(crate) struct View {
     pub(crate) refraction_source: Option<wgpu::TextureView>,
     /// Each slot's reflection record and each pixel's reflection reconstruction
     /// guides, for the reflection passes (passes/reflections.rs).
-    pub(crate) reflection_records: wgpu::Buffer,
+    pub(crate) reflection_records: Vec<wgpu::Buffer>,
     pub(crate) reflection_field_bytes: u64,
+    pub(crate) reflection_fields_per_buffer: u32,
     pub(crate) reflection_guides: wgpu::Buffer,
     /// Bytes of dense slots and list heads; merged views clear these per exposure.
     listed: u64,
@@ -881,7 +885,6 @@ impl View {
             guide_bytes=view_bindings_with_pool(shape,extent,samples,0)[4].1;
             for (label,bytes) in view_bindings_with_pool(shape,storage_extent,samples,pool) {gpu_memory::storage_binding(&limits,label,bytes, "reduce resolution or choose --profile std/draft for a lower sample and reflection budget")?;}
             gpu_memory::storage_binding(&limits,"reflection guides",guide_bytes, "reduce resolution or choose --profile std/draft for a lower sample and reflection budget")?;
-            ensure!(record_bytes*u64::from(VISIBILITY_REFLECTION_WORDS)<=limits.max_buffer_size,"{}", crate::gpu_memory::limit_message("camera packet reflection allocation", format_args!("{} bytes",record_bytes*u64::from(VISIBILITY_REFLECTION_WORDS)), format_args!("max_buffer_size={} bytes",limits.max_buffer_size), "reduce resolution or choose --profile std/draft for a lower sample and reflection budget"));
         }
         let occupancy_row=occupancy_row_bytes(w,samples,shape.boundaries);
         let metadata_size=metadata_size-occupancy_row*u64::from(packet_rows.min(TILE));
@@ -929,7 +932,11 @@ impl View {
         // slices separately: the complete record array need not fit one binding.
         // SlotLayout.reflection is the common record index in all fields.
         let reflection_field_bytes=record_bytes.div_ceil(u64::from(limits.min_storage_buffer_offset_alignment))*u64::from(limits.min_storage_buffer_offset_alignment);
-        let reflection_records = s.transients.buffer(d, "reflection records", reflection_field_bytes*u64::from(VISIBILITY_REFLECTION_WORDS), wgpu::BufferUsages::STORAGE);
+        // Each packed field is its own binding; pack as many fields per allocation
+        // as the device allows so the complete record array can exceed one buffer.
+        let reflection_fields_per_buffer=reflection_fields_per_buffer(reflection_field_bytes,limits.max_buffer_size);
+        let reflection_records:Vec<_>=(0..VISIBILITY_REFLECTION_WORDS).step_by(reflection_fields_per_buffer as usize).enumerate().map(|(chunk,first)|
+            s.transients.buffer(d,&format!("reflection records {chunk}"),reflection_field_bytes*u64::from((VISIBILITY_REFLECTION_WORDS-first).min(reflection_fields_per_buffer)),wgpu::BufferUsages::STORAGE)).collect();
         let reflection_guides = s.transients.buffer(d, "reflection guides", guide_bytes, wgpu::BufferUsages::STORAGE);
         let screen = s.plan.screen_refraction;
         let refraction_receivers = s.transients.buffer(d, "refraction receivers", if screen { pixels * 16 } else { 16 }, wgpu::BufferUsages::STORAGE);
@@ -1124,7 +1131,7 @@ impl View {
         let geometry_bindings=crate::rt::hit_bindings(&geometry);
         let read_words=[&slots,&installed.draw_table,&installed.object_draws].map(|buffer|wgpu::BufferBinding {buffer,offset:0,size:None});
         let write_words=[&reflection_guides,&subsurface_records,&evaluation_metadata,&evaluation_bins,&evaluation_allocator].map(|buffer|wgpu::BufferBinding {buffer,offset:0,size:None});
-        let reflection_fields=crate::passes::reflections::record_fields(&reflection_records,reflection_field_bytes);
+        let reflection_fields=crate::passes::reflections::record_fields(&reflection_records,reflection_field_bytes,reflection_fields_per_buffer);
         let write_vectors=[&targets.aov_values,&refraction_receivers].map(|buffer|wgpu::BufferBinding {buffer,offset:0,size:None});
         let hits=d.create_bind_group(&wgpu::BindGroupDescriptor {label:Some("camera geometry and evaluations"),layout:&camera_geometry_layout(d,s.pipelines.camera_pages),entries:&[
             entry(0,wgpu::BindingResource::BufferArray(&geometry_bindings)),entry(1,wgpu::BindingResource::BufferArray(&page_bindings)),
@@ -1168,7 +1175,7 @@ impl View {
             capacity_feedback: shader_errors.context("camera capacity diagnostics")?.clone(),
             evaluation, evaluation_bins, evaluation_args, evaluation_allocator, indirect_dispatch, indirect_offsets, material_count:installed.materials, config_stride, transport_parts, bands, band_rows,
             evaluation_groups:if direct {w.div_ceil(TILE)*h.div_ceil(TILE)} else {evaluation_capacity.div_ceil(64)},
-            subsurface_records, refraction_source: (screen && s.plan.effects.subsurface).then(||level_zero.clone()), direct_keys, receivers, normals, stride: sampling.stride, keys, depth, slots, reflection_records, reflection_field_bytes, reflection_guides, listed, overflow, fragments, passes, transparent_passes, merge_pipeline, shade_pipeline, merge,
+            subsurface_records, refraction_source: (screen && s.plan.effects.subsurface).then(||level_zero.clone()), direct_keys, receivers, normals, stride: sampling.stride, keys, depth, slots, reflection_records, reflection_field_bytes, reflection_fields_per_buffer, reflection_guides, listed, overflow, fragments, passes, transparent_passes, merge_pipeline, shade_pipeline, merge,
             shade: [global, material, shadow, hits, own],
             refraction,
             extent,
@@ -1468,6 +1475,17 @@ pub(crate) fn refraction(encoder: &mut wgpu::CommandEncoder, f: &crate::view::Vi
 #[cfg(test)]
 mod tests {
     #[test]
+    fn reflection_fields_split_at_the_allocation_limit() {
+        // 4K records: 8,294,400 pixels x 4 slots x 4 bytes = 132,710,400 B per field.
+        let field=132_710_400;
+        assert_eq!(super::reflection_fields_per_buffer(field,2_147_483_647),16);
+        assert_eq!(super::reflection_fields_per_buffer(field,200<<20),1);
+        assert_eq!(super::reflection_fields_per_buffer(u64::MAX,1<<40),1);
+        let per=u64::from(super::reflection_fields_per_buffer(field,2_147_483_647));
+        assert!(field*per<=2_147_483_647,"one allocation must fit the device limit");
+        assert_eq!((f64::from(28u32)/per as f64).ceil() as u32,2,"28 fields take two allocations at 4K");
+    }
+    #[test]
     fn camera_packets_follow_memory_and_native_limits() -> Result<()> {
         let limits=wgpu::Limits {max_storage_buffer_binding_size:2<<30,max_buffer_size:16<<30,..Default::default()};
         let shape=ViewShape {transparent:false,diffusion:false,reflections:true,screen_refraction:false,table_only:true,boundaries:0,reserved:0};
@@ -1710,16 +1728,22 @@ mod tests {
     }
     #[test]
     fn reflection_allocation_limit_explains_recovery() {
-        let limits = wgpu::Limits {max_storage_buffer_binding_size:1<<30,max_buffer_size:1<<30,..Default::default()};
-        // A glass scene retains whole-frame reflection records. Geometry count
-        // does not enter this allocation: four dense records per pixel suffice.
-        let shape = ViewShape {transparent:true,diffusion:false,reflections:true,screen_refraction:true,boundaries:0,table_only:true,reserved:0};
-        assert!(!packet_eligible(shape,32));
-        let error=check_view(&limits,[2000,1333],32,shape).unwrap_err().to_string();
-        for text in ["1194368000 bytes", "1073741824 bytes", "lower the resolution", "--profile std/path"] {
+        // One table-glass sample packs four dense records per pixel and no pool,
+        // so only the record fields grow with the extent.
+        let limits = wgpu::Limits {max_storage_buffer_binding_size:1<<40,max_buffer_size:1<<30,..Default::default()};
+        let shape = ViewShape {transparent:false,diffusion:false,reflections:true,screen_refraction:false,boundaries:0,table_only:true,reserved:0};
+        // Fields are separate bindings packed across allocations, so the combined
+        // 28-field array may exceed max_buffer_size without refusing the view.
+        let fields=check_view(&limits,[3840,2160],1,shape).unwrap();
+        assert_eq!(fields[3],132_710_400);
+        assert!(fields[3]*u64::from(VISIBILITY_REFLECTION_WORDS)>limits.max_buffer_size);
+        // One field still has to fit max_buffer_size, and the error explains recovery.
+        let small = wgpu::Limits {max_buffer_size:64<<20,..limits};
+        let error=check_view(&small,[3840,2160],1,shape).unwrap_err().to_string();
+        for text in ["reflection record field", "132710400 bytes", "67108864 bytes", "reduce the rendered resolution"] {
             assert!(error.contains(text), "missing {text:?}: {error}");
         }
-        check_view(&limits,[1000,667],32,shape).unwrap();
+        check_view(&small,[1280,720],1,shape).unwrap();
     }
 
     #[test]
