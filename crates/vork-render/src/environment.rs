@@ -2,6 +2,8 @@
 use super::*;
 mod cache;
 mod evaluated;
+#[cfg(test)]
+mod brdf_tests;
 pub(crate) use evaluated::Validation;
 // Preserve float32 bits without a float-sampling capability or precision loss.
 #[cfg(test)]
@@ -239,13 +241,14 @@ impl Environment {
         );
         let pipeline = Self::pipeline(r);
         let integrate =
-            |encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture, mode: u32, mip: u32| {
+            |encoder: &mut wgpu::CommandEncoder, target: &wgpu::Texture, mode: u32, mip: u32, rows: std::ops::Range<u32>| {
                 let view = target.create_view(&wgpu::TextureViewDescriptor {
                     base_mip_level: mip,
                     mip_level_count: Some(1),
                     ..Default::default()
                 });
-                let parameters = filter_parameters(mip, mode, filter_scale, sh, [dw, dh]);
+                let mut parameters = filter_parameters(mip, mode, filter_scale, sh, [dw, dh]);
+                parameters[5][3] = rows.start as f32;
                 let params = init(
                     d,
                     "environment integral parameters",
@@ -267,7 +270,7 @@ impl Environment {
                     params,
                     groups: [
                         (target.width() >> mip).max(1).div_ceil(8),
-                        (target.height() >> mip).max(1).div_ceil(8),
+                        (rows.end - rows.start).div_ceil(8),
                     ],
                 };
                 if filtered.is_none() || mode == 2 {
@@ -278,7 +281,8 @@ impl Environment {
         // The LUT is device-owned and scene-independent. OnceLock serializes its
         // initialization, including submission, before another install can use it.
         let brdf = r.brdf.get_or_init(|| {
-            let mut encoder = d.create_command_encoder(&Default::default());
+            // One workgroup row per Metal submission; preserve every integration sample.
+            let rows = if r.adapter_info.backend == wgpu::Backend::Metal { 8 } else { crate::constants::BRDF_HEIGHT };
             let lut = texture(
                 "BRDF moments and dielectric directional albedo",
                 crate::constants::BRDF_SIZE,
@@ -287,10 +291,17 @@ impl Environment {
                 wgpu::TextureFormat::Rgba16Float,
                 usage,
             );
-            integrate(&mut encoder, &lut, 2, 0);
-            // Submit inside initialization so concurrent installs observe GPU queue
-            // ordering as well as the completed CPU initialization.
-            crate::command_finish::Segments::submit(&r.queue, encoder);
+            // Bound startup work as well as frame work: the dielectric atlas is
+            // independent of output resolution and can trip Metal's watchdog.
+            for first in (0..crate::constants::BRDF_HEIGHT).step_by(rows as usize) {
+                let mut encoder = d.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("BRDF lookup tile"),
+                });
+                integrate(&mut encoder, &lut, 2, 0, first..(first + rows).min(crate::constants::BRDF_HEIGHT));
+                // Submit inside initialization so concurrent installs observe GPU
+                // queue ordering as well as the completed CPU initialization.
+                crate::command_finish::Segments::submit(&r.queue, encoder);
+            }
             lut.create_view(&Default::default())
         });
         let mut encoder = d.create_command_encoder(&Default::default());
@@ -300,7 +311,7 @@ impl Environment {
                 .map(|m| (&specular, 0u32, m))
                 .chain([(&diffuse, 1, 0)])
             {
-                integrals.push(integrate(&mut encoder, target, mode, mip));
+                integrals.push(integrate(&mut encoder, target, mode, mip, 0..(target.height() >> mip).max(1)));
             }
         }
         crate::command_finish::Segments::submit(&r.queue, encoder);

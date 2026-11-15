@@ -54,6 +54,11 @@ Dense imported transmitting geometry has not been qualified on Metal. Large scen
 with dense transparency can lose the device in final even at small resolutions;
 try path and test the full shot before committing to a batch.
 
+Startup BRDF lookup generation uses bounded row submissions on Metal, retaining
+the full lookup resolution and integration sample counts. This bounds the
+scene-independent startup workload; lowering scene resolution does not reduce
+that workload.
+
 Large point scenes and working buffers can exceed a device's per-buffer binding
 limit even when total free VRAM is sufficient. Follow the error's resolution/profile
 advice or simplify scene buffers. Scene import support does not guarantee rendering

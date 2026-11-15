@@ -7,6 +7,7 @@ import environment_proposal;
 [[vk::binding(0, 0)]] Texture2DArray<uint4> source : register(t0);
 [[vk::binding(1, 0)]] [format("rgba16f")] RWTexture2D<float4> output : register(u1);
 // settings.z is the finite positive reciprocal HDR scale, constructed on the host.
+// distribution_size.w offsets bounded dispatches into the output texture.
 struct FilterParams { float4 settings; float4 sh[4]; float4 distribution_size; };
 [[vk::binding(2, 0)]] ConstantBuffer<FilterParams> params : register(b0);
 [[vk::binding(3, 0)]] StructuredBuffer<float2> environment_distribution : register(t1);
@@ -27,6 +28,7 @@ float brdf_alpha(uint row) {
 [shader("compute")]
 [numthreads(REG_COMPUTE_TILE, REG_COMPUTE_TILE, 1)]
 void filter_main(uint3 id : SV_DispatchThreadID) {
+    id.y+=uint(params.distribution_size.w);
     uint width, height; output.GetDimensions(width, height);
     let size=uint2(width, height);if (any(id.xy>=size)) {return;}
     let coord=(float2(id.xy)+.5)/float2(size);
