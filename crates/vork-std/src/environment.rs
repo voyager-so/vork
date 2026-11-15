@@ -322,7 +322,7 @@ pub fn prepare(
     if let Some(s) = sun {
         nodes.push(serde_json::json!({"type":"light","name":format!("{}_sun",o.name),"shape":"sun","visible_camera":false,"rotation":s.rotation,"color":s.color,"energy":s.intensity,"angle":s.angle}));
     }
-    Ok(serde_json::json!({"images":{image_name.clone():{"file":std::path::absolute(&o.file)?,"color_space":if srgb {"sRGB"} else {"Linear Rec.709"},"wrap_t":"clamp_to_edge"},weight_name.clone():{"file":file,"color_space":"Non-Color","wrap_t":"clamp_to_edge"}},"materials":{material.clone():{"program":"std/environment_image","inputs":{"image":{"image":image_name},"lighting_weight":{"image":weight_name}}}},"nodes":nodes}).to_string())
+    Ok(serde_json::to_string(&serde_json::json!({"images":{image_name.clone():{"file":std::path::absolute(&o.file)?,"color_space":if srgb {"sRGB"} else {"Linear Rec.709"},"wrap_t":"clamp_to_edge"},weight_name.clone():{"file":file,"color_space":"Non-Color","wrap_t":"clamp_to_edge"}},"materials":{material.clone():{"program":"std/environment_image","inputs":{"image":{"image":image_name},"lighting_weight":{"image":weight_name}}}},"nodes":nodes}))?)
 }
 
 // Generated EXR sequences use an index clock (one frame per second), recorded
@@ -494,7 +494,7 @@ pub fn prepare_frames(
         options["file"] = serde_json::json!(scratch.0);
         options["output"] = file.into();
         let fragment: serde_json::Value =
-            serde_json::from_str(&prepare(&options.to_string(), &mut cached, &mut publish)?)?;
+            serde_json::from_str(&prepare(&serde_json::to_string(&options)?, &mut cached, &mut publish)?)?;
         let sun=fragment["nodes"].get(1).cloned().unwrap_or_else(||serde_json::json!({"type":"light","shape":"sun","name":sun_name,"visible_camera":false,"rotation":[0,0,0,1],"color":[0,0,0],"energy":0,"angle":0}));
         for (field, keys) in &mut fields {
             keys.push(serde_json::json!([time, sun[*field]]));
@@ -515,7 +515,7 @@ pub fn prepare_frames(
     tracks.push(serde_json::json!({"path":["images",image_name,"time"],"interpolation":"STEP","keys":clocks}));
     tracks.push(serde_json::json!({"path":["images",weight_name,"time"],"interpolation":"STEP","keys":clocks}));
     result["animation"] = serde_json::json!([{"tracks":tracks}]);
-    Ok(result.to_string())
+    Ok(serde_json::to_string(&result)?)
 }
 
 #[cfg(test)]

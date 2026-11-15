@@ -2,7 +2,7 @@ animation.clip.file: file-path|null; null = the target asset's clips; else a glT
 animation.clip.index: u32|null; XOR name; JSON shape: integer|null
 animation.clip.name: string|null; XOR index; JSON shape: string|null
 animation.clip.target: asset-node-name; JSON shape: string
-animation.layer.blend: replace|add; default replace; JSON shape: "replace"|"add"
+animation.layer.blend: replace|combine; default replace; JSON shape: "replace"|"combine"
 animation.layer.clip: clip|null; XOR tracks; JSON shape: Clip object|null
 animation.layer.loop: bool; default false; JSON shape: boolean
 animation.layer.name: string|null; JSON shape: string|null
@@ -10,9 +10,9 @@ animation.layer.offset: number; source time = offset + time*speed; default 0; JS
 animation.layer.speed: number; default 1; JSON shape: number
 animation.layer.tracks: track[]|null; XOR clip; JSON shape: Track object[]|null
 animation.layer.weight: number; default 1; JSON shape: number
-animation.track.interpolation: STEP|LINEAR|CUBICSPLINE; omitted: STEP for strings/bools, else LINEAR; default null; JSON shape: "STEP"|"LINEAR"|"CUBICSPLINE"|null
+animation.track.interpolation: STEP|LINEAR|CUBICSPLINE; omitted: LINEAR for numeric and CSS/SVG fields; STEP for bools and resource tokens; default null; JSON shape: "STEP"|"LINEAR"|"CUBICSPLINE"|null
 animation.track.keys: [[time, value], ...] | {times: buffer, values: buffer}; time increasing; CUBICSPLINE [time, value, in_tangent, out_tangent] (tangents per second) or [time, value] (zero tangents); rotation values as in node.rotation; JSON shape: JSON value[][]|object
-animation.track.path: string[]; ["nodes",node,property...] | ["nodes",asset,"nodes",imported-name|#index,property...] | ["materials",material,"inputs",input] | ["animation",layer,"weight"] | ["render",property...]; JSON shape: string[]
+animation.track.path: (string|index)[]; ["nodes",node,property...] | ["nodes",asset,"nodes",imported-name|#index,property...] | ["materials",material,"inputs",input] | ["animation",layer,"weight"] | ["render",property...] | ["nodes",text-node,"glyphs"|"words"|"lines",index,translation|rotation|scale|opacity|fill|stroke|transform-origin]; JSON shape: (string|integer)[]
 buffer.count: u32|null; file only; JSON shape: integer|null
 buffer.data: number[]|number[][]; XOR file; one typed element per outer entry; vector/matrix entries contain 2/3/4/16 scalar components, not a flat scalar stream; mat4 column-major; JSON shape: number[]|number[][]|null
 buffer.dims: [u32,u32,u32]|null; positive dense typed array dimensions; data or binary file optional; file count defaults to dims product and must match it; x contiguous; field cell centres span local [-1,1]³; JSON shape: [integer, integer, integer]|null
@@ -22,6 +22,12 @@ buffer.offset: u64; bytes, multiple of 4; default 0; JSON shape: integer
 buffer.type: f32|i32|u32|vec2|vec3|vec4|uvec4|mat4; JSON shape: "f32"|"i32"|"u32"|"vec2"|"vec3"|"vec4"|"uvec4"|"mat4"
 node.focus_object (camera): node-name|null; camera-axis depth supplied to the program at sample time; default null; JSON shape: string|null
 node.material (camera): material-name|inline material|null; omitted = std/camera; optics are program inputs; default null; JSON shape: string|Material object|null
+composition.color_space: Linear Rec.709|Linear Rec.2020|ACEScg|sRGB|Display P3; omitted: worlds Linear Rec.709, canvases sRGB; JSON shape: "Linear Rec.709"|"Linear Rec.2020"|"ACEScg"|"sRGB"|"Display P3"
+composition.compositor: (material-name|{material,name?,resolution?})[]; ordered image graph in the working space, before the view; last is the output; material may be inline; a canvas's graph works in the canvas's working encoding (sRGB code values by default); JSON shape: (string|Material object|CompositeNode object)[]
+composition.preserveAspectRatio: string|null; none, or x(Min|Mid|Max)Y(Min|Mid|Max) then meet|slice; null = xMidYMid meet; unsupported on a canvas inside a canvas; JSON shape: string|null
+composition.space: 2d|3d; 2d: a canvas, top-left origin, y down, painted in node order; 3d: a standalone or nested closed world; JSON shape: "2d"|"3d"
+composition.view: material-name|inline material; local default: worlds std/agx, canvases std/standard; never inherited; JSON shape: string|Material object
+composition.viewBox: [min-x,min-y,width,height]|null; the canvas's own coordinates, placed in render.resolution; null = render.resolution px; unsupported on a canvas inside a canvas; JSON shape: [number, number, number, number]|null
 compositor.resolution: [width,height] pixels or positive output scale; floor, minimum 1; null = output; last image resampled to output; JSON shape: [integer, integer]|number|null
 geometry.attributes: {name: buffer-name|inline buffer}; POSITION required (glTF names and types; COLOR_n: linear vec3/vec4, alpha defaults to 1); implicit: exactly one f32 dense grid, zero threshold; custom f32/vec2/vec3/vec4 bind to material inputs; JSON shape: {name: string|Buffer object}
 geometry.count: one-element u32 buffer|null; points only; overflow rejects the exposure; JSON shape: string|Buffer object|null
@@ -48,14 +54,15 @@ geometry.subdivision.subdivision_type: catmull_clark|simple; default catmull_cla
 geometry.subdivision.use_limit_surface: bool; default true; JSON shape: boolean
 geometry.topology: triangles|points|curves|implicit; points render as spheres; default triangles; JSON shape: "triangles"|"points"|"curves"|"implicit"
 geometry.widths: f32 buffer; diameter per point; curves and points; required; JSON shape: string|Buffer object|null
-image.color_space: sRGB|Linear Rec.709|Non-Color|null; null: hdr/exr/ies linear, others sRGB; default null; JSON shape: "sRGB"|"Linear Rec.709"|"Non-Color"|null
+image.color_space: sRGB|Display P3|Linear Rec.709|Linear Rec.2020|ACEScg|Non-Color|null; omitted/null: embedded colour description, else hdr/exr/ies linear Rec.709 and other files sRGB; default null; JSON shape: "sRGB"|"Linear Rec.709"|"Linear Rec.2020"|"ACEScg"|"Display P3"|"Non-Color"|null
+image.composition: {compositor}|null; a rendered image's image graph; requires render; JSON shape: ImageComposition object|null
+image.composition.compositor: same ordered image graph as composition.compositor; names local to this capture; JSON shape: (string|Material object|CompositeNode object)[]
 image.file: file-path; XOR render; png jpg tif hdr exr ies mov mp4 mkv or %04d frame pattern; 8-bit may be block-compressed; 16-bit integer and floating-point inputs use uncompressed half-float precision, not exact source integer codes; ies: LM-63 Type C; JSON shape: string|null
 image.mag_filter: nearest|linear; default linear; JSON shape: "nearest"|"linear"
 image.min_filter: nearest|linear|nearest_mipmap_nearest|linear_mipmap_nearest|nearest_mipmap_linear|linear_mipmap_linear; default linear_mipmap_linear; JSON shape: "nearest"|"linear"|"nearest_mipmap_nearest"|"linear_mipmap_nearest"|"nearest_mipmap_linear"|"linear_mipmap_linear"
 image.render: ImageRender; renders a camera view into the texture; inherits integrator, fps, AOVs; sampling budget follows quality/cost level; closed shutter; scene-linear premultiplied RGBA; default null; JSON shape: ImageRender object|null
-image.render.background: environment|transparent|RGB; default environment; JSON shape: [number, number, number]|"environment"|"transparent"
+image.render.background: environment|transparent|RGB; default environment; JSON shape: [number, number, number]|"environment"|"transparent"|string
 image.render.camera: camera-node-name|null; null = the only authored camera, else first imported; default null; JSON shape: string|null
-image.render.compositor: same image graph as render.compositor; names local to this capture; default []; JSON shape: (string|Material object|CompositeNode object)[]
 image.render.resolution: uvec2; default [1920,1080]; JSON shape: [integer, integer]
 image.render.root: node-name|null; only this subtree draws and is lit; objects outside still cast shadows; null = whole scene; default null; JSON shape: string|null
 image.time: number|rational string|null; seconds from first displayed frame; null follows scene time; animatable; subframes hold; out-of-range holds ends; default null; JSON shape: number|string|null
@@ -84,8 +91,8 @@ material.channel.channel: color|depth|view_normal|object_index|motion|shadow_cat
 material.double_sided: bool; false culls back faces; default true; JSON shape: boolean
 material.geometry.geometry: mesh-node name; read-only geometry at the program's canonical sample time; JSON shape: string
 material.grid.grid: buffer-name|inline buffer; buffer with a grid; JSON shape: string|Buffer object
-material.inputs: {name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{node}|{channel}|{geometry}}; default {}; JSON shape: {name: number|number[]|boolean|GeometryBinding object|TextureBinding object|AttributeBinding object|GridBinding object|AovBinding object|ChannelBinding object|NodeBinding object|string}
-material.inputs (std/openpbr): OpenPBR Surface; shaded inputs: base_weight base_color base_metalness specular_weight specular_color specular_roughness specular_roughness_anisotropy specular_ior transmission_weight transmission_color transmission_depth subsurface_weight subsurface_color subsurface_radius subsurface_radius_scale subsurface_scatter_anisotropy coat_weight coat_color coat_roughness coat_ior coat_darkening fuzz_weight fuzz_color fuzz_roughness emission_luminance emission_color thin_film_weight thin_film_thickness thin_film_ior geometry_opacity geometry_thin_walled geometry_normal geometry_tangent geometry_coat_normal transmission_dispersion_scale transmission_dispersion_abbe_number alpha_cutoff
+material.inputs: {name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{step}|{channel}|{geometry}}; default {}; JSON shape: {name: number|number[]|boolean|GeometryBinding object|TextureBinding object|AttributeBinding object|GridBinding object|AovBinding object|ChannelBinding object|StepBinding object|string}
+material.inputs (std/openpbr): OpenPBR Surface; shaded inputs: base_weight base_color base_metalness specular_weight specular_color specular_roughness specular_roughness_anisotropy specular_ior transmission_weight transmission_color transmission_depth subsurface_weight subsurface_color subsurface_radius subsurface_radius_scale subsurface_scatter_anisotropy coat_weight coat_color coat_roughness coat_roughness_anisotropy coat_ior coat_darkening fuzz_weight fuzz_color fuzz_roughness emission_luminance emission_color thin_film_weight thin_film_thickness thin_film_ior geometry_opacity geometry_thin_walled geometry_normal geometry_tangent geometry_coat_normal geometry_coat_tangent transmission_dispersion_scale transmission_dispersion_abbe_number alpha_cutoff
 material.inputs.alpha_cutoff: number; Negative disables threshold; otherwise geometry_opacity >= alpha_cutoff produces 1, else 0; range [-1,1]; units dimensionless; constant|texture|attribute; animatable; default -1
 material.inputs.base_color: color3; Base reflection albedo (dielectric); F0 colour at normal incidence (metal); range [0,1] per channel; units dimensionless; constant|texture|attribute; animatable; default (0.8, 0.8, 0.8)
 material.inputs.base_metalness: number; Fraction of the microsurface that is metallic; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
@@ -94,6 +101,7 @@ material.inputs.coat_color: color3; Square of the coat's normal-incidence transm
 material.inputs.coat_darkening: number; Modulates the physical coat darkening effect; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 1
 material.inputs.coat_ior: number; Refractive index of the coat; range (0,inf); units dimensionless; constant|texture|attribute; animatable; default 1.6
 material.inputs.coat_roughness: number; Roughness of the coat NDF; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
+material.inputs.coat_roughness_anisotropy: number; Anisotropy of NDF of coat BSDF; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
 material.inputs.coat_weight: number; Coverage weight of the coat slab; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
 material.inputs.emission_color: color3; Emission colour multiplier (emitted = `emission_color` × `emission_luminance`); range [0,inf) per channel; units dimensionless; constant|texture|attribute; animatable; default (1, 1, 1)
 material.inputs.emission_luminance: number; Emission luminance with `emission_color` = (1,1,1), before coat and fuzz; range [0,inf); units cd/m² (nits); constant|texture|attribute; animatable; default 0
@@ -101,6 +109,7 @@ material.inputs.fuzz_color: color3; Reflection albedo colour of the fuzz; range 
 material.inputs.fuzz_roughness: number; Reflection roughness of the fuzz; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0.5
 material.inputs.fuzz_weight: number; Coverage weight of the fuzz slab; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
 material.inputs.geometry_coat_normal: vector3; Shading normal of the coat; linear tangent-space RGB; factor scales XY; independent of base normal; range N/A; units dimensionless; constant or texture; animatable; default unperturbed normal
+material.inputs.geometry_coat_tangent: vector3; Reference tangent for coat anisotropy; range N/A; units dimensionless; constant or texture; animatable; default unperturbed tangent
 material.inputs.geometry_normal: vector3; Shading normal of the base; range N/A; units dimensionless; constant or texture; animatable; default unperturbed normal
 material.inputs.geometry_opacity: number; Opacity (presence) of the surface; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 1
 material.inputs.geometry_tangent: vector3; Reference tangent for specular anisotropy; range N/A; units dimensionless; constant or texture; animatable; default unperturbed tangent
@@ -123,20 +132,53 @@ material.inputs.transmission_depth: number; Depth at which `transmission_color` 
 material.inputs.transmission_dispersion_abbe_number: number; Physical Abbe number of the base dielectric medium; range (0,inf); units dimensionless; constant|texture|attribute; animatable; default 20
 material.inputs.transmission_dispersion_scale: number; Linearly scales the amount of dispersion; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
 material.inputs.transmission_weight: number; Mix weight between translucent base and opaque base slabs; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
-material.node.node: earlier compositor entry name; clamped bilinear image sampling; JSON shape: string
 material.opacity: coverage|transmittance|null; null = coverage, transmittance for transmitting surfaces; coverage = occupied area fraction; transmittance = continuous attenuation by 1 - geometry_opacity; renderer chooses integration; default null; JSON shape: "coverage"|"transmittance"|null
 material.priority: integer; highest owns overlapping solid media; equal priorities: last entered wins, simultaneous entries: later solid order wins; lower-priority boundaries change membership only; default 0; JSON shape: integer
 material.program: program-name|inline program|<library>/<module>; std/openpbr, std/hair (curves only), or custom; default std/openpbr; JSON shape: string|Program object
+material.step.step: earlier compositor entry name; clamped bilinear image sampling; JSON shape: string
 material.texture.image: image-name|inline image; the program owns sampling and UV transforms; JSON shape: string|Image object
+node.active: true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step); JSON shape: boolean|[number|string, number|string]
+node.animation: layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself; JSON shape: NodeLayer object[]
+node.animation.layer.blend: replace|combine; default replace; JSON shape: "replace"|"combine"
+node.animation.layer.clip: clip|null; XOR tracks; target = this node or a descendant asset; JSON shape: Clip object|null
+node.animation.layer.loop: bool; default false; JSON shape: boolean
+node.animation.layer.name: string|null; JSON shape: string|null
+node.animation.layer.offset: number; source time = offset + node time*speed; default 0; JSON shape: number
+node.animation.layer.speed: number; default 1; JSON shape: number
+node.animation.layer.tracks: track[]|null; XOR clip; paths start at this node: ["translation"], ["children",name,...]; keys in this node's seconds; JSON shape: Track object[]|null
+node.animation.layer.weight: number; default 1; JSON shape: number
 node.file (asset): file-path; JSON shape: string
 node.materials (asset): {imported-name|#index|*: material-name|inline material}; #index = glTF material index; specific beats *; default {}; JSON shape: {name: string|Material object}
 node.nodes (asset): {imported-name|#index: overrides}; #index = glTF node index; default {}; JSON shape: {name: AssetNodeOverrides object}
 node.nodes.<name>.light_link_tags (asset): string[]|null; replaces inherited tags; JSON shape: string[]|null
 node.nodes.<name>.pass_index (asset): u32|null; 1..65535; object ID; JSON shape: integer|null
+node.audio: {file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch; JSON shape: Audio object|null
+node.audio.file: file-path|null; mono/stereo; relative to scene; omitted = children only; JSON shape: string|null
+node.audio.gain: number; linear amplitude over source plus children; default 1; keyable; default 1; JSON shape: number
 node.children: node[]; default []; JSON shape: Node object[]
+node.clip-path: node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself; JSON shape: string|null
+node.composition: composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box; JSON shape: Composition object|null
+node.content (text): string|run[]; position by the text box's top-left; switch content with STEP keys; runs set font and paint; white-space controls newlines; JSON shape: string|Run object[]
+node.d (path): string; SVG path data, px; "none" or empty paints nothing; default none; JSON shape: string
+node.direction (text): ltr|rtl; default ltr; JSON shape: "ltr"|"rtl"
+node.fill (path): paint; "none"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}; default #000; JSON shape: "none"|string|ImagePaint object
+node.fill (text): "none"|CSS colour|CSS gradient|{image, fit}; default #000; JSON shape: "none"|string|ImagePaint object
+node.fill-opacity (path): number; 0..1; default 1; JSON shape: number
+node.fill-rule (path): nonzero|evenodd; default nonzero; JSON shape: "nonzero"|"evenodd"
+node.filter: string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses; JSON shape: string|null
+node.font (text): file-path|file-path[]; .ttf/.otf; a list offers faces font-weight and font-style choose from; JSON shape: string|string[]
+node.font-feature-settings (text): string; default normal; JSON shape: string
+node.font-size (text): number; px; default 16; JSON shape: number
+node.font-style (text): normal|italic|oblique; default normal; JSON shape: "normal"|"italic"|"oblique"
+node.font-variation-settings (text): string; default normal; JSON shape: string
+node.font-weight (text): number|normal|bold; default normal; JSON shape: "normal"|"bold"|number
 node.is_holdout: bool; RGB 0; alpha 0 on transparent background, 1 on opaque background; default false; JSON shape: boolean
 node.is_shadow_catcher: bool; shadow_catcher channel is material light with CG / without CG, unclamped; zero baseline gives neutral 1; CG light on an otherwise unlit catcher cannot be represented; default false; JSON shape: boolean
+node.letter-spacing (text): number; px; default 0; JSON shape: number
 node.light_link_tags: string[]; matched by light illuminates/shadowed_by; inherited; default []; JSON shape: string[]
+node.line-break (text): auto; the others are not built; default auto; JSON shape: "auto"|"loose"|"normal"|"strict"|"anywhere"
+node.line-height (text): normal|number; a multiple of the font size; default normal; JSON shape: "normal"|number
+node.mask: node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself; JSON shape: string|null
 node.geometry (mesh): geometry-name|inline geometry; JSON shape: string|Geometry object
 node.instances (mesh): instances|null; JSON shape: Instances object|null
 node.instances.attributes (mesh): equal-length buffers: TRANSLATION vec3, ROTATION vec4 (xyzw), SCALE vec3 (omitted = identity; any zero world-scale component hides the instance), time_offset f32, pass_index u32, custom columns bind to material inputs; JSON shape: {name: string|Buffer object}
@@ -147,10 +189,31 @@ node.skin (mesh): skin|null; JSON shape: Skin object|null
 node.skin.inverse_bind_matrices (mesh): mat4-buffer-name|inline buffer; JSON shape: string|Buffer object
 node.skin.joints (mesh): node-name[]; JSON shape: string[]
 node.name: string; globally unique, including imported nodes; default ""; JSON shape: string
+node.opacity: number; 2D; 0..1; the node's picture, children included, placed once; default 1; JSON shape: number
+node.paint-order (path): string; normal, or the layers to paint first out of fill, stroke, markers ("stroke" puts the stroke under the fill); default normal; JSON shape: string
 node.pass_index: u32|null; 1..65535; object ID; JSON shape: integer|null
+node.pathLength (path): number|null; the author's total length of d; dash lengths and offset scale by computed/pathLength; JSON shape: number|null
 node.rotation: [x,y,z,w] quaternion | {euler:[x,y,z]} (Blender XYZ); default [0,0,0,1]; JSON shape: [number, number, number, number]|object
 node.scale: [x,y,z]; any zero world-scale component hides geometry, including children; default [1,1,1]; JSON shape: [number, number, number]
+node.stroke (path): paint; "none"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}; default none; JSON shape: "none"|string|ImagePaint object
+node.stroke (text): "none"|CSS colour|CSS gradient|{image, fit}; the glyph outlines; default none; JSON shape: "none"|string|ImagePaint object
+node.stroke-dasharray (path): "none"|number[]; px; an odd count repeats; scaled by pathLength; default none; JSON shape: "none"|number[]
+node.stroke-dashoffset (path): number; px; default 0; JSON shape: number
+node.stroke-linecap (path): butt|round|square; default butt; JSON shape: "butt"|"round"|"square"
+node.stroke-linejoin (path): miter|round|bevel; default miter; JSON shape: "miter"|"round"|"bevel"
+node.stroke-miterlimit (path): number; at least 1; default 4; JSON shape: number
+node.stroke-opacity (path): number; 0..1; default 1; JSON shape: number
+node.stroke-width (path): number; px; 0 paints nothing; default 1; JSON shape: number
+node.stroke-width (text): number; px; default 1; JSON shape: number
 node.target: node-name|[x,y,z]|null; aims -Z, world Y up; rotation is an offset on top; structural, not animatable: aim at a named node and animate its translation; JSON shape: string|[number, number, number]|null
+node.text-align (text): start|end|left|right|center|justify; default start; JSON shape: "start"|"end"|"left"|"right"|"center"|"justify"
+node.time: {start,offset,duration,speed,loop}|null; node-owned animation/media clock; time-reading programs, conflicting movie clocks and scene-time tracks inside retimed compositions refuse; null inherits parent/active-window clock; JSON shape: NodeClock object|null
+node.time.duration: number|rational string|null; content seconds used from offset; > 0; null = the rest of the one source; only active ends the node; JSON shape: number|string|null
+node.time.loop: bool; wraps inside [offset, offset+duration); needs an end; default false; JSON shape: boolean
+node.time.offset: number|rational string; content seconds where the clip begins; >= 0; default 0; JSON shape: number|string
+node.time.pitch: follow|keep; keep holds sound pitch when speed changes; keep is not built yet; default follow; JSON shape: "follow"|"keep"
+node.time.speed: number|rational string; keyable >= 0 and integrated; a constant < 0 plays the trimmed section backwards from its end; default 1; JSON shape: number|string
+node.time.start: number|rational string|null; parent seconds where local = offset; null = active window start, else 0; shifts loop phase; JSON shape: number|string|null
 node.translation: [x,y,z]; parent frame; default [0,0,0]; JSON shape: [number, number, number]
 node.visible: bool; false hides the subtree and disables its lights; animatable (step); default true; JSON shape: boolean
 node.visible_camera: bool; default true; JSON shape: boolean
@@ -158,6 +221,17 @@ node.visible_diffuse: bool; default true; JSON shape: boolean
 node.visible_glossy: bool; default true; JSON shape: boolean
 node.visible_shadow: bool; lights must stay true (a light without shadows: shadowed_by []); default true; JSON shape: boolean
 node.visible_transmission: bool; object visibility to transmission rays; lights must stay true; default true; JSON shape: boolean
+node.white-space (text): normal|nowrap|pre-line; pre, pre-wrap and break-spaces are not built; default normal; JSON shape: "normal"|"nowrap"|"pre"|"pre-wrap"|"pre-line"|"break-spaces"
+node.width (text): number|null; px; lines wrap and align in it; null = no wrapping; JSON shape: number|null
+node.word-break (text): normal; the others are not built; default normal; JSON shape: "normal"|"break-all"|"keep-all"|"break-word"
+node.word-spacing (text): number; px; only 0 is built; default 0; JSON shape: number
+output.color_space: EXR storage space; omitted: the composition's working space; a world takes the linear spaces, a canvas any; excludes display and luminance fields; JSON shape: "Linear Rec.709"|"Linear Rec.2020"|"ACEScg"|"sRGB"|"Display P3"
+output.display: sRGB|Display P3|Rec.2100-PQ|Rec.2100-HLG; omitted: sRGB for viewed outputs; raw outputs bypass the view; JSON shape: "sRGB"|"Display P3"|"Rec.2100-PQ"|"Rec.2100-HLG"
+output.file: path; format follows extension; JSON shape: string
+output.peak_luminance: positive cd/m²; omitted: SDR 100, HDR 1000; JSON shape: number
+output.reference_white: positive cd/m², at most peak_luminance; omitted: SDR 100, HDR 203; JSON shape: number
+paint.fit: contain|cover|fill|none|null; centred in the shape's box; null = natural size from the box's top-left, repeated as the image's wrap_s and wrap_t say; JSON shape: "contain"|"cover"|"fill"|"none"|null
+paint.image: image-name; PNG or JPEG, sRGB; clipped by the shape; JSON shape: string
 profile.description: string; default ""; JSON shape: string
 profile.level: u8; 0..3; quality/cost level; 3 is previs; JSON shape: integer
 profile.settings: Settings; seed, samples and denoise only; default {}; JSON shape: Settings object
@@ -171,10 +245,8 @@ program.source_origin: virtual filename|null; inline source only; resolves local
 render.aovs: [{name,type:value|color}]; output with --channels all or aov:<name>; default []; JSON shape: Aov object[]
 render.aovs.name: name; EXR channels <name>.X or <name>.R/G/B; JSON shape: string
 render.aovs.type: value|color; JSON shape: "value"|"color"
-render.background: environment|transparent|RGB; RGB and transparent apply to camera escapes and opacity passthrough; path glass transmission sees the World; default environment; JSON shape: [number, number, number]|"environment"|"transparent"
+render.background: environment|transparent|RGB|CSS colour; RGB and transparent apply to camera escapes and opacity passthrough; path glass transmission sees the World; a 2D canvas takes transparent or a CSS colour; default environment; JSON shape: [number, number, number]|"environment"|"transparent"|string
 render.camera: camera-node-name|null; null = the only authored camera, else first imported; a camera cut track may select; default null; JSON shape: string|null
-render.compositor: (material-name|{material,name?,resolution?})[]; ordered image graph, last output; material may be inline; default []; JSON shape: (string|Material object|CompositeNode object)[]
-render.display: material-name|inline material; display program; EXR stays scene-linear; default {"program":"std/agx"}; JSON shape: string|Material object
 render.duration: number|rational string; seconds; default 125/12; JSON shape: number|string
 render.fps: number|rational string; positive output frames/second; default 24; JSON shape: number|string
 render.motion_blur: MotionBlur|null; non-null enables; shutter in frames; default null; JSON shape: MotionBlur object|null
@@ -182,9 +254,20 @@ render.motion_blur.position: start|center|end; default center; JSON shape: "star
 render.motion_blur.shutter: number; frames; default 0.5; JSON shape: number
 render.resolution: uvec2; default [1920,1080]; JSON shape: [integer, integer]
 render.root: node-name|null; only this subtree draws and is lit; objects outside still cast shadows; null = whole scene; default null; JSON shape: string|null
+run.content: string; JSON shape: string
+run.fill: "none"|CSS colour|CSS gradient|{image, fit}; default the node's; JSON shape: "none"|string|ImagePaint object|null
+run.font: file-path|file-path[]; default the node's; JSON shape: string|string[]|null
+run.font-feature-settings: string; default the node's; JSON shape: string|null
+run.font-size: number; px; default the node's; JSON shape: number|null
+run.font-style: normal|italic|oblique; default the node's; JSON shape: "normal"|"italic"|"oblique"|null
+run.font-variation-settings: string; default the node's; JSON shape: string|null
+run.font-weight: number|normal|bold; default the node's; JSON shape: "normal"|"bold"|number|null
+run.letter-spacing: number; px; default the node's; JSON shape: number|null
+run.stroke: "none"|CSS colour|CSS gradient|{image, fit}; default the node's; JSON shape: "none"|string|ImagePaint object|null
 scene.$schema: string; editor schema URL; JSON shape: string|null
 scene.animation: layer[]; default []; JSON shape: Layer object[]
 scene.buffers: {name:buffer}; default {}; JSON shape: {name: Buffer object}
+scene.composition: composition|null; space 2d = canvas, 3d = world; null = 3D world; JSON shape: Composition object|null
 scene.geometry: {name:geometry}; default {}; JSON shape: {name: Geometry object}
 scene.geometry_stages: (deform|compute|displace)[]; ordered, each at most once; default [deform,compute,displace]; default [deform,compute,displace]; JSON shape: ("deform"|"compute"|"displace")[]
 scene.images: {name:image}; default {}; JSON shape: {name: Image object}
@@ -212,6 +295,7 @@ std/openpbr.coat_color: color3; Square of the coat's normal-incidence transmitta
 std/openpbr.coat_darkening: number; Modulates the physical coat darkening effect; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 1
 std/openpbr.coat_ior: number; Refractive index of the coat; range (0,inf); units dimensionless; constant|texture|attribute; animatable; default 1.6
 std/openpbr.coat_roughness: number; Roughness of the coat NDF; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
+std/openpbr.coat_roughness_anisotropy: number; Anisotropy of NDF of coat BSDF; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
 std/openpbr.coat_weight: number; Coverage weight of the coat slab; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
 std/openpbr.emission_color: color3; Emission colour multiplier (emitted = `emission_color` × `emission_luminance`); range [0,inf) per channel; units dimensionless; constant|texture|attribute; animatable; default (1, 1, 1)
 std/openpbr.emission_luminance: number; Emission luminance with `emission_color` = (1,1,1), before coat and fuzz; range [0,inf); units cd/m² (nits); constant|texture|attribute; animatable; default 0
@@ -219,6 +303,7 @@ std/openpbr.fuzz_color: color3; Reflection albedo colour of the fuzz; range [0,1
 std/openpbr.fuzz_roughness: number; Reflection roughness of the fuzz; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0.5
 std/openpbr.fuzz_weight: number; Coverage weight of the fuzz slab; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
 std/openpbr.geometry_coat_normal: vector3; Shading normal of the coat; linear tangent-space RGB; factor scales XY; independent of base normal; range N/A; units dimensionless; constant or texture; animatable; default unperturbed normal
+std/openpbr.geometry_coat_tangent: vector3; Reference tangent for coat anisotropy; range N/A; units dimensionless; constant or texture; animatable; default unperturbed tangent
 std/openpbr.geometry_normal: vector3; Shading normal of the base; range N/A; units dimensionless; constant or texture; animatable; default unperturbed normal
 std/openpbr.geometry_opacity: number; Opacity (presence) of the surface; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 1
 std/openpbr.geometry_tangent: vector3; Reference tangent for specular anisotropy; range N/A; units dimensionless; constant or texture; animatable; default unperturbed tangent
@@ -241,8 +326,9 @@ std/openpbr.transmission_depth: number; Depth at which `transmission_color` is r
 std/openpbr.transmission_dispersion_abbe_number: number; Physical Abbe number of the base dielectric medium; range (0,inf); units dimensionless; constant|texture|attribute; animatable; default 20
 std/openpbr.transmission_dispersion_scale: number; Linearly scales the amount of dispersion; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
 std/openpbr.transmission_weight: number; Mix weight between translucent base and opaque base slabs; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0
-animation.track.path properties: node translation|rotation|scale|visible|visible_camera|visible_shadow|visible_diffuse|visible_glossy|visible_transmission|morph_weights,<morph>, camera/light numeric fields (camera optics are material inputs); imported nodes: translation|rotation|scale|morph_weights|visible
-animation.track.path render properties: camera|background (RGB)|motion_blur,shutter
+animation.track.path properties: node translation|rotation|scale|visible|visible_camera|visible_shadow|visible_diffuse|visible_glossy|visible_transmission|morph_weights,<morph>, camera/light numeric fields (camera optics are material inputs); canvas: filter, clip-path, mask, all path/text style fields; imported nodes: translation|rotation|scale|morph_weights|visible
+animation.track.path render properties: camera|background (RGB; CSS colour on a canvas)|motion_blur,shutter
+animation.track.path text pieces: fill and stroke [r,g,b,a] 0..1 or CSS colour/gradient or image paint; transform-origin CSS, default the ink box centre
 coordinates: glTF right-handed Y-up; cameras look along local -Z
 image.render restrictions: shared parent pose; aperture sampling is renderer-selected; geometry_opacity/alpha_cutoff/geometry_normal/environment image inputs unsupported
 lights: with no environment light the world is RGB [0.05,0.05,0.05]
@@ -257,7 +343,7 @@ node.nodes.<name>.visible_shadow (asset): bool; default true
 node.nodes.<name>.visible_diffuse (asset): bool; default true
 node.nodes.<name>.visible_glossy (asset): bool; default true
 node.nodes.<name>.visible_transmission (asset): bool; default true
-node.type: node|mesh|asset|camera|light; default "node"
+node.type: node|mesh|asset|camera|light|text|path; default "node"
 asset (glTF cameras): addressed as <asset>/<node-name|#index>
 program enum inputs: lowercased Slang case-name tokens (e.g. fog_glow)
 program.surface emission: authoritative radiance for hits and light samples; lit output is authored shading
@@ -272,3 +358,5 @@ node [type="mesh"]: {"type":"mesh", …}; flat sibling fields: geometry, instanc
 node [type="asset"]: {"type":"asset", …}; flat sibling fields: file, materials, nodes; no variant wrapper
 node [type="camera"]: {"type":"camera", …}; flat sibling fields: focus_object, material; no variant wrapper
 node [type="light"]: {"type":"light", …}; flat sibling fields: angle, color, energy, illuminates, image, material, medium, radius, shadowed_by, shape, size, size_y, spot_blend, spot_size, temperature; no variant wrapper
+node [type="text"]: {"type":"text", …}; flat sibling fields: content, direction, fill, font, font-feature-settings, font-size, font-style, font-variation-settings, font-weight, letter-spacing, line-break, line-height, stroke, stroke-width, text-align, white-space, width, word-break, word-spacing; no variant wrapper
+node [type="path"]: {"type":"path", …}; flat sibling fields: d, fill, fill-opacity, fill-rule, paint-order, pathLength, stroke, stroke-dasharray, stroke-dashoffset, stroke-linecap, stroke-linejoin, stroke-miterlimit, stroke-opacity, stroke-width; no variant wrapper

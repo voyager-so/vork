@@ -33,7 +33,7 @@ impl Source {
             .min(r.device.limits().max_buffer_size);
         ensure!(
             size <= limit,
-            "{}", crate::gpu_memory::limit_message("deformation input", format_args!("{size} bytes"), format_args!("{limit} bytes"), "split the mesh into smaller objects")
+            crate::gpu_memory::device_limit("deformation input", format_args!("{size} bytes"), format_args!("{limit} bytes"), "split the mesh into smaller objects")
         );
         let buffer = gpu_memory::buffer(
             &r.device,
@@ -131,7 +131,7 @@ impl AttributeRows {
             .min(r.device.limits().max_buffer_size);
         ensure!(
             size <= limit,
-            "{}", crate::gpu_memory::limit_message("geometry stage attribute inputs", format_args!("{size} bytes"), format_args!("{limit} bytes"), "split geometry into smaller objects")
+            crate::gpu_memory::device_limit("geometry stage attribute inputs", format_args!("{size} bytes"), format_args!("{limit} bytes"), "split geometry into smaller objects")
         );
         ensure!(
             rest.size() == u64::from(count) * rows * 16,

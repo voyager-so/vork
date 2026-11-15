@@ -4,6 +4,7 @@ import unittest
 import subprocess
 import sys
 import tempfile
+from unittest.mock import patch
 
 scan = runpy.run_path(str(Path(__file__).with_name('check-metal-generated')))['file_scope_acceleration_structures']
 AS = 'metal::raytracing::acceleration_structure<metal::raytracing::instancing>'
@@ -31,6 +32,23 @@ class ScopeScan(unittest.TestCase):
 
 
 class ScanCommand(unittest.TestCase):
+    def test_producer_executable_runs_without_cargo_in_renderer_cwd(self):
+        script = Path(__file__).with_name('check-metal-generated')
+        main = runpy.run_path(str(script))['main']
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / 'modules'
+            executable = Path(directory) / 'renderer-tests'
+            def capture(command, **kwargs):
+                self.assertEqual(command, [str(executable.resolve()),
+                    'metal_generated_tests::installed_scene_modules', '--exact', '--ignored', '--nocapture'])
+                self.assertEqual(kwargs['cwd'], script.resolve().parent.parent / 'crates/vork-render')
+                self.assertEqual(kwargs['env']['VORK_INSTALLED_METAL_DIR'], str(output.resolve()))
+                output.joinpath('scene.metal').write_text('kernel void scene() {}')
+            with patch.object(sys, 'argv', [str(script), '--executable', str(executable), '--output', str(output)]), \
+                 patch.object(subprocess, 'run', side_effect=capture) as run:
+                self.assertFalse(main())
+                run.assert_called_once()
+
     def test_empty_module_is_not_validation(self):
         with tempfile.TemporaryDirectory() as directory:
             Path(directory, 'placeholder.metal').touch()

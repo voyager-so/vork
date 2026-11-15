@@ -1,0 +1,10 @@
+# Ported from Moda (desktop-moda native/crates/moda-plain-text); the changes are listed in PROVENANCE.md.
+[package]
+name = "moda-plain-text"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "A rich-text layer's canonical plain text: the code-point index space of per-glyph unit transforms (moda-text renders them). No dependencies."
+
+[dependencies]

@@ -5,7 +5,7 @@
 set -eu
 repo=${VORK_REPO:-voyager-so/vork}
 # Default version is generated from Cargo.toml by scripts/sync-version.
-version=${VERSION:-0.5.1}
+version=${VERSION:-0.6.0}
 default_prefix=$HOME/.local
 prefix=${PREFIX:-"$default_prefix"}
 # POSIX shell literals for copy/paste, including embedded quotes and $/backticks.
@@ -27,8 +27,9 @@ case "$(uname -s)-$(uname -m)" in
     Darwin-arm64)
         platform=darwin-arm64
         macos=$(sw_vers -productVersion 2>/dev/null || true)
-        if ! awk -v v="$macos" 'BEGIN {split(v,a,"."); exit !(a[1] ~ /^[0-9]+$/ && a[1]>=26)}'; then
-            echo "Requires Apple Silicon macOS 26+ because the bundled Slang compiler and libraries target macOS 26; found ${macos:-unknown}. Nothing was downloaded." >&2
+        if ! awk -v v="$macos" 'BEGIN {split(v,a,"."); exit !(a[1] ~ /^[0-9]+$/ && a[1]>=15)}'; then
+            # dist/macos-minimum.txt owns this floor: every packaged Mach-O file is built for and checked against it.
+            echo "Requires Apple Silicon macOS 15+ (the deployment target of the packaged binaries and libraries); found ${macos:-unknown}. Nothing was downloaded." >&2
             exit 1
         fi ;;
     Linux-x86_64)
@@ -40,15 +41,28 @@ case "$(uname -s)-$(uname -m)" in
     *) echo 'Supported platforms: Apple Silicon macOS and Linux x64' >&2; exit 1 ;;
 esac
 archive="vork-${version}-${platform}.tar.gz"
+# A release also carries the same tree as a smaller .tar.xz. Reading it needs the xz program, or a tar
+# that decodes xz itself (bsdtar with liblzma, which macOS ships); otherwise the .tar.gz is used.
+compact="vork-${version}-${platform}.tar.xz"
+unxz=''
+if command -v xz >/dev/null 2>&1; then unxz=xz
+elif tar --version 2>/dev/null | grep liblzma >/dev/null; then unxz=tar; fi
 base=${VORK_DOWNLOAD_BASE:-"https://github.com/$repo/releases/download/v$version"}
 base=${base%/}
 # A downloaded installer can accompany an archive; piped installs still download.
 installer_dir=
 if [ -f "$0" ]; then installer_dir=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P); fi
+# A downloaded installer beside an archive installs that archive: the .tar.xz when it is there and readable.
+bundled=''
+if [ -n "$installer_dir" ]; then
+    if [ -n "$unxz" ] && [ -f "$installer_dir/$compact" ]; then bundled=$compact
+    elif [ -f "$installer_dir/$archive" ]; then bundled=$archive; fi
+fi
 if "$dry_run"; then
-    source_base=$base
-    if [ -n "$installer_dir" ] && [ -f "$installer_dir/$archive" ]; then source_base=$installer_dir; fi
-    printf 'Archive: %s/%s\nChecksums: %s/SHA256SUMS\nBinary: %s/bin/vork\n' "$source_base" "$archive" "$source_base" "$prefix"
+    if [ -n "$bundled" ]; then printf 'Archive: %s/%s\n' "$installer_dir" "$bundled"; source_base=$installer_dir
+    elif [ -n "$unxz" ]; then printf 'Archive: %s/%s (or %s when the release has no .tar.xz)\n' "$base" "$compact" "$archive"; source_base=$base
+    else printf 'Archive: %s/%s\n' "$base" "$archive"; source_base=$base; fi
+    printf 'Checksums: %s/SHA256SUMS\nBinary: %s/bin/vork\n' "$source_base" "$prefix"
     exit 0
 fi
 command -v curl >/dev/null 2>&1 || { echo 'vork install needs curl; install it and run this again.' >&2; exit 1; }
@@ -77,15 +91,29 @@ fetch() {
         exit 1
     }
 }
-if [ -n "$installer_dir" ] && [ -f "$installer_dir/$archive" ]; then
+if [ -n "$bundled" ]; then
+    archive=$bundled
     echo "Using bundled archive: $installer_dir/$archive"
     [ -f "$installer_dir/SHA256SUMS" ] || { echo 'Bundled archive requires SHA256SUMS beside install.sh' >&2; exit 1; }
     cp "$installer_dir/$archive" "$work/$archive"
     cp "$installer_dir/SHA256SUMS" "$work/SHA256SUMS"
 else
-    fetch "$archive"
+    # The checksum list says which archives this release has; releases before 0.6.0 have no .tar.xz.
     fetch SHA256SUMS
+    if [ -n "$unxz" ] && awk -v name="$compact" '$2 == name || $2 == "*" name {found = 1} END {exit !found}' "$work/SHA256SUMS"; then
+        archive=$compact
+    fi
+    fetch "$archive"
 fi
+# List or extract the verified archive ($1 is t or x; further arguments go to tar).
+unpack() {
+    mode=$1; shift
+    case "$archive" in
+        *.tar.gz) tar "-${mode}zf" "$work/$archive" "$@" ;;
+        *) if [ "$unxz" = xz ]; then xz -dc "$work/$archive" | tar "-${mode}f" - "$@"
+           else tar "-${mode}Jf" "$work/$archive" "$@"; fi ;;
+    esac
+}
 (
     cd "$work" || exit 1
     awk -v name="$archive" '$2 == name || $2 == "*" name {print}' SHA256SUMS > selected.sha256
@@ -98,7 +126,7 @@ fi
     exit 1
 }
 # Refuse traversal paths before extracting a verified archive.
-if tar -tzf "$work/$archive" | LC_ALL=C grep -E '(^/|(^|/)\.\.(/|$))' >/dev/null; then
+if unpack t | LC_ALL=C grep -E '(^/|(^|/)\.\.(/|$))' >/dev/null; then
     echo 'Unsafe archive path' >&2; exit 1
 fi
 mkdir -p "$prefix/bin" "$prefix/lib"
@@ -106,7 +134,7 @@ prefix=$(cd "$prefix" && pwd -P)
 # Build the new tree beside the old one and swap it in whole: files a release dropped
 # do not survive an upgrade, and a failed install leaves the old one working.
 stage=$(mktemp -d "$prefix/lib/.vork-new.XXXXXX")
-if ! tar -xzf "$work/$archive" -C "$stage" 2>"$work/extract.log"; then
+if ! unpack x -C "$stage" 2>"$work/extract.log"; then
     echo "Could not extract vork into $stage; the existing install was not changed." >&2
     echo "Check free space and write permissions on $prefix (the expanded release must fit beside the existing install). The downloaded archive also occupies space in $work." >&2
     head -n 8 "$work/extract.log" >&2

@@ -2,7 +2,7 @@
 // mode-5/6 approach. Intel MIT notice: third_party/ispc_refine/LICENSE.
 import vork_constants;
 
-uint4 refine_quantize_endpoint(float4 endpoint)
+uint4 refine_quantize_endpoint(float4 endpoint, bool opaque)
 {
     endpoint = clamp(endpoint, 0.0, 255.0);
     uint4 even = uint4(clamp(floor(endpoint * 0.5 + 0.5), 0.0, 127.0)) * 2;
@@ -10,7 +10,8 @@ uint4 refine_quantize_endpoint(float4 endpoint)
     float4 a = float4(even) - endpoint, b = float4(odd) - endpoint;
     float ea=dot(a.rgb,a.rgb)+g_alpha_weight*a.a*a.a;
     float eb=dot(b.rgb,b.rgb)+g_alpha_weight*b.a*b.a;
-    return ea < eb ? even : odd;
+    if (opaque) odd.a = 255;
+    return !opaque && ea < eb ? even : odd;
 }
 
 uint refine_indices(float4 pixels[16], uint4 low, uint4 high, out uint2 indices)
@@ -92,7 +93,7 @@ uint4 refine_pack_mode5(uint4 low,uint4 high,uint rgb_indices,uint alpha_indices
     [unroll] for(uint i=1;i<16;++i) refine_bits(block,at,(alpha_indices>>(i*2))&3,2);
     return block;
 }
-void refine_mode5(float4 pixels[16],float4 original_mean,uint rotation,inout uint best_error,inout uint4 best_block)
+void refine_mode5(float4 pixels[16],float4 original_mean,uint rotation,bool opaque,inout uint best_error,inout uint4 best_block)
 {
     float4 mean=refine_rotate(original_mean,rotation);
     float4 importance=refine_rotate(float4(1,1,1,g_alpha_weight),rotation);
@@ -129,6 +130,11 @@ void refine_mode5(float4 pixels[16],float4 original_mean,uint rotation,inout uin
         high.rgb=uint3(clamp(floor(high_endpoint.rgb*(127.0/255.0)+0.5),0.0,127.0));
         low.a=uint(clamp(floor(low_endpoint.a+0.5),0.0,255.0));
         high.a=uint(clamp(floor(high_endpoint.a+0.5),0.0,255.0));
+        // Rotation moves the original alpha into an RGB endpoint component.
+        if (opaque) {
+            uint channel=rotation==0?3:rotation-1;
+            low[channel]=high[channel]=rotation==0?255:127;
+        }
         uint4 dl=uint4((low.rgb<<1)|(low.rgb>>6),low.a);
         uint4 dh=uint4((high.rgb<<1)|(high.rgb>>6),high.a);
         float4 span=float4(dh)-float4(dl);
@@ -229,8 +235,8 @@ void RefineMode56CS(uint3 id:SV_DispatchThreadID)
     uint2 best_indices=0;
     for (uint iteration=0;iteration<=REG_BC7_ENDPOINT_REFINEMENTS;++iteration)
     {
-        uint4 low=refine_quantize_endpoint(low_endpoint);
-        uint4 high=refine_quantize_endpoint(high_endpoint);
+        uint4 low=refine_quantize_endpoint(low_endpoint, min_alpha == 255);
+        uint4 high=refine_quantize_endpoint(high_endpoint, min_alpha == 255);
         uint2 indices;
         uint error=refine_indices(pixels,low,high,indices);
         if (error<best_error)
@@ -256,12 +262,12 @@ void RefineMode56CS(uint3 id:SV_DispatchThreadID)
     if (best_error<original_error) best_block=refine_pack_mode6(best_low,best_high,best_indices);
     if (best_error!=0)
     {
-        refine_mode5(pixels,mean,0,best_error,best_block);
+        refine_mode5(pixels,mean,0,min_alpha==255,best_error,best_block);
         float gb=refine_pair_residual(covariance[1].y,covariance[2].z,covariance[1].z);
         float rb=refine_pair_residual(covariance[0].x,covariance[2].z,covariance[0].z);
         float rg=refine_pair_residual(covariance[0].x,covariance[1].y,covariance[0].y);
         uint rotation=gb<=rb && gb<=rg?1:(rb<=rg?2:3);
-        refine_mode5(pixels,mean,rotation,best_error,best_block);
+        refine_mode5(pixels,mean,rotation,min_alpha==255,best_error,best_block);
     }
     if (best_error<original_error) g_OutBuff[blockID]=best_block;
 }

@@ -14,7 +14,7 @@ fn directory(name: &str) -> Result<PathBuf> {
 fn emission_scene(width: u32, height: u32, image: Value) -> Value {
     let aspect = height as f32 / width as f32;
     json!({"version":2,
-        "render":{"resolution":[width,height],"background":[0,0,0],"settings":{"integrator":"raster","samples":1,"reflections":"environment"},"display":{"program":"std/standard","inputs":{"dither_intensity":0}}},
+        "composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[width,height],"background":[0,0,0],"settings":{"integrator":"raster","samples":1,"reflections":"environment"}},
         "images":{"source":image},
         "materials":{"m":{"inputs":{"base_weight":0,"specular_weight":0,"emission_luminance":1,
             "emission_color":{"image":"source"}}}},
@@ -50,8 +50,9 @@ fn distinct(row: &[[f32; 4]]) -> usize {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn sixteen_bit_png_gradient_keeps_more_than_256_levels() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else { return Ok(()) };
+    let r = crate::test_renderer()?;
     let base = directory("png16")?;
     let width = 1024u32;
     let codes: Vec<u16> = (0..width).map(|x| ((x as f64 * 65535. / (width - 1) as f64).round()) as u16).collect();
@@ -80,8 +81,9 @@ fn sixteen_bit_png_gradient_keeps_more_than_256_levels() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn float_exr_and_hdr_values_above_one_render_above_one() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else { return Ok(()) };
+    let r = crate::test_renderer()?;
     let base = directory("float")?;
     // Exact in RGBE as well as binary32; 1e6 clamps to the half-float maximum.
     let values = [0.25f32, 1.5, 4., 16., 300., 1000., 60000., 1e6];
@@ -106,8 +108,9 @@ fn float_exr_and_hdr_values_above_one_render_above_one() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn float_mips_average_values_above_one() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else { return Ok(()) };
+    let r = crate::test_renderer()?;
     let base = directory("mips")?;
     // A one-texel 0/8 checker minified 16x: only the filtered mip chain gives 4.
     exr::prelude::write_rgb_file(base.join("checker.exr"), 128, 128, |x, y| {

@@ -14,3 +14,8 @@ slot consumption for buffers, textures, samplers, external textures and Tier-2
 binding arrays. Metal HAL layout allocation and renderer ABI checks share it;
 native Apple reflection remains the independent verifier. Remove together with
 passthrough ABI consumers if upstream provides an equivalent contract.
+
+Local native geometry extension: axis-aligned bounding-box BLAS descriptions and
+build inputs use the existing Vulkan/Metal HAL AABB implementation. Core checks
+geometry counts, compatible flags, stride/alignment, buffer range, usage and device
+ownership, and tracks initialization and build-input transitions.

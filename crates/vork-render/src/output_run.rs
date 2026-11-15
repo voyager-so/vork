@@ -192,8 +192,10 @@ impl OutputRun {
         let namespaces: Vec<_> = paths.iter().map(|path|namespace(path)).collect();
         for i in 0..paths.len() {
             for j in 0..i {
-                anyhow::ensure!(!conflicts(&directories[i], &namespaces[i], &directories[j], &namespaces[j]),
-                    "overlapping output namespaces: {} and {}", paths[j].display(), paths[i].display());
+                if conflicts(&directories[i], &namespaces[i], &directories[j], &namespaces[j]) {
+                    return Err(anyhow::anyhow!("overlapping output namespaces: {} and {}", paths[j].display(), paths[i].display())
+                        .context(crate::failure::FailureKind::Usage));
+                }
             }
         }
         let mut locks = Vec::new();

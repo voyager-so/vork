@@ -12,7 +12,7 @@ class RenderExposure(unittest.TestCase):
             output = os.path.join(directory, 'frame.png')
             with open(output + '.meta.json', 'w') as stream:
                 json.dump({'warnings': []}, stream)
-            with patch('subprocess.run') as run:
+            with patch('vork._engine.engine', return_value='vork'), patch('subprocess.run') as run:
                 render('shot.json', output, at=0.5, set={'fps': '30000/1001'})
             self.assertEqual(run.call_args.args[0][1:],
                              ['render', 'shot.json', '--out', output, '--at', '0.5', '--set', 'fps="30000/1001"'])
@@ -34,7 +34,7 @@ class RenderExposure(unittest.TestCase):
                 os.makedirs(os.path.dirname(path), exist_ok=True)
                 with open(path, 'w') as f:
                     json.dump({'exposure': summaries[i], 'warnings': [warning, degradation]} if i < 3 else {'warnings': [warning, degradation]}, f)
-            with patch('subprocess.run') as run:
+            with patch('vork._engine.engine', return_value='vork'), patch('subprocess.run') as run:
                 result = render('shot.json', outputs)
                 self.assertEqual(run.call_args.kwargs, {'check': True})
             self.assertEqual(result, {'exposure': [{'output': out, 'exposure': summaries[i]} for i, out in enumerate(outputs[:3])], 'warnings': [warning, degradation]})

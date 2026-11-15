@@ -2,10 +2,9 @@
 use crate::*;
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn chiang_samples_preserve_energy_and_longitudinal_moments() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     let native = medium::Native {
         includes: vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../libraries")],
         ..Default::default()

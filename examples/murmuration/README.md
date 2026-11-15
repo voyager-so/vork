@@ -11,6 +11,8 @@ vork render /tmp/vork-birds/scene.json --profile std/previs --at 12 --set resolu
 vork render /tmp/vork-birds/scene.json --profile std/final --frame-start 216 --frame-end 407 --out /tmp/birds.mp4
 ```
 
+On Apple silicon, frame ranges of this scene can lose the GPU and stop with "frame discarded" ([issue #10](https://github.com/voyager-so/vork/issues/10)); there is no workaround yet and a fix is planned.
+
 The shot starts nine seconds into the simulation; seeking replays that history.
 The README stills came from an earlier draft profile. These commands use the
 shipped profiles and do not reproduce their quality or timing.

@@ -261,6 +261,42 @@ float3 screen_geometric_normal(Texture2D<float4> receivers,int2 pixel,float3 pos
     let n=normalize(g/scale);return select(dot(n,shading)>=0.,n,-n);
 }
 
+// Authored environment images occupy a packed float32 buffer at their own extents.
+// Decode before reconstruction, preserving HDR and both authored address modes.
+int environment_image_address(int p,int n,uint mode) {
+    if(mode==1u) return clamp(p,0,n-1);
+    if(mode==2u) {let q=(p+2*n)%(2*n);return min(q,2*n-1-q);}
+    return (p+n)%n;
+}
+float4 environment_image_load(StructuredBuffer<uint> image,int2 p,int2 size,uint2 mode,uint slot) {
+    let q=int2(environment_image_address(p.x,size.x,mode.x),environment_image_address(p.y,size.y,mode.y));
+    let base=image[slot];let pixel=uint(q.y)*uint(size.x)+uint(q.x);uint4 bits;
+    [unroll] for(uint c=0u;c<4u;c++) {
+        let descriptor=image[base+6u+c];
+        if((image[base+5u]&(1u<<c))!=0u) {bits[c]=descriptor;}
+        else {bits[c]=image[base+descriptor+pixel];}
+    }
+    return asfloat(bits);
+}
+float4 environment_image_sample(StructuredBuffer<uint> image,float2 uv,uint2 extent,uint3 mode,uint slot) {
+    let base=image[slot];
+    if(image[base+5u]==15u) {
+        return asfloat(uint4(image[base+6u],image[base+7u],image[base+8u],image[base+9u]));
+    }
+    var bounded=uv;
+    for(uint k=0;k<2u;k++) {
+        if(mode[k]==1u) bounded[k]=clamp(uv[k],0.,1.);
+        else {let period=mode[k]==2u ? 2. : 1.;bounded[k]=uv[k]-floor(uv[k]/period)*period;}
+    }
+    let size=int2(extent);let p=bounded*float2(size)-.5;let q=int2(floor(p));let f=p-floor(p);
+    if(mode.z!=0u) return environment_image_load(image,int2(floor(p+.5)),size,mode.xy,slot);
+    let a=environment_image_load(image,q,size,mode.xy,slot);
+    let b=environment_image_load(image,q+int2(1,0),size,mode.xy,slot);
+    let c=environment_image_load(image,q+int2(0,1),size,mode.xy,slot);
+    let d=environment_image_load(image,q+int2(1,1),size,mode.xy,slot);
+    return (a+(b-a)*f.x)+((c+(d-c)*f.x)-(a+(b-a)*f.x))*f.y;
+}
+
 // Float32 source bits live in an integer texture: no optional float filtering.
 // Decode each explicit load before masking and bilinear interpolation.
 // Longitude wraps and latitude clamps, matching the environment image sampler.

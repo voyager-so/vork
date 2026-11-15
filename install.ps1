@@ -10,7 +10,7 @@ $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 $repo = if ($env:VORK_REPO) { $env:VORK_REPO } else { 'voyager-so/vork' }
 # Default version is generated from Cargo.toml by scripts/sync-version.
-$version = if ($env:VERSION) { $env:VERSION } else { '0.5.1' }
+$version = if ($env:VERSION) { $env:VERSION } else { '0.6.0' }
 # Contract: PREFIX -> a fully qualified, lexically normalized install directory,
 # without trailing separators, or a refusal before downloads/writes. Relative and
 # drive-relative forms use the PowerShell filesystem location (not process cwd);

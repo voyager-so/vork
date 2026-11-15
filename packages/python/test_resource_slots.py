@@ -35,7 +35,7 @@ def resource_paths(node, seen=frozenset(), path=()):
 def cases():
     paths = set(resource_paths(SCHEMA))
     paths |= {('nodes', 0, 'children', 0) + p[2:] for p in paths if p[:1] == ('nodes',)}
-    paths |= {('images', 'nested', 'render') + p[1:] for p in paths if p[:2] == ('render', 'compositor')}
+    paths |= {('images', 'nested') + p for p in paths if p[:2] == ('composition', 'compositor')}
     return sorted(paths, key=str)
 
 

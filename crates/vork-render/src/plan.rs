@@ -64,7 +64,7 @@ impl EffectPlan {
         let ray_indirect = crate::rt::ray_indirect(scene);
         let features = Self {
             path: integrator.is_path(),
-            implicit: scene.geometry.values().any(|g|matches!(g.topology,vork_scene::v2::Topology::Implicit)),
+            implicit: crate::splats::present(scene) || scene.geometry.values().any(|g|matches!(g.topology,vork_scene::v2::Topology::Implicit)),
             indirect,
             ray_indirect,
             reflections: matches!(
@@ -72,7 +72,7 @@ impl EffectPlan {
                 Some(vork_scene::Reflections::Auto | vork_scene::Reflections::Ray)
             ),
             denoise: integrator.denoiser().is_some() || scene.render.settings.reconstruct,
-            compositor: crate::catcher::has_catchers(scene) || !scene.render.compositor.is_empty() || scene.images.values().any(|i| i.render.as_ref().is_some_and(|r| !r.compositor.is_empty())),
+            compositor: crate::catcher::has_catchers(scene) || !scene.compositor().is_empty() || scene.images.values().any(|i| i.render.is_some() && !i.compositor().is_empty()),
             probes: integrator.probe_volume().is_some(),
             ..Default::default()
         };

@@ -1,3 +1,4 @@
+import dielectric_interface;
 // Candidate coverage shares the hit-to-surface evaluator with committed hits.
 // Builtin UV-only opacity retains its compact corner reader; named opacity
 // and authored coverage use the consumer's existing full hit reconstruction.
@@ -31,12 +32,20 @@ public float candidate_coverage<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<
     }
     return ray_candidate_opacity(words,hit,r);
 }
-public bool candidate_accepts<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<uint> words, RayIntersection hit, float3x4 world_to_object, float3 direction, float2 pixel) {
+// Nearest-surface queries must reject an uncovered side before committing it:
+// discarding the shaded closest hit would hide the next visible surface.
+// Solid transport still needs rear boundaries to leave an occupied medium.
+public bool candidate_covers_side(uint object, bool front, bool solid_owner=false) {
+    return material_covers_side<Unspecialized>(object,front) || solid_owner;
+}
+public bool candidate_accepts<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<uint> words, RayIntersection hit, bool front, float3x4 world_to_object, float3 direction, float2 pixel, bool solid_owner=false) {
+    if (!candidate_covers_side(hit.instance_custom_data,front,solid_owner)) {return false;}
     return candidate_coverage<P,G>(g,words,hit,world_to_object,direction,pixel)>0.;
 }
 // Reflection rays integrate blended surface coverage. Keep the sequence fixed as camera samples
 // move their hit point, so coverage remains stratified over the exposure.
-public bool reflection_candidate_accepts<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<uint> words, RayIntersection hit, float3x4 world_to_object, float3 direction, float2 pixel, uint2 cell, uint index, uint count) {
+public bool reflection_candidate_accepts<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<uint> words, RayIntersection hit, bool front, float3x4 world_to_object, float3 direction, float2 pixel, uint2 cell, uint index, uint count) {
+    if (!candidate_covers_side(hit.instance_custom_data,front)) {return false;}
     let opacity=candidate_coverage<P,G>(g,words,hit,world_to_object,direction,pixel);
     let seed=cell^uint2(pixel_hash(hit.primitive_index),pixel_hash(hit.instance_custom_data));
     return coverage_accepts(opacity,seed,index,count);
@@ -69,20 +78,23 @@ public bool connection_owns_hit<G:IHitGeometry>(G g,RayIntersection hit,float3x4
 // Exact straight-segment surface transmission. Coverage is scalar; a thin
 // null interface contributes its RGB closure throughput. Nonabsorbing IOR-1
 // solids also have a straight delta; refracting solids block this segment.
+// Installation records which materials can produce either
+// (REG_FLAG_NULL_CONNECTION): every other covered candidate blocks without
+// evaluating its closure, and a scene without one compiles no evaluation.
 // Shared by every triangle backend.
-public ConnectionVisibility connection_candidate_transmittance<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<uint> words, RayIntersection hit, float3x4 inverse, float3 direction, float2 pixel, float3 world, uint sample_index, float incident_ior=1., bool null_sheets=true) {
+public ConnectionVisibility connection_candidate_transmittance<P:IProgram,G:IHitGeometry,V:IVariant=Unspecialized>(G g,StructuredBuffer<uint> words, RayIntersection hit, float3x4 inverse, float3 direction, float2 pixel, float3 world, uint sample_index, DielectricSegment incident=DielectricSegment(float3(1.),0.,1.,1.)) {
     let opacity=candidate_coverage<P,G>(g,words,hit,inverse,direction,pixel);
     if (opacity<=0.) {return ConnectionVisibility(float3(1.),0u);}
-    if (!null_sheets) {return ConnectionVisibility(float3(1.-opacity),0u);}
+    if (!V.has_null_connection || (material_records[objects[hit.instance_custom_data].material_index].tag.z&REG_FLAG_NULL_CONNECTION)==0u) {return ConnectionVisibility(float3(1.-opacity),0u);}
     let spatial=pixel_hash(asuint(world.x)^asuint(world.y)^asuint(world.z)^hit.instance_custom_data^hit.primitive_index);
     let u=float(screen_ray_hash(uint2(spatial,hit.instance_custom_data),sample_index,REG_SAMPLING_STREAM_SHADOW_ALPHA)>>8u)*(256.*REG_RADICAL_INVERSE_SCALE);
     let h=hit_surface<Unspecialized,P,G>(g,hit.instance_index,hit.primitive_index,hit.instance_custom_data,inverse,hit.barycentrics,direction,pixel,Lobe(select(P.lobes,LOBE_PICK,0u),u));
-    let sheet=h.s.is_hair ? float3(0.) : transport_null_transmittance(h.s.closure,-direction,incident_ior,h.s.geometric,h.face)*h.s.weight;
+    let sheet=h.s.is_hair ? float3(0.) : transport_null_transmittance<V>(h.s.closure,-direction,incident,h.s.geometric,h.face)*h.s.weight;
     return ConnectionVisibility((1.-opacity)+opacity*sheet,any(sheet>float3(0.)) ? 1u : 0u);
 }
 
-// Diffuse visibility follows raster material sidedness. Queries force opaque
-// geometry through candidates too; otherwise hardware would accept its back faces.
+// Diffuse visibility follows raster material sidedness. Hardware rejects ordinary
+// opaque back faces; solid exits and coverage still require candidate evaluation.
 // Ray-query facing is in object space, matching the raster's material_front.
 public bool diffuse_candidate_accepts<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<uint> words, RayIntersection hit, bool front, float3x4 world_to_object, float3 direction, float2 pixel) {
     if (!material_covers_side<Unspecialized>(hit.instance_custom_data,front)) {return false;}
@@ -107,7 +119,7 @@ public bool diffuse_ray_occluded<P:IProgram,G:IHitGeometry>(G g,RaytracingAccele
         }
     }
     RayQuery<RAY_FLAG_ACCEPT_FIRST_HIT_AND_END_SEARCH> query;
-    query.TraceRayInline(scene,RAY_FLAG_FORCE_NON_OPAQUE,mask,ray);
+    query.TraceRayInline(scene,RAY_FLAG_CULL_BACK_FACING_TRIANGLES,mask,ray);
     while (query.Proceed()) {
         let candidate=RayIntersection(query.CandidateInstanceIndex(),query.CandidateInstanceID(),query.CandidatePrimitiveIndex(),query.CandidateTriangleBarycentrics());
         if (diffuse_candidate_accepts<P,G>(g,words,candidate,query.CandidateTriangleFrontFace(),query.CandidateWorldToObject3x4(),ray.Direction,pixel)) {query.CommitNonOpaqueTriangleHit();}

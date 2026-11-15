@@ -5,10 +5,10 @@ pub(crate) fn entries() -> Vec<wgpu::BindGroupLayoutEntry> {
     let stages=wgpu::ShaderStages::COMPUTE;
     let mut entries=pipelines::global_entries();
     entries.extend([
-        pipelines::buffer_entry(10,stages,wgpu::BufferBindingType::Storage {read_only:true}),
-        pipelines::buffer_entry(11,stages,wgpu::BufferBindingType::Storage {read_only:false}),
-        pipelines::buffer_entry(12,stages,wgpu::BufferBindingType::Uniform),
-        pipelines::buffer_entry(13,stages,wgpu::BufferBindingType::Storage {read_only:true}),
+        pipelines::buffer_entry(11,stages,wgpu::BufferBindingType::Storage {read_only:true}),
+        pipelines::buffer_entry(12,stages,wgpu::BufferBindingType::Storage {read_only:false}),
+        pipelines::buffer_entry(13,stages,wgpu::BufferBindingType::Uniform),
+        pipelines::buffer_entry(14,stages,wgpu::BufferBindingType::Storage {read_only:true}),
     ]);
     for e in &mut entries {e.visibility=stages;}
     entries
@@ -28,7 +28,7 @@ impl Plan {
         let bytes=u64::from(leaves)*8;
         let limits=r.device.limits();
         ensure!(bytes<=limits.max_buffer_size && bytes<=u64::from(limits.max_storage_buffer_binding_size),
-            "{}", crate::gpu_memory::limit_message("mesh-source area tree", format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",limits.max_storage_buffer_binding_size,limits.max_buffer_size), "reduce emissive mesh geometry"));
+            crate::gpu_memory::device_limit("mesh-source area tree", format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",limits.max_storage_buffer_binding_size,limits.max_buffer_size), "reduce emissive mesh geometry"));
         let d=&r.device;
         let layout=d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:Some("mesh-source areas"),entries:&entries()});
         let hits=rt::hits_layout(d);
@@ -63,8 +63,8 @@ impl Slot {
             // The storage admission bounds the tree well below a two-dimensional dispatch's capacity.
             assert!(height<=max,"mesh-source tree dispatch exceeds device dimensions");
             let config=init(d,"mesh-source area level",bytemuck::cast_slice(&[plan.base,first,first,width,crate::materials::value_word(vork_scene::v2::OPENPBR.iter().position(|p|p.name=="emission_color").unwrap()) as u32,crate::materials::value_word(vork_scene::v2::OPENPBR.iter().position(|p|p.name=="emission_luminance").unwrap()) as u32,0,0]),wgpu::BufferUsages::UNIFORM);
-            let mut entries=pipelines::ray_globals(s,&lighting.uniform,objects,&lighting.lights,&lighting.cluster_config,&lighting.cluster_lights);
-            entries.extend([entry(10,s.rays.as_ref().unwrap().alpha.as_entire_binding()),entry(11,self.buffer.as_entire_binding()),entry(12,config.as_entire_binding()),entry(13,materials.as_entire_binding())]);
+            let mut entries=pipelines::ray_globals(s,&lighting.uniform,objects,&lighting.lights,&lighting.cluster_config,&lighting.cluster_lights, &lighting.analytic_light_tree);
+            entries.extend([entry(11,s.rays.as_ref().unwrap().alpha.as_entire_binding()),entry(12,self.buffer.as_entire_binding()),entry(13,config.as_entire_binding()),entry(14,materials.as_entire_binding())]);
             self.steps.push(Step {bind:d.create_bind_group(&wgpu::BindGroupDescriptor {label:Some("mesh-source area level"),layout:&plan.layout,entries:&entries}),dispatch:[width,height,1]});
             if first==1 {break;} first/=2;
         }

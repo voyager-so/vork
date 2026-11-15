@@ -12,7 +12,7 @@ pub type Origins = BTreeMap<String, Vec<String>>;
 fn content_name(definition: &Value) -> String {
     // FNV-1a over the canonical (key-sorted) JSON text: stable across runs and platforms.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
-    for byte in definition.to_string().bytes() {
+    for byte in serde_json::to_string(definition).expect("inline JSON serializes").bytes() {
         hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
     }
     format!("~{hash:016x}")
@@ -46,20 +46,19 @@ fn hoist(root: &mut Map<String, Value>, table: &str, slot: &mut Value, path: &st
 // table values; structural edges recurse without hoisting their object.
 fn edges(kind: &str) -> &'static [(&'static str, &'static str, bool)] {
     match kind {
-        "scene" => &[("nodes.*","node",false),("render","render",false),("animation.*","layer",false),
+        "scene" => &[("nodes.*","node",false),("composition","composition",false),("animation.*","layer",false),
             ("geometry.*","geometry",false),("materials.*","materials",false),("images.*","images",false),
             ("buffers.*","buffers",false),("programs.*","programs",false)],
-        "node" => &[("children.*","node",false),("geometry","geometry",true),("materials.*","materials",true),
+        "node" => &[("children.*","node",false),("animation.*","layer",false),("geometry","geometry",true),("materials.*","materials",true),
             ("instances.count","buffers",true),("instances.attributes.*","buffers",true),
             ("skin.inverse_bind_matrices","buffers",true),("image","images",true),
-            ("medium","materials",true),("material","materials",true)],
+            ("medium","materials",true),("material","materials",true),("composition","composition",false)],
+        "composition" => &[("view","materials",true),("compositor.*","composite",false)],
         "geometry" => &[("status.buffer","buffers",true),("ids","buffers",true),("count","buffers",true),("indices","buffers",true),("curve_vertex_counts","buffers",true),("widths","buffers",true),
             ("attributes.*","buffers",true),("morphs.*.POSITION","buffers",true),("morphs.*.NORMAL","buffers",true)],
         "materials" => &[("program","programs",true),("inputs.*","input",false)],
         "input" => &[("image","images",true),("grid","buffers",true)],
-        "images" => &[("render","render",false)],
-        "render" => &[("compositor.*","composite",false),
-            ("display","materials",true)],
+        "images" => &[("composition","composition",false)],
         "programs" => &[("bindings.*","buffers",true)],
         "layer" => &[("tracks.*.keys.times","buffers",true),("tracks.*.keys.values","buffers",true)],
         _ => &[],
@@ -126,7 +125,16 @@ macro_rules! resource_files {
             fn files(nodes: &mut [super::Node]) -> Vec<&mut String> {
                 let mut result = Vec::new();
                 for node in nodes {
-                    if let super::NodeKind::Asset { file, .. } = &mut node.kind { result.push(file); }
+                    match &mut node.kind {
+                        super::NodeKind::Asset { file, .. } => result.push(file),
+                        super::NodeKind::Text { font, content, .. } => {
+                            result.extend(font.files_mut());
+                            if let super::Content::Runs(runs) = content {
+                                result.extend(runs.iter_mut().filter_map(|run| run.font.as_mut()).flat_map(|font| font.files_mut()));
+                            }
+                        }
+                        _ => {}
+                    }
                     result.extend(files(&mut node.children));
                 }
                 result
@@ -188,19 +196,26 @@ pub(super) fn lower(scene: &mut Value) -> Origins {
 mod tests {
     use super::super::*;
     #[test]
+    fn content_names_sort_nested_object_keys() {
+        let first: serde_json::Value = serde_json::from_str(r#"{"z":{"b":1,"a":2},"a":[3,2]}"#).unwrap();
+        let second: serde_json::Value = serde_json::from_str(r#"{"a":[3,2],"z":{"a":2,"b":1}}"#).unwrap();
+        assert_eq!(super::content_name(&first), super::content_name(&second));
+    }
+
+    #[test]
     fn display_inputs_lower_nested_inline_images() {
         let scene = Scene::from_json(&serde_json::to_vec(&serde_json::json!({
             "version":2,"programs":{"copy_program":{"source":crate::v2::COPY_COMPOSITOR}},"nodes":[{"type":"camera","name":"camera"}],
-            "render":{"display":{"program":"blender/filmic","inputs":{
-                "lut":{"image":{"render":{"camera":"camera","compositor":[{
+            "composition":{"space":"3d","view":{"program":"blender/filmic","inputs":{
+                "lut":{"image":{"composition":{"compositor":[{
                     "program":"copy_program","inputs":{"texture":{"image":{"file":"lut.exr"}}}
-                }]}}}
+                }]},"render":{"camera":"camera"}}}
             }}}
         })).unwrap()).unwrap();
         assert_eq!(scene.images.len(), 2);
         assert!(scene.images.values().any(|image| image.file.as_deref() == Some("lut.exr")));
         let value = scene.content_json().unwrap();
-        let material = value["render"]["display"].as_str().unwrap();
+        let material = value["composition"]["view"].as_str().unwrap();
         let name = value["materials"][material]["inputs"]["lut"]["image"].as_str().unwrap();
         assert!(scene.images[name].render.is_some());
     }
@@ -218,21 +233,21 @@ mod tests {
     }
     #[test]
     fn inline_render_images_lower_their_compositors_recursively() {
-        let image = serde_json::json!({"render":{"camera":"capture","root":"empty",
-            "compositor":[{"program":"copy_program"}]}});
+        let image = serde_json::json!({"composition":{"compositor":[{"program":"copy_program"}]},"render":{"camera":"capture","root":"empty"}});
         for document in [
             serde_json::json!({"version":2,"programs":{"copy_program":{"source":crate::v2::COPY_COMPOSITOR}},"nodes":[{"type":"camera","name":"capture"},{"type":"node","name":"empty"}],
                 "materials":{"surface":{"inputs":{"base_color":{"image":image}}}}}),
             serde_json::json!({"version":2,"programs":{"copy_program":{"source":crate::v2::COPY_COMPOSITOR}},"nodes":[{"type":"camera","name":"capture"},{"type":"node","name":"empty"},
                 {"type":"light","shape":"environment","material":{"program":"std/environment_image","inputs":{"image":{"image":image}}}}]}),
             serde_json::json!({"version":2,"programs":{"copy_program":{"source":crate::v2::COPY_COMPOSITOR}},"nodes":[{"type":"camera","name":"capture"},{"type":"node","name":"empty"}],
-                "render":{"compositor":[{"program":"copy_program","inputs":{"texture":{"image":image}}}]}}),
+                "composition":{"space":"3d","compositor":[{"program":"copy_program","inputs":{"texture":{"image":image}}}]},"render":{}}),
         ] {
             let loaded = Scene::from_json(&serde_json::to_vec(&document).unwrap());
             let scene=loaded.unwrap();
-            let image = scene.images.values().next().unwrap().render.as_ref().unwrap();
-            assert_eq!(image.compositor.len(), 1);
-            assert_eq!(scene.materials[image.compositor[0].material()].program, "copy_program");
+            let image = scene.images.values().next().unwrap();
+            assert!(image.render.is_some());
+            assert_eq!(image.compositor().len(), 1);
+            assert_eq!(scene.materials[image.compositor()[0].material()].program, "copy_program");
         }
     }
     #[test]
@@ -278,15 +293,14 @@ mod tests {
 
 /// Recover positions from the original JSON, never from its sorted/serialized form.
 /// The input has already passed serde's syntax check. Only requested paths are retained.
+///
+/// One walk over the bytes with its own stack of open containers, so a document's depth costs no call stack.
+/// The requested paths are held sorted: the ones under any path are one range of that list, found inside its
+/// parent's range, and a value no requested path lies under is skipped without being read.
 pub(super) fn locate(bytes: &[u8], origins: &mut Origins) {
+    use std::fmt::Write;
     fn ws(bytes: &[u8], pos: &mut usize) {
         while bytes.get(*pos).is_some_and(u8::is_ascii_whitespace) { *pos += 1; }
-    }
-    fn token(bytes: &[u8], pos: &mut usize) -> Value {
-        let mut stream = serde_json::Deserializer::from_slice(&bytes[*pos..]).into_iter::<Value>();
-        let value = stream.next().unwrap().unwrap();
-        *pos += stream.byte_offset();
-        value
     }
     fn skip(bytes: &[u8], pos: &mut usize) {
         let mut depth = 0usize;
@@ -294,7 +308,7 @@ pub(super) fn locate(bytes: &[u8], origins: &mut Origins) {
             match bytes.get(*pos) {
                 Some(b'"') => {
                     *pos += 1;
-                    while bytes[*pos] != b'"' {
+                    while bytes.get(*pos).is_some_and(|&c| c != b'"') {
                         if bytes[*pos] == b'\\' { *pos += 1; }
                         *pos += 1;
                     }
@@ -312,47 +326,86 @@ pub(super) fn locate(bytes: &[u8], origins: &mut Origins) {
             }
         }
     }
-    fn walk(bytes: &[u8], pos: &mut usize, path: &str, wanted: &mut BTreeMap<String, usize>, newlines: &[usize]) {
-        ws(bytes, pos);
-        if !wanted.range(path.to_owned()..).next().is_some_and(|(p, _)| p.starts_with(path)) {
-            skip(bytes, pos); return;
-        }
-        if let Some(line) = wanted.get_mut(path) { *line = newlines.partition_point(|&offset| offset < *pos) + 1; }
-        match bytes[*pos] {
-            b'{' => {
-                *pos += 1;
-                loop {
-                    ws(bytes, pos);
-                    if bytes[*pos] == b'}' { *pos += 1; break; }
-                    let key = token(bytes, pos).as_str().unwrap().to_owned();
-                    ws(bytes, pos); *pos += 1;
-                    // Structural field names use dots; arbitrary table keys use brackets.
-                    let bracket = format!("{path}[{key:?}]");
-                    let opaque = wanted.range(bracket.clone()..).next().is_some_and(|(p, _)| p.starts_with(&bracket));
-                    let child = if opaque { bracket } else { format!("{path}.{key}") };
-                    walk(bytes, pos, &child, wanted, newlines);
-                    ws(bytes, pos);
-                    if bytes[*pos] == b',' { *pos += 1; }
-                }
-            }
-            b'[' => {
-                *pos += 1; let mut index = 0;
-                loop {
-                    ws(bytes, pos);
-                    if bytes[*pos] == b']' { *pos += 1; break; }
-                    walk(bytes, pos, &format!("{path}[{index}]"), wanted, newlines);
-                    index += 1; ws(bytes, pos);
-                    if bytes[*pos] == b',' { *pos += 1; }
-                }
-            }
-            _ => { token(bytes, pos); }
+    /// The object key at `pos` (its opening quote), leaving `pos` after its closing quote.
+    fn key<'a>(bytes: &'a [u8], pos: &mut usize) -> std::borrow::Cow<'a, str> {
+        let start = *pos;
+        skip(bytes, pos);
+        let end = (*pos).min(bytes.len());
+        let inner = bytes.get(start + 1..end.saturating_sub(1)).unwrap_or_default();
+        match std::str::from_utf8(inner) {
+            // No escape: the key is the bytes between its quotes.
+            Ok(text) if !inner.contains(&b'\\') => text.into(),
+            _ => serde_json::from_slice::<String>(&bytes[start..end]).unwrap_or_default().into(),
         }
     }
-    let mut wanted = origins.values().flatten().map(|path| (path.clone(), 0)).collect();
+    let mut wanted: Vec<String> = origins.values().flatten().cloned().collect();
+    wanted.sort_unstable();
+    wanted.dedup();
+    let mut lines = vec![0usize; wanted.len()];
     let newlines = bytes.iter().enumerate().filter_map(|(i, &c)| (c == b'\n').then_some(i)).collect::<Vec<_>>();
-    walk(bytes, &mut 0, "scene", &mut wanted, &newlines);
+    // The requested paths that start with `path`, as a range of `wanted` inside `within` (its parent's range).
+    let under = |within: (usize, usize), path: &str| -> (usize, usize) {
+        let low = within.0 + wanted[within.0..within.1].partition_point(|known| known.as_str() < path);
+        let high = low + wanted[low..within.1].partition_point(|known| known.starts_with(path));
+        (low, high)
+    };
+    /// A container being read: where its own path ends in the path buffer, the requested paths under it,
+    /// and, for an array, the next element's index.
+    struct Open { array: bool, index: usize, path_len: usize, under: (usize, usize) }
+    let mut path = String::from("scene");
+    let mut open: Vec<Open> = Vec::new();
+    let mut pos = 0;
+    ws(bytes, &mut pos);
+    // The value at `pos`, whose path is the buffer and whose requested paths are `range`.
+    let mut value = |pos: &mut usize, path: &str, range: (usize, usize), open: &mut Vec<Open>| {
+        if range.0 == range.1 { skip(bytes, pos); return; }
+        let exact = wanted[range.0] == path;
+        if exact { lines[range.0] = newlines.partition_point(|&offset| offset < *pos) + 1; }
+        // Nothing requested lies inside it.
+        if exact && range.1 - range.0 == 1 { skip(bytes, pos); return; }
+        match bytes.get(*pos) {
+            Some(b'{') => { *pos += 1; open.push(Open { array: false, index: 0, path_len: path.len(), under: range }); }
+            Some(b'[') => { *pos += 1; open.push(Open { array: true, index: 0, path_len: path.len(), under: range }); }
+            _ => skip(bytes, pos),
+        }
+    };
+    value(&mut pos, &path, under((0, wanted.len()), "scene"), &mut open);
+    while let Some(top) = open.last_mut() {
+        ws(bytes, &mut pos);
+        if bytes.get(pos) == Some(&b',') { pos += 1; ws(bytes, &mut pos); }
+        let (path_len, within) = (top.path_len, top.under);
+        path.truncate(path_len);
+        match bytes.get(pos) {
+            None => break,
+            Some(b']') if top.array => { pos += 1; open.pop(); }
+            Some(b'}') if !top.array => { pos += 1; open.pop(); }
+            Some(_) if top.array => {
+                let _ = write!(path, "[{}]", top.index);
+                top.index += 1;
+                value(&mut pos, &path, under(within, &path), &mut open);
+            }
+            Some(_) => {
+                let name = key(bytes, &mut pos);
+                ws(bytes, &mut pos);
+                pos += 1;
+                ws(bytes, &mut pos);
+                // Structural field names use dots; arbitrary table keys use brackets.
+                let _ = write!(path, "[{name:?}]");
+                let mut range = under(within, &path);
+                if range.0 == range.1 {
+                    path.truncate(path_len);
+                    path.push('.');
+                    path.push_str(&name);
+                    range = under(within, &path);
+                }
+                value(&mut pos, &path, range, &mut open);
+            }
+        }
+    }
     for path in origins.values_mut().flatten() {
-        if let Some(line) = wanted.get(path).filter(|&&line| line > 0) { *path = format!("{path} (line {line})"); }
+        if let Ok(at) = wanted.binary_search_by(|known| known.as_str().cmp(path.as_str())) {
+            if lines[at] > 0 { *path = format!("{path} (line {})", lines[at]); }
+        }
     }
 }
 

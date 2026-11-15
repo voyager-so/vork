@@ -23,10 +23,10 @@ public struct Inputs {
 
 // Blender view plane. A positive focus argument is the evaluated focus-object depth.
 public CameraCalibration camera_calibration(float aspect, float focus, float time, Inputs i) {
-    let span = i.fit == SensorFit.Horizontal ? aspect : i.fit == SensorFit.Vertical ? 1. : (aspect > 1. ? aspect : 1.);
-    let sensor = i.fit == SensorFit.Vertical ? i.sensor_height : i.sensor_width;
+    let span = int(i.fit) == int(SensorFit.Horizontal) ? aspect : int(i.fit) == int(SensorFit.Vertical) ? 1. : (aspect > 1. ? aspect : 1.);
+    let sensor = int(i.fit) == int(SensorFit.Vertical) ? i.sensor_height : i.sensor_width;
     let height = sensor / span;
-    let ortho = i.projection == CameraProjection.Ortho;
+    let ortho = int(i.projection) == int(CameraProjection.Ortho);
     CameraCalibration c;
     c.screen = float4(ortho ? 2.*span/(i.ortho_scale*aspect) : 2.*i.lens/(height*aspect),
         ortho ? 2.*span/i.ortho_scale : 2.*i.lens/height,

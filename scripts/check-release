@@ -30,13 +30,20 @@ with tempfile.TemporaryDirectory(prefix='vork-release-') as tmp:
     if a.skip_setup:
         env['VORK_SKIP_SETUP'] = '1'
     (root / 'home').mkdir()
+    # Run a copy of the installer from a directory holding nothing else. Run from the checkout, it would take
+    # an archive packaged beside it (install.sh prefers a .tar.xz there) instead of the one named here. The
+    # download base holds only the named archive and its checksum, so a successful install installed it.
+    installer = root / 'installer'
+    installer.mkdir()
     if os.name == 'nt':
+        shutil.copy2(repo / 'install.ps1', installer / 'install.ps1')
         subprocess.run([shutil.which('pwsh') or 'powershell', '-NoProfile', '-ExecutionPolicy', 'Bypass',
-                        '-File', str(repo / 'install.ps1')], env=env, check=True)
+                        '-File', str(installer / 'install.ps1')], env=env, check=True)
         package = root / 'installed'
         binary = package / 'vork.exe'
     else:
-        subprocess.run(['sh', str(repo / 'install.sh')], env=env, check=True)
+        shutil.copy2(repo / 'install.sh', installer / 'install.sh')
+        subprocess.run(['sh', str(installer / 'install.sh')], env=env, check=True)
         package = root / 'installed/lib/vork'
         binary = root / 'installed/bin/vork'
     # Validate the installed immutable assets against the exact installed binary.
@@ -54,8 +61,8 @@ with tempfile.TemporaryDirectory(prefix='vork-release-') as tmp:
     Path(env['PATH']).mkdir()
     # Use installed assets, not the source checkout or the extracted archive.
     # The installed symlink must resolve Filmic data beside the real executable.
-    filmic = {'version': 2, 'render': {'resolution': [1, 1],
-              'display': {'program': 'blender/filmic', 'inputs': {'dither_intensity':0}}, 'background': [.18, .18, .18]},
+    filmic = {'version': 2, 'composition': {'space': '3d', 'view': {'program': 'blender/filmic'}},
+              'render': {'resolution': [1, 1], 'background': [.18, .18, .18]},
               'nodes': [{'type': 'camera'}]}
     filmic_scene = root / 'filmic.json'
     filmic_scene.write_text(json.dumps(filmic))
@@ -69,7 +76,7 @@ with tempfile.TemporaryDirectory(prefix='vork-release-') as tmp:
         result = subprocess.run(command, cwd=root, env=env, capture_output=True, text=True)
         if result.returncode == 0 or str(lut.resolve()) not in result.stdout + result.stderr:
             p.error(f'missing Filmic LUT must fail naming {lut}: {result.stdout}{result.stderr}')
-        filmic['render']['display'] = {'program':'std/standard'}
+        filmic['composition']['view'] = {'program':'std/standard'}
         filmic_scene.write_text(json.dumps(filmic))
         subprocess.run(command, cwd=root, env=env, check=True)
     finally:

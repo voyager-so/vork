@@ -1,0 +1,110 @@
+{
+  "nodes": [
+    {
+      "id": "fx-combo-text",
+      "type": "richtext",
+      "x": 120,
+      "y": 200,
+      "rotation": 0,
+      "scale": 1,
+      "width": 1040,
+      "height": 260,
+      "htmlContent": "<p style=\"font-family: Inter; font-size: 92px; font-weight: 700; color: #f4f7fb\">STACKED</p>",
+      "effects": [
+        {
+          "id": "drop-shadow-0",
+          "type": "drop-shadow",
+          "color": "rgba(0, 0, 0, 0.9)",
+          "blur": 4,
+          "offset": {
+            "x": 5,
+            "y": 5
+          },
+          "opacity": 0.5
+        },
+        {
+          "type": "glow",
+          "id": "effect-combo-glow",
+          "color": "#36f9c5",
+          "radiusPx": 14,
+          "intensity": 1.2,
+          "opacity": 0.9
+        },
+        {
+          "type": "echo",
+          "id": "effect-combo-echo",
+          "count": 3,
+          "offsetX": 8,
+          "offsetY": 6,
+          "scaleStep": 0.97,
+          "colorStart": "#3a86ff",
+          "colorEnd": "#10131a",
+          "opacityStep": 0.75
+        },
+        {
+          "type": "extrude",
+          "id": "effect-combo-extrude",
+          "depthPx": 12,
+          "angleDeg": 60,
+          "color": "#2b2d42"
+        }
+      ],
+      "strokes": [
+        {
+          "id": "stroke-0",
+          "paint": {
+            "type": "solid",
+            "color": "#ff006e"
+          },
+          "width": 2
+        }
+      ]
+    },
+    {
+      "id": "fx-combo-disabled",
+      "type": "richtext",
+      "x": 120,
+      "y": 540,
+      "rotation": 0,
+      "scale": 1,
+      "width": 1040,
+      "height": 140,
+      "htmlContent": "<p style=\"font-family: Inter; font-size: 48px; color: #adb5bd\">disabled entries render plain</p>",
+      "effects": [
+        {
+          "type": "glow",
+          "id": "effect-combo-disabled-glow",
+          "color": "#ff0000",
+          "radiusPx": 30,
+          "intensity": 2,
+          "opacity": 1,
+          "visible": false
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "effects-structured-combo",
+      "width": 1280,
+      "height": 800,
+      "nodeIds": ["fx-combo-text", "fx-combo-disabled"],
+      "fills": [
+        {
+          "id": "fill-0",
+          "paint": {
+            "type": "solid",
+            "color": "#10131a"
+          }
+        }
+      ]
+    }
+  ],
+  "config": {
+    "renderPageClipping": true
+  },
+  "variables": [],
+  "canvasRootNodeIds": [],
+  "layoutMode": "vertical"
+}

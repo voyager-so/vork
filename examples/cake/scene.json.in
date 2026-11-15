@@ -7,12 +7,14 @@
       1080
     ],
     "fps": 24,
-    "duration": 7,
-    "display": {
+    "duration": 7
+  },
+  "composition": {
+    "space": "3d",
+    "view": {
       "program": "std/agx",
       "inputs": {
-        "exposure": 0,
-        "dither_intensity": 1.5
+        "exposure": 0
       }
     }
   },

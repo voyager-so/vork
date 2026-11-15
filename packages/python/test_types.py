@@ -5,6 +5,11 @@ import vork.types as types
 
 
 class GeneratedTypes(unittest.TestCase):
+    def test_compositor_step_binding_replaces_node_binding(self):
+        self.assertEqual(set(get_type_hints(types.StepBinding)), {"step"})
+        self.assertEqual(types.StepBinding.__required_keys__, {"step"})
+        self.assertFalse(hasattr(types, "NodeBinding"))
+
     def test_argv_builder_is_private(self):
         import vork
         self.assertFalse(hasattr(vork, "render_arguments"))

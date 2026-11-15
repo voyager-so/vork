@@ -58,7 +58,7 @@ with tempfile.TemporaryDirectory() as empty:
             call()
         except RuntimeError as error:
             message = str(error)
-            for text in ('vork executable not found', 'PATH', 'VORK_BIN', 'npm install -g @voyager-so/vork', 'https://github.com/voyager-so/vork/releases'):
+            for text in ('vork renderer not found', 'VORK_BIN', 'npm install -g @voyager-so/vork', 'Curl installer: https://github.com/voyager-so/vork#install'):
                 assert text in message, message
             print(message)
         else:

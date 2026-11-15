@@ -1,4 +1,11 @@
 NODES
+A field path names one object, not its table: `vork help field node.font-size`, never nodes.font-size
+(the table is scene.nodes). A node type's fields are flat siblings of `type`, addressed as node.NAME.
+`vork help text`, `vork help path`, `vork help mesh`, `vork help camera`, `vork help light` and
+`vork help asset` list one type's fields; `vork help composition` lists the canvas's.
+Canvas fields (`vork help field PATH`): composition.space, composition.viewBox, node.d, node.fill, node.stroke,
+node.stroke-width, node.content, node.font, node.font-size, node.opacity, node.clip-path, node.mask, node.filter.
+A canvas inside a canvas cannot set viewBox or preserveAspectRatio.
 Visibility per ray type is ANDed with ancestors. pass_index is inherited; otherwise IDs
 are assigned stably in meta.json (0 = background).
 Assets load .glb/.gltf. Imported names: asset/node-name or asset/#index.

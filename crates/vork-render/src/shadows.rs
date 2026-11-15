@@ -19,7 +19,7 @@ impl Persistent {
     pub(crate) fn new(s:&InstalledScene,r:&Renderer)->Result<Self> {
         let mut counts = std::collections::BTreeSet::from([1usize]);
         for render in std::iter::once(s.render.clone()).chain(
-            s.scene.images.values().filter_map(|i| i.render.as_ref()).map(|r| r.resolve(&s.render))
+            s.scene.images.values().filter_map(|i| i.resolved_render(&s.render))
         ) {
 
             counts.insert(render.settings.samples as usize); // One emitter ray per camera sample.
@@ -37,10 +37,10 @@ impl Persistent {
             words.extend(crate::sampling::sequence_parameters(count));
         }
 
-        ensure!(words.len() as u64*4<=r.device.limits().max_storage_buffer_binding_size.min(r.device.limits().max_buffer_size),"{}", crate::gpu_memory::limit_message("shadow sampling rows", format_args!("{} bytes",words.len() as u64*4), format_args!("{} bytes",r.device.limits().max_storage_buffer_binding_size.min(r.device.limits().max_buffer_size)), "reduce shadow light count"));
+        ensure!(words.len() as u64*4<=r.device.limits().max_storage_buffer_binding_size.min(r.device.limits().max_buffer_size),crate::gpu_memory::device_limit("shadow sampling rows", format_args!("{} bytes",words.len() as u64*4), format_args!("{} bytes",r.device.limits().max_storage_buffer_binding_size.min(r.device.limits().max_buffer_size)), "reduce shadow light count"));
         let sequence=init(&r.device,"shadow sampling rows",bytemuck::cast_slice(&words),wgpu::BufferUsages::STORAGE);
         let mut changes=values::LightingTracker::default();
-        if s.environment.animated() {changes.changed(values::LightingKey::EnvironmentInputs,&s.environment.sample_key(0.)?);}
+        if s.environment.animated() {changes.changed(values::LightingKey::EnvironmentInputs,&s.environment.sample_key(0.,0.)?);}
         Ok(Self {_fibre:s.fibre.as_ref().map(|p|p.storage()),_probes:s.probes.as_ref().map(|p|p.storage()),sequence,sequence_offsets,changes:std::sync::Arc::new(std::sync::Mutex::new(changes))})
     }
     /// Camera-budget parameters live above the independent transport flag bits.

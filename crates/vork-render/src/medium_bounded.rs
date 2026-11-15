@@ -105,10 +105,6 @@ pub(super) fn install(
         ));
     }
     path_homogeneous.push_str("default: return true;}}\n");native.point.push_str(&path_homogeneous);
-    native.identity.push(u8::from(native.homogeneous));
-    if !native.homogeneous {
-        native.identity.extend([u8::from(native.scattering_free),u8::from(native.emission_free)]);
-    }
     if let Some(world) = world {
         (words[2], words[3]) = names[world];
     }
@@ -141,7 +137,6 @@ impl super::Installed {
         let carriers:std::collections::BTreeSet<_>=self.instances.names.keys().filter_map(|name|materials.get(name).copied()).collect();
         self.native.convex=!force_general && draws.iter().filter(|draw|carriers.contains(&draw.material))
             .all(|draw|convex_carrier(draw).is_some());
-        self.native.identity.push(u8::from(self.native.convex));
     }
     pub(crate) fn mesh_words(
         &mut self,
@@ -545,8 +540,9 @@ mod empty_input_tests {
     use serde_json::json;
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn empty_medium_input_bases_remain_distinct() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         for path in [false, true] {
             for pair in [["empty_a", "empty_b"], ["empty_a", "animated"], ["animated", "empty_b"]] {
                 let mut value = json!({"version":2,"render":{"resolution":[4,4],"duration":1},
@@ -592,7 +588,6 @@ impl super::Installed {
                     .with_context(||format!("medium program {:?} (material {name:?}) has no bounded callback work proof; use a bounded physical coefficient program, or render the volume externally",scene.materials[name].program))?;
                 self.native.point_work=self.native.point_work.max(work);
             }
-            self.native.identity.extend_from_slice(&self.native.point_work.to_le_bytes());
         Ok(())
     }
 }

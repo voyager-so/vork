@@ -1,3 +1,4 @@
+import {writeExecutable} from './executable-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp, writeFile, readFile, rm} from 'node:fs/promises';
@@ -11,7 +12,7 @@ test('exportAsset forwards selection/time/loss codes and returns the complete re
     const asset = join(directory, 'hero.glb'), executable = join(directory, 'vork');
     const report = {version:1, status:'complete', issues:[], counts:{nodes:1,meshes:1,materials:1,images:0}, source_hash:'test'};
     await writeFile(join(directory, 'hero.export.json'), JSON.stringify(report));
-    await writeFile(executable, '#!/usr/bin/env node\nrequire("fs").writeFileSync(process.env.CAPTURE,JSON.stringify(process.argv.slice(2)));\n', {mode:0o700});
+    writeExecutable(executable, '#!/usr/bin/env node\nrequire("fs").writeFileSync(process.env.CAPTURE,JSON.stringify(process.argv.slice(2)));\n', {mode:0o700});
     const module = new URL('../dist/index.js', import.meta.url).href;
     const output = execFileSync(process.execPath, ['--input-type=module','-e', `import {exportAsset} from ${JSON.stringify(module)}; console.log(JSON.stringify(exportAsset('scene.json',{out:${JSON.stringify(asset)},root:'hero',at:1.25,allowLosses:['camera_dof']})));`], {encoding:'utf8', env:{...process.env,VORK_BIN:executable,CAPTURE:join(directory,'args.json')}});
     assert.deepEqual(JSON.parse(output), report);

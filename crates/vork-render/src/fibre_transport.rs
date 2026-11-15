@@ -61,7 +61,7 @@ impl Plan {
         let allocation = u64::from(side).pow(2) * 8;
         ensure!(
             side > 0 && side <= limits.max_texture_dimension_2d && allocation <= max_allocation,
-            "{}", crate::gpu_memory::limit_message("fibre transport atlas", format_args!("{side}x{side} pixels, {allocation} bytes per count/identity target"), format_args!("{} pixels per axis and {max_allocation} bytes per allocation",limits.max_texture_dimension_2d), "reduce render resolution or shadow light count")
+            crate::gpu_memory::device_limit("fibre transport atlas", format_args!("{side}x{side} pixels, {allocation} bytes per count/identity target"), format_args!("{} pixels per axis and {max_allocation} bytes per allocation",limits.max_texture_dimension_2d), "reduce render resolution or shadow light count")
         );
         let mut faces = Vec::with_capacity(count);
         for (light, sun) in suns.iter().enumerate() {
@@ -462,8 +462,9 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn diffuse_hair_reserves_no_physical_capture_or_exit_tree() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let fixture = hair_fixture::with_test_hair(vork_scene::v2::with_test_settings(include_str!("../tests/fixtures/fibre-receiver.json"), include_str!("../tests/presets/fibre-receiver-2172aaaf.json"))?);
         for model in ["diffuse", "chiang"] {
             let mut scene = fixture.clone();
@@ -471,7 +472,10 @@ mod tests {
             inputs.insert("model".into(), model.into());
             let installed = r.install(vork_scene::v2::from_test_value(scene)?, Path::new("."))?;
             let physical = model == "chiang";
-            assert_eq!(installed.fibre.is_some(), physical, "{model:?}");
+            // Physical scattering promotes the complete camera view to path
+            // transport, which reserves no raster fibre capture for either model.
+            assert_eq!(installed.render().settings.integrator.is_path(), physical, "{model:?}");
+            assert!(installed.fibre.is_none(), "{model:?}");
             assert_eq!(installed.objects.iter().any(|o| o.material_index[2] != 0), physical, "{model:?}");
         }
         let mut mixed = fixture.clone();
@@ -481,31 +485,37 @@ mod tests {
         diffuse["materials"] = serde_json::json!(["diffuse"]);
         mixed["nodes"].as_array_mut().unwrap().push(diffuse);
         let installed = r.install(vork_scene::v2::from_test_value(mixed)?, Path::new("."))?;
+        assert!(installed.render().settings.integrator.is_path(), "one physical strand selects the path owner");
+        assert!(installed.fibre.is_none());
         assert_eq!(installed.plan.draws.iter().filter(|d| d.hair).count(), 1);
         assert_eq!(installed.objects.iter().filter(|o| o.material_index[2] != 0).count(), 1);
         Ok(())
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn eviction_respects_shadow_leases_and_rebuilds_fibre() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()) };
+        let r = crate::test_renderer()?;
         let mut fixture = hair_fixture::with_test_hair(vork_scene::v2::with_test_settings(include_str!("../tests/fixtures/fibre-receiver.json"), include_str!("../tests/presets/fibre-receiver-2172aaaf.json"))?);
         fixture["materials"]["hair"]["inputs"]["model"] = "chiang".into();
         fixture["render"]["resolution"] = serde_json::json!([32,32]);
         let scene = r.install(vork_scene::v2::from_test_value(fixture)?, Path::new("."))?;
-        let fibre = scene.fibre.as_ref().context("physical fibre capture")?;
+        // Physical Hair is owned by complete-camera path transport: there is no
+        // raster fibre capture for frame bindings or shadow backing to lease.
+        assert!(scene.render().settings.integrator.is_path(), "physical Hair uses the complete-camera path owner");
+        assert!(scene.fibre.is_none(), "path-owned physical Hair reserves no raster fibre capture");
         let mut frame = scene.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
         frame.submit(&scene, &r, 0.)?;
         let before = frame.collect(&r)?.linear_rgba.unwrap();
+        assert!(before.iter().flatten().all(|v| v.is_finite()));
         let shadows = scene.shadows();
+        // Eviction with live frame bindings, with only the shadow backing, and
+        // with neither must leave a scene that rebuilds the same frame.
         r.residency.evict(u64::MAX);
-        assert!(fibre.cache.is_resident(), "live frame bindings pin fibre storage");
         drop(frame);
         r.residency.evict(u64::MAX);
-        assert!(fibre.cache.is_resident(), "shadow backing still binds the fibre capture");
         drop(shadows);
         r.residency.evict(u64::MAX);
-        assert!(!fibre.cache.is_resident());
         let mut frame = scene.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
         frame.submit(&scene, &r, 0.)?;
         crate::test_linear::assert_linear_eq(&before,&frame.collect(&r)?.linear_rgba.unwrap());
@@ -537,10 +547,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn compiled_fibre_transport_obeys_path_sums_and_absorption_limits() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let r = crate::test_renderer()?;
         let native = medium::Native {
             includes: vec![PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../libraries")],
             ..Default::default()

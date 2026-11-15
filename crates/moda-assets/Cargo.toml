@@ -1,0 +1,42 @@
+# Ported from Moda (desktop-moda native/crates/moda-assets); the changes are listed in PROVENANCE.md.
+[package]
+name = "moda-assets"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Moda's asset layer: local source resolution, decode, ICC, SVG raster, placeholders, pattern packing."
+
+[lib]
+doctest = false
+
+[dependencies]
+# vork reads PNG and JPEG into a canvas; the image crate's other default formats (AVIF and its encoder among them) are
+# left out.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+moxcms = "0.8"
+fast_image_resize = "6"
+resvg = "0.47"
+wgpu = "29"
+bytemuck = { version = "1", features = ["derive"] }
+base64 = "0.22"
+anyhow = "1"
+serde_json = { version = "1", features = ["preserve_order"] }
+
+moda-scene = { path = "../moda-scene" }
+moda-shaders = { path = "../moda-shaders" }
+# The prefetch's decoded-raster cache key (fetch.rs `decoded_raster`).
+blake3 = { version = "1", optional = true }
+
+[features]
+default = ["native-io"]
+# Native local-source prefetch (files / data: URIs, decoded on a thread pool).
+native-io = ["dep:blake3"]
+
+[lints.rust]
+# Moda's `jpeg-parity` feature (libjpeg-turbo decode through mozjpeg's C build) is not ported; JPEG decodes through
+# the image crate, as Moda's builds without the feature do. Its cfg stays declared.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("jpeg-parity"))'] }
+
+[dev-dependencies]
+png = "0.18"

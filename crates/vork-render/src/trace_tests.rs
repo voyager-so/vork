@@ -1,8 +1,9 @@
 use crate::*;
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn surface_queries_match_analytic_fields_in_path_and_raster() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let mut original:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/compute-trace.json"))?;
     let source=original["programs"]["bake"]["source"].as_str().unwrap()
         .replace("void compute(ComputeContext ctx,Inputs i)","Closure surface(ShadingContext ctx,Inputs i)")
@@ -33,8 +34,9 @@ fn surface_queries_match_analytic_fields_in_path_and_raster() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn hair_surface_queries_preserve_complete_camera_routing()->Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let mut scene:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/compute-trace.json"))?;
     let source=scene["programs"]["bake"]["source"].as_str().unwrap();
     let body=source.split_once("bool good=true;").unwrap().1.split_once("#endif").unwrap().0;

@@ -90,7 +90,7 @@ fn cloth_function(library: &str, name: &str) -> String {
     panic!("unterminated cloth function {name}");
 }
 fn cloth_numeric_contract(functions: &[(&str, &str)], setup: &str, checks: &str) -> Result<()> {
-    let Some(r) = crate::test_renderer()? else { return Ok(()); };
+    let r = crate::test_renderer()?;
     let mut source = setup.to_owned();
     for &(library, name) in functions { source.push_str(&cloth_function(library, name)); }
     source.push_str(&format!(r#"
@@ -119,6 +119,7 @@ const CLOTH_SELF: &str = include_str!("../../../libraries/cloth/self.slang");
 const CLOTH_BODY: &str = include_str!("../../../libraries/cloth/body.slang");
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn cloth_unit_handles_lengths_areas_and_zero() -> Result<()> {
     cloth_numeric_contract(&[(CLOTH_SOLVER,"cloth_unit")], "", r#"
         float3 direction=normalize(float3(1,2,-3));
@@ -130,6 +131,7 @@ fn cloth_unit_handles_lengths_areas_and_zero() -> Result<()> {
     "#)
 }
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn cloth_closest_preserves_regions_and_collapsed_triangles_across_units() -> Result<()> {
     cloth_numeric_contract(&[(CLOTH_SOLVER,"cloth_closest")], "", r#"
         float3 a=0,b=float3(1,0,0)*scale,c=float3(0,1,0)*scale,w;
@@ -143,6 +145,7 @@ fn cloth_closest_preserves_regions_and_collapsed_triangles_across_units() -> Res
     "#)
 }
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn cloth_body_cross_preserves_intersection_parallel_and_zero_across_units() -> Result<()> {
     cloth_numeric_contract(&[(CLOTH_BODY,"cloth_body_cross")], "", r#"
         float3 a=0,b=float3(1,0,0)*scale,c=float3(0,1,0)*scale,w;float t;
@@ -160,6 +163,7 @@ fn cloth_body_cross_preserves_intersection_parallel_and_zero_across_units() -> R
     "#)
 }
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn cloth_self_normal_preserves_crossings_and_gap_direction_across_units() -> Result<()> {
     cloth_numeric_contract(&[(CLOTH_SOLVER,"cloth_unit"),(CLOTH_SELF,"cloth_self_normal")],
         "groupshared float SELF_MARGIN;", r#"
@@ -174,6 +178,7 @@ fn cloth_self_normal_preserves_crossings_and_gap_direction_across_units() -> Res
     "#)
 }
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn cloth_face_region_tolerance_tracks_thickness_across_units() -> Result<()> {
     // Execute the shipped face-region expression, with projected points just
     // inside, at the boundary and well outside a finite triangular face.
@@ -203,6 +208,7 @@ fn cloth_face_region_tolerance_tracks_thickness_across_units() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn cloth_stretch_uses_rest_length_for_collapsed_edges() -> Result<()> {
     cloth_numeric_contract(&[(CLOTH_SOLVER,"cloth_stretch")], r#"
         groupshared float3 cloth_x[4];groupshared float rest_length;
@@ -222,6 +228,7 @@ fn cloth_stretch_uses_rest_length_for_collapsed_edges() -> Result<()> {
     "#)
 }
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn cloth_bend_keeps_small_hinges_and_rejects_collapsed_faces() -> Result<()> {
     cloth_numeric_contract(&[(CLOTH_SOLVER,"cloth_bend")], r#"
         groupshared float3 cloth_x[4];
@@ -249,6 +256,7 @@ fn cloth_bend_keeps_small_hinges_and_rejects_collapsed_faces() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn cloth_contact_projection_and_friction_preserve_mass_and_length_units() -> Result<()> {
     cloth_numeric_contract(&[(CLOTH_SOLVER,"cloth_unit"),(CLOTH_SELF,"cloth_contacts_gauss_seidel")], r#"
         static const uint CLOTH_VERTICES=4,CONTACT_CAPACITY=1;
@@ -278,6 +286,7 @@ fn cloth_contact_projection_and_friction_preserve_mass_and_length_units() -> Res
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn cloth_tangent_fallback_is_relative_to_the_local_tangent() -> Result<()> {
     let predicate = CLOTH_SOLVER.lines().find(|s| s.contains("float tangent_length2=")).unwrap();
     let checks = format!(r#"
@@ -291,6 +300,7 @@ fn cloth_tangent_fallback_is_relative_to_the_local_tangent() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn cloth_segment_degeneracy_tracks_thickness_for_either_edge() -> Result<()> {
     cloth_numeric_contract(&[(CLOTH_SELF,"cloth_segments")], "groupshared float SELF_MARGIN;", r#"
         SELF_MARGIN=.03*scale;float s,t;

@@ -10,6 +10,7 @@ const PROGRAM_INPUTS: &str = include_str!(concat!(env!("OUT_DIR"),"/program-inpu
 fn document(topic: &str) -> Option<&'static str> {
     Some(match topic {
         "check" => include_str!("../../../docs/help/check.md"),
+        "ask" => include_str!("../../../docs/help/ask.md"),
         "init" => include_str!("../../../docs/help/init.md"),
         "build" => include_str!("../../../docs/help/build.md"),
         "limits" => include_str!("../../../docs/help/limits.md"),
@@ -23,6 +24,9 @@ fn document(topic: &str) -> Option<&'static str> {
         "geometry" => include_str!("../../../docs/help/geometry.md"),
         "buffers" => include_str!("../../../docs/help/buffers.md"),
         "images" => include_str!("../../../docs/help/images.md"),
+        "springs" => include_str!("../../../docs/help/springs.md"),
+        "sequences" => include_str!("../../../docs/help/sequences.md"),
+        "captions" => include_str!("../../../docs/help/captions.md"),
         "animation" => include_str!("../../../docs/help/animation.md"),
         "render" => include_str!("../../../docs/help/render.md"),
         "profiles" => include_str!("../../../docs/help/profiles.md"),
@@ -38,20 +42,29 @@ fn document(topic: &str) -> Option<&'static str> {
         _ => return None,
     })
 }
+fn node_kind(kind: &str) -> bool {
+    matches!(kind, "camera" | "mesh" | "light" | "asset" | "path" | "text")
+}
 /// The field's own line, or for an object path (e.g. `render`) every field beneath it.
 fn field_lines(path: &str) -> Vec<&'static str> {
     let alias;
     let mut kind_alias = None;
     let path = if let Some((kind, tail)) = path.split_once('.') {
-        if matches!(kind, "camera" | "mesh" | "light" | "asset") {
+        if node_kind(kind) {
             kind_alias = Some(kind);
             alias = format!("node.{tail}");
             &alias
         } else { path }
+    } else if node_kind(path) {
+        kind_alias = Some(path);
+        "node"
     } else { path };
     let name = |line: &'static str| line.split_once(':').map(|(name, _)| name);
     REFERENCE.lines().chain(PROGRAM_INPUTS.lines()).filter(|line| {
         if let Some(kind) = kind_alias {
+            if let Some((_, variant)) = name(line).unwrap_or("").split_once(" [type=") {
+                if variant != format!("\"{kind}\"]") { return false; }
+            }
             if let Some((_, annotation)) = name(line).unwrap_or("").split_once(" (") {
                 if annotation != format!("{kind})") { return false; }
             }
@@ -61,8 +74,29 @@ fn field_lines(path: &str) -> Vec<&'static str> {
         })
     }).collect()
 }
+/// The object a scene table holds, read from the table's own reference line: `scene.nodes: node[]` holds
+/// `node` and `scene.materials: {name:material}` holds `material`. Field paths name that object.
+fn table_element(table: &str) -> Option<&'static str> {
+    let line = REFERENCE.lines().find(|line| line.strip_prefix("scene.")
+        .and_then(|rest| rest.strip_prefix(table)).is_some_and(|rest| rest.starts_with(':')))?;
+    let shape = line.split_once(": ")?.1.split(';').next()?.trim();
+    let element = shape.strip_suffix("[]").or_else(|| shape.strip_prefix("{name:")?.strip_suffix('}'))?;
+    (element != table && !field_lines(element).is_empty()).then_some(element)
+}
 /// Diagnose only failed help lookups; scene decoding keeps its own suggestions.
 fn unknown_field(path: &str) -> String {
+    let heading = path.rsplit('.').next().unwrap_or(path).to_ascii_lowercase();
+    if node_kind(&heading) {
+        return format!("unknown field {path:?}; use `vork help {heading}`; node type fields are flat siblings");
+    }
+    // A table's name in place of its object's: `nodes.font-size` for `node.font-size`.
+    let (table, rest) = path.split_once('.').unwrap_or((path, ""));
+    if let Some(element) = table_element(table) {
+        let field = if rest.is_empty() { element.to_owned() } else { format!("{element}.{rest}") };
+        if !field_lines(&field).is_empty() {
+            return format!("unknown field {path:?}; scene.{table} is the table and a field path names one {element}: use `vork help field {field}`");
+        }
+    }
     let library = path.split('/').next().filter(|name| vork_scene::libraries::library(name).is_some()).unwrap_or("std");
     let listing = format!("; list fields with `vork help {library} --all` or `vork help TOPIC --all`");
     // Variant annotations describe a field, but are not part of its wire path.
@@ -143,6 +177,11 @@ fn serve(topic: Option<&str>, field: Option<&str>, all: bool) -> Result<()> {
         return Ok(());
     }
     let Some(text) = document(topic) else {
+        let lines = field_lines(topic);
+        if !lines.is_empty() {
+            for line in lines { writeln!(out, "{line}").map_err(crate::output::error)?; }
+            return Ok(());
+        }
         let error = vork_scene::diagnostics::unknown("help topic", topic, constants::HELP_TOPICS.iter().copied());
         return Err(usage(format!("{error}; use `vork help` for the topic list")));
     };
@@ -181,6 +220,58 @@ mod tests {
         assert!(!field_lines("mesh.geometry").is_empty());
     }
     #[test]
+    fn node_headings_include_common_and_only_their_variant_fields() {
+        for kind in ["camera", "mesh", "light", "asset", "path", "text"] {
+            let lines = field_lines(kind);
+            assert!(lines.iter().any(|line| line.starts_with("node.translation:")), "{kind}");
+            assert!(lines.iter().any(|line| line.contains(&format!(" ({kind}):"))), "{kind}");
+            assert!(lines.iter().all(|line| {
+                let name = line.split_once(':').unwrap().0;
+                name.split_once(" (").is_none_or(|(_, annotation)| annotation == format!("{kind})"))
+            }), "{kind}");
+        }
+        assert_eq!(field_lines("text.font-size"), field_lines("node.font-size"));
+        assert_eq!(field_lines("path.d"), field_lines("node.d"));
+        assert!(field_lines("text.d").is_empty());
+        assert!(field_lines("path.font").is_empty());
+        for path in ["Text", "node.text", "nodes.path", "nodes.mesh"] {
+            let error = unknown_field(path);
+            assert!(error.contains("vork help ") && error.contains("flat siblings"), "{error}");
+        }
+    }
+    #[test]
+    fn a_table_name_points_at_the_object_its_fields_belong_to() {
+        for (path, field) in [("nodes.font-size", "node.font-size"), ("nodes", "node"),
+            ("materials.inputs", "material.inputs"), ("images.file", "image.file"), ("buffers.type", "buffer.type")] {
+            assert!(field_lines(path).is_empty(), "{path}");
+            assert!(!field_lines(field).is_empty(), "{field}");
+            let error = unknown_field(path);
+            assert!(error.contains(&format!("use `vork help field {field}`")), "{error}");
+            assert!(error.contains(&format!("scene.{}", path.split('.').next().unwrap())), "{error}");
+        }
+        // A table named like its object, an object that is not a table, and a field its object lacks keep
+        // the nearest-name diagnosis.
+        assert_eq!(table_element("geometry"), None);
+        assert_eq!(table_element("render"), None);
+        assert!(!unknown_field("nodes.fontsize").contains("is the table"));
+    }
+    #[test]
+    fn the_nodes_page_names_canvas_fields_and_lookups_that_resolve() {
+        let page = document("nodes").unwrap();
+        let listed = page.split_once("Canvas fields (`vork help field PATH`): ").unwrap().1;
+        let listed = &listed[..listed.find(".\n").unwrap()];
+        let paths: Vec<_> = listed.split([',', '\n']).map(str::trim).filter(|path| !path.is_empty()).collect();
+        assert!(paths.contains(&"node.font-size") && paths.contains(&"node.d") && paths.contains(&"composition.space"), "{paths:?}");
+        for path in paths {
+            assert!(!field_lines(path).is_empty(), "{path}");
+        }
+        for topic in ["text", "path", "mesh", "camera", "light", "asset", "composition"] {
+            assert!(page.contains(&format!("`vork help {topic}`")), "{topic}");
+            assert!(!field_lines(topic).is_empty(), "{topic}");
+        }
+        assert!(root_help().contains("vork help composition, vork help text, vork help path"));
+    }
+    #[test]
     fn program_recovery_prefers_real_fields() {
         for leaf in ["emission_luminance", "subsurface_radius_scale"] {
             let lines = field_lines(&format!("std/openpbr.{leaf}"));
@@ -192,11 +283,17 @@ mod tests {
     }
     #[test]
     fn bundled_inputs_include_defaults_tokens_and_declared_ranges() {
+        // Hair belongs to the std program; test its generated facts, not a prose redirect.
+        assert!(!REFERENCE.lines().any(|line| line.starts_with("hair.")));
+        assert!(vork_scene::libraries::library("std").unwrap().help.contains("std/hair"));
         let hair = field_lines("std/hair");
         assert_eq!(hair.len(), 14);
         assert!(field_lines("std/hair.parametrization")[0].contains("color|melanin|absorption"));
         assert!(field_lines("std/hair.color")[0].contains("default [0.017513,0.005763,0.002059]"));
         assert!(field_lines("std/hair.roughness")[0].contains("default 0.3; no declared range"));
+        assert_eq!(field_lines("std/hair.random"), [
+            "std/hair.random: An unbound input supplies a stable per-strand random value."
+        ]);
         assert_eq!(field_lines("std/sky").len(), 6);
         assert!(field_lines("std/sky.altitude")[0].contains("default 100; range [0,100000]"));
         assert!(field_lines("std/text.size")[0].contains("default 1; metres per font em"));

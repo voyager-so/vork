@@ -140,9 +140,8 @@ def _moon_mesh():
 
 def generate():
     scene = {'version': 2,
-             'render': {'resolution': [1920,1080], 'duration': DURATION, 'fps': FPS,
-                        'background': 'environment', 'display': {'program': 'std/agx'},
-                        'compositor': bloom({'threshold':1.,'strength':.045,'size':.28},[1920,1080])},
+             "composition":{"space":"3d","view":{'program': 'std/agx'},'compositor':bloom({'threshold':1.,'strength':.045,'size':.28},[1920,1080])},'render': {'resolution': [1920,1080], 'duration': DURATION, 'fps': FPS,
+                        'background': 'environment'},
              'propagation': {'program': 'propagation', 'bounds': [[-1000]*3, [1000]*3]},
              'programs': {name: {'file': name+'.slang'} for name in ['propagation', 'disk', 'environment', 'moon']},
              'materials': {'disk': {'program': 'disk'},

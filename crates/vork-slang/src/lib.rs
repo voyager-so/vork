@@ -8,11 +8,16 @@
 //! WGSL fragment whose identifiers carry a per-program tag, so any set of
 //! programs can be concatenated into one scene shader. The kernel side of the
 //! boundary is described by [`Abi`]; see docs/PROGRAMS.md.
+#[cfg(all(test, unix))]
+#[path = "../../test_support.rs"]
+mod test_support;
+
 mod image_native;
 mod identity;
 mod filesystem;
-pub use identity::{InputIdentity, PreparedModules, PreparedProgram};
+pub use identity::{ClosedInputIdentity, InputIdentity, PreparedModules, PreparedProgram};
 pub mod metal_source;
+pub mod spirv;
 
 use anyhow::{Context, Result, bail, ensure};
 use serde::{Deserialize, Serialize};
@@ -79,6 +84,7 @@ fn spawn_compiler(command: &mut Command) -> std::io::Result<std::process::Child>
 }
 
 mod effects;
+mod input_values;
 mod trace;
 pub use trace::QueryFilter;
 pub use effects::EffectProbe;
@@ -150,6 +156,7 @@ fn reject_reserved(source: &str, file: &str) -> Result<()> {
         } else if bytes[i].is_ascii_alphabetic() || bytes[i] == b'_' {
             let end = rest.find(|c: char| !(c.is_ascii_alphanumeric() || c == '_')).unwrap_or(rest.len());
             let name = &rest[..end];
+            ensure!(name != "DisplayContext", "display(DisplayContext, Inputs) was removed; use ViewResult view(ViewContext, Inputs); see vork help upgrade");
             // Modules every workspace supplies (write_modules: vork_sampling and the
             // OpenPBR constants) are importable by name; a module name is not plumbing.
             let module = name == "vork_openpbr_constants" || KERNEL_MODULES.iter().any(|(kernel, _)| *kernel == name);
@@ -393,9 +400,9 @@ impl Abi {
     /// passes: images and input words read the scene material table directly.
     pub fn native_module(&self) -> String {
         let module = self.module_with(
-            "import material;\nimport frame;\n",
+            "import material;\nimport frame;\n#ifdef VORK_CAMERA_ENVIRONMENT\ninternal extern float4 camera_environment_image(uint address,float2 uv);\n#endif\n",
             true,
-            &format!("if (slot == {NO_IMAGE}u) {{ return float4(1.); }}\n    return material_image(slot, uv, ddx, ddy);"),
+            &format!("if (slot == {NO_IMAGE}u) {{ return float4(1.); }}\n#ifdef VORK_CAMERA_ENVIRONMENT\n    if ((slot & 0x80000000u) != 0u) return camera_environment_image(slot & 0x7fffffffu, uv);\n#endif\n    return material_image(slot, uv, ddx, ddy);"),
             "return material_words[index];",
         );
         openpbr::with_replay(&module, &self.closure)
@@ -454,7 +461,10 @@ impl Abi {
         s.push_str(include_str!("propagation_context.slang"));
         s.push_str("public struct EnvironmentContext { public float3 origin; public float3 direction; public float time; public bool camera; };\n");
         // Display stage: unassociated scene-linear Rec.709 after the compositor.
-        s.push_str("public struct DisplayContext { public float3 color; public uint2 pixel; public uint seed; public uint bit_depth; };\n");
+        s.push_str("public enum WorkingColorSpace { LinearRec709 = 0, LinearRec2020 = 1, ACEScg = 2, Srgb = 3, DisplayP3 = 4 }; public enum ReferenceDomain { Scene = 0, Display = 1 }; public enum DisplayTarget { Srgb = 0, DisplayP3 = 1, Rec2100Pq = 2, Rec2100Hlg = 3 }; public struct ViewContext { public float3 color; public WorkingColorSpace color_space; public ReferenceDomain reference_domain; public DisplayTarget display; public float peak_luminance; public float reference_white; public uint2 pixel; public uint seed; public float time; };\n");
+        // A view's result is a value and its form: absolute XYZ D65 in cd/m², or code values for one display.
+        // The engine takes codes for its destination as they are and converts XYZ to the destination itself.
+        s.push_str("public struct ViewResult { public float3 value; public bool codes; public DisplayTarget display; };\npublic ViewResult view_from_xyz(float3 xyz) { ViewResult r; r.value = xyz; r.codes = false; r.display = DisplayTarget::Srgb; return r; }\npublic ViewResult view_from_codes(float3 codes, DisplayTarget display) { ViewResult r; r.value = codes; r.codes = true; r.display = display; return r; }\n");
         s.push_str(include_str!("composite_context.slang"));
         s.push_str("public struct ComputeContext { public uint3 id; public uint frame; public float time; public float dt; public uint seed; };\n");
         s.push_str(&hair::module());
@@ -495,7 +505,9 @@ impl Abi {
         s.push_str(&attributes::module(native));
         s.push_str("public float4 sample(Image image, float2 uv, DisplacementContext ctx) { return sample_slot(image.slot, uv, float2(0), float2(0)); }\n");
         s.push_str("public float4 sample(Image image, float2 uv, EnvironmentContext ctx) { return sample_slot(image.slot, uv, float2(0), float2(0)); }\n");
-        s.push_str("public float4 sample(Image image, float2 uv, DisplayContext ctx) { return sample_slot(image.slot, uv, float2(0), float2(0)); }\n");
+        s.push_str("public float4 sample(Image image, float2 uv, ViewContext ctx) { return sample_slot(image.slot, uv, float2(0), float2(0)); }\n");
+        // One texel exactly, for a bundled view whose data is a lattice; the display stage clamps the coordinate.
+        s.push_str("float4 view_load_slot(uint slot, int2 texel) { __target_switch { case wgsl: __intrinsic_asm \"vork_view_load($0, $1)\"; } }\npublic float4 vork_view_texel(Image image, int2 texel) { return view_load_slot(image.slot, texel); }\n");
         s.push_str("float4 compositor_load_slot(uint slot, int2 pixel) { __target_switch { case wgsl: __intrinsic_asm \"vork_compositor_load($0, $1)\"; } }\npublic float4 compositor_load(Image image, int2 pixel) { return compositor_load_slot(image.slot,pixel); }\npublic float4 compositor_sample(Image image, float2 uv) { return sample_slot(image.slot, uv, float2(0), float2(0)); }\n");
         s.push_str("float2 compositor_size_slot(uint slot) { __target_switch { case wgsl: __intrinsic_asm \"vork_compositor_size($0)\"; } }\npublic float2 compositor_size(Image image) { return compositor_size_slot(image.slot); }\npublic float2 compositor_size() { return compositor_size_slot(0u); }\n");
         s.push_str("public float4 compositor_sample(float2 uv) { return sample_slot(0u, uv, float2(0), float2(0)); }\n");
@@ -746,10 +758,13 @@ pub struct ProgramCapabilities {
     /// The closure can scatter through a solid interior (thin sheets cannot).
     pub spatial_subsurface: bool,
     pub anisotropy: bool,
+    pub coat_anisotropy: bool,
     pub film: bool,
     pub coat: bool,
     pub fuzz: bool,
     pub tint: bool,
+    /// Any returned closure can have a non-unit dielectric specular weight.
+    pub weighted_ior: bool,
     /// `surface` returns a Blend: independently shaded lobes.
     #[serde(default)]
     pub lobes: bool,
@@ -850,7 +865,7 @@ impl Program {
     }
 }
 
-/// The pinned Slang compiler is missing or the wrong version.
+/// The pinned Slang compiler is missing, cannot run, or has the wrong version.
 #[derive(Debug)]
 pub struct CompilerUnavailable(pub String);
 impl std::fmt::Display for CompilerUnavailable {
@@ -860,6 +875,85 @@ impl std::fmt::Display for CompilerUnavailable {
 }
 impl std::error::Error for CompilerUnavailable {}
 
+
+/// Where admissions are kept between processes: the identities ([`Compiler::toolchain`]) of
+/// toolchains that reported the pinned version when run. The renderer keeps them in its
+/// disk store beside the receipts.
+pub trait AdmissionLedger {
+    /// The one place this ledger's store keeps `toolchain`'s admission, whoever asks.
+    fn entry(&self, toolchain: blake3::Hash) -> Option<PathBuf>;
+    fn admitted(&self, entry: &Path, toolchain: blake3::Hash) -> bool;
+    fn record(&self, entry: &Path, toolchain: blake3::Hash);
+}
+
+/// What the environment tells the dynamic loader when the compiler starts.
+struct Loader {
+    /// Path lists it searches for libraries, by variable.
+    searched: Vec<(String, std::ffi::OsString)>,
+    /// Anything else addressed to it: injected libraries, audit modules, switches. These
+    /// are not modelled, so a toolchain started under one has no identity.
+    other: Vec<(String, std::ffi::OsString)>,
+    /// The directory the compiler is started in.
+    started_in: PathBuf,
+}
+impl Loader {
+    /// Every variable the platform's loader reads is one of its search lists or `other`:
+    /// a variable this code does not know cannot be silently ignored.
+    fn environment() -> Self {
+        let (prefix, lists): (&str, &[&str]) = if cfg!(target_os = "macos") {
+            ("DYLD_", &["DYLD_LIBRARY_PATH", "DYLD_FALLBACK_LIBRARY_PATH", "DYLD_VERSIONED_LIBRARY_PATH"])
+        } else if cfg!(unix) { ("LD_", &["LD_LIBRARY_PATH"]) } else { ("", &[]) };
+        let mut loader = Self { searched: Vec::new(), other: Vec::new(), started_in: std::env::current_dir().unwrap_or_default() };
+        if prefix.is_empty() { return loader; }
+        let mut variables: Vec<_> = std::env::vars_os()
+            .filter_map(|(name, value)| Some((name.to_str()?.to_owned(), value)))
+            .filter(|(name, value)| name.starts_with(prefix) && !value.is_empty()).collect();
+        variables.sort();
+        for (name, value) in variables {
+            if lists.contains(&name.as_str()) { loader.searched.push((name, value)); } else { loader.other.push((name, value)); }
+        }
+        loader
+    }
+}
+
+/// This process's verdict on one selected executable that passed.
+struct Checked {
+    /// The toolchain vouched for: the files that were run, or that a ledger held.
+    toolchain: Option<blake3::Hash>,
+    /// The ledger entries known to hold it.
+    published: std::collections::BTreeSet<PathBuf>,
+}
+impl Checked {
+    /// Make sure `ledger`'s store holds the admission; once per store per process.
+    fn publish(&mut self, ledger: Option<&dyn AdmissionLedger>) {
+        let (Some(ledger), Some(toolchain)) = (ledger, self.toolchain) else { return };
+        let Some(entry) = ledger.entry(toolchain) else { return };
+        if self.published.contains(&entry) { return; }
+        if !ledger.admitted(&entry, toolchain) { ledger.record(&entry, toolchain); }
+        self.published.insert(entry);
+    }
+}
+
+/// Evidence that the selected toolchain is the pinned compiler: it reported [`VERSION`]
+/// when run, in this process or as these same files in an earlier one. Only
+/// [`Compiler::admit`] makes one.
+pub struct Admitted<'a> {
+    pub(crate) compiler: &'a Compiler,
+}
+impl Admitted<'_> {
+    /// The version the admitted toolchain reported.
+    pub fn version(&self) -> &'static str {
+        VERSION
+    }
+}
+
+fn compiler_start_advice(macos: bool) -> &'static str {
+    if macos {
+        "check the loader diagnostic and macOS requirement; if the compiler requires a newer macOS, update macOS or use a compatible vork build. VORK_SLANGC must select the pinned, OS-compatible toolchain"
+    } else {
+        "check the executable and its runtime libraries; install the pinned toolchain or set VORK_SLANGC"
+    }
+}
 
 impl Compiler {
     /// Explicit override, installed companion toolchain, then developer PATH.
@@ -899,26 +993,218 @@ impl Compiler {
             captured: None,
         }
     }
+    /// The pinned version, once this process has checked the selected toolchain by running it.
     pub fn version(&self) -> Result<String> {
+        self.checked(None)
+    }
+
+    /// Admit the selected toolchain as a value. A cache key that names the compiler is built
+    /// from this, so a decision read from a cache and a fresh compile refuse the same compilers.
+    ///
+    /// The toolchain is admitted by what it is ([`Self::toolchain`]): one whose identity the
+    /// ledger already holds passed the version check as these same files and is not run again;
+    /// any other is run, and recorded when it reports the pinned version. A replaced, edited
+    /// or missing compiler has another identity (or none) and takes the version check.
+    pub fn admit(&self, ledger: &dyn AdmissionLedger) -> Result<Admitted<'_>> {
+        self.checked(Some(ledger))?;
+        Ok(Admitted { compiler: self })
+    }
+
+    fn checked(&self, ledger: Option<&dyn AdmissionLedger>) -> Result<String> {
         // Compiler instances are short-lived and used concurrently during install.
         // Keep both success and failure for each selected executable for this process.
-        static VERSIONS: OnceLock<Mutex<BTreeMap<PathBuf, Result<String, String>>>> = OnceLock::new();
-        let mut versions = VERSIONS.get_or_init(Mutex::default).lock().unwrap();
-        versions
+        static CHECKS: OnceLock<Mutex<BTreeMap<PathBuf, Result<Checked, String>>>> = OnceLock::new();
+        let mut checks = CHECKS.get_or_init(Mutex::default).lock().unwrap();
+        let check = checks
             .entry(self.executable.clone())
-            .or_insert_with(|| self.probe_version().map_err(|e| format!("{e:#}")))
-            .clone()
-            .map_err(|reason| anyhow::Error::new(CompilerUnavailable(reason)))
+            .or_insert_with(|| self.check(ledger, &Loader::environment()).map_err(|e| format!("{e:#}")));
+        match check {
+            Ok(checked) => {
+                // A check made with another ledger, or none, is published to this one.
+                checked.publish(ledger);
+                Ok(VERSION.to_owned())
+            }
+            Err(reason) => Err(anyhow::Error::new(CompilerUnavailable(reason.clone()))),
+        }
+    }
+
+    /// One check of the selected toolchain, outside the process memo.
+    fn check(&self, ledger: Option<&dyn AdmissionLedger>, loader: &Loader) -> Result<Checked> {
+        let before = self.toolchain_under(loader).ok();
+        // An admission is taken from the ledger only for files that are the same when
+        // looked at again; files changing under the look take the run below.
+        if let (Some(ledger), Some(toolchain)) = (ledger, before)
+            && let Some(entry) = ledger.entry(toolchain)
+            && ledger.admitted(&entry, toolchain)
+            && self.toolchain_under(loader).ok() == before {
+            return Ok(Checked { toolchain: before, published: [entry].into() });
+        }
+        self.probe_version()?;
+        // The verdict vouches for an identity only when the same files were there before
+        // and after the run. Otherwise (they could not all be observed, or the directories
+        // changed meanwhile, which a shared `bin` does for unrelated reasons) the toolchain
+        // passed for this process on the strength of the run alone: nothing is recorded and
+        // the next process runs it again.
+        let stable = before.filter(|toolchain| self.toolchain_under(loader).ok() == Some(*toolchain));
+        let mut checked = Checked { toolchain: stable, published: Default::default() };
+        checked.publish(ledger);
+        Ok(checked)
+    }
+
+    /// What the selected toolchain is, for the pinned version: the executable's path, size,
+    /// permissions, modification time and content, and Slang's own files in its directory
+    /// and in the `lib` directory next to it. Slang's files are the ones named `slang*` or
+    /// `libslang*` (its tools, the compiler library that carries the version, the libraries
+    /// and standard-module directory it loads at run time), each by name, size, permissions
+    /// and modification time. Other files beside the compiler, in a shared `bin` say, are
+    /// not part of it. The directories the environment tells the loader to search
+    /// (`LD_LIBRARY_PATH`, with glibc's `glibc-hwcaps` subdirectories; the `DYLD_*_LIBRARY_PATH` lists on macOS) are
+    /// observed the same way, in order, since a Slang library there can be the one loaded.
+    /// A search list the loader would interpret rather than read as directories, or any
+    /// other variable addressed to the loader (an injected library, an audit module), leaves
+    /// no identity. On Windows the loader takes a library beside the executable first. An error when the executable cannot be read or
+    /// one of Slang's files cannot be observed: such a toolchain has no identity and is
+    /// checked by running it.
+    pub fn toolchain(&self) -> Result<blake3::Hash> {
+        self.toolchain_under(&Loader::environment())
+    }
+
+    /// [`Self::toolchain`] under a given loader environment.
+    fn toolchain_under(&self, loader: &Loader) -> Result<blake3::Hash> {
+        fn part(hash: &mut blake3::Hasher, bytes: &[u8]) {
+            hash.update(&(bytes.len() as u64).to_le_bytes());
+            hash.update(bytes);
+        }
+        fn state(hash: &mut blake3::Hasher, meta: &fs::Metadata) {
+            hash.update(&meta.len().to_le_bytes());
+            // Whether it may be read and run is part of what it is: the same bytes without
+            // their execute bits cannot be the compiler.
+            // Its owner and group decide which of those bits apply to this process.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::{MetadataExt, PermissionsExt};
+                hash.update(&meta.permissions().mode().to_le_bytes());
+                hash.update(&meta.uid().to_le_bytes());
+                hash.update(&meta.gid().to_le_bytes());
+            }
+            #[cfg(not(unix))]
+            hash.update(&[u8::from(meta.permissions().readonly())]);
+            let modified = meta.modified().ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(u128::MAX, |since| since.as_nanos());
+            hash.update(&modified.to_le_bytes());
+        }
+        fn slang_owned(name: &std::ffi::OsStr) -> bool {
+            let name = name.to_string_lossy().to_ascii_lowercase();
+            name.strip_prefix("lib").unwrap_or(&name).starts_with("slang")
+        }
+        fn children(directory: &Path) -> Result<Vec<PathBuf>> {
+            let mut paths = fs::read_dir(directory)
+                .and_then(|entries| entries.map(|entry| entry.map(|entry| entry.path())).collect::<std::io::Result<Vec<_>>>())
+                .with_context(|| format!("list the Slang toolchain directory {}", directory.display()))?;
+            paths.sort();
+            Ok(paths)
+        }
+        /// One of Slang's files, or everything under one of its directories.
+        fn observe(hash: &mut blake3::Hasher, path: &Path) -> Result<()> {
+            part(hash, path.file_name().unwrap_or_default().as_encoded_bytes());
+            // Through links: a library is usually a link to its versioned file.
+            match fs::metadata(path) {
+                Ok(meta) if meta.is_dir() => {
+                    let paths = children(path)?;
+                    hash.update(&[2]);
+                    hash.update(&(paths.len() as u64).to_le_bytes());
+                    for path in paths { observe(hash, &path)?; }
+                }
+                Ok(meta) => { hash.update(&[1]); state(hash, &meta); }
+                // A link to nothing is a complete observation; anything else is not.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => { hash.update(&[0]); }
+                Err(error) => return Err(error).with_context(|| format!("examine the Slang toolchain file {}", path.display())),
+            }
+            Ok(())
+        }
+        let mut hash = blake3::Hasher::new();
+        part(&mut hash, b"slang-toolchain-v5");
+        part(&mut hash, VERSION.as_bytes());
+        part(&mut hash, self.executable.as_os_str().as_encoded_bytes());
+        let file = fs::File::open(&self.executable)
+            .with_context(|| format!("read Slang at {}", self.executable.display()))?;
+        state(&mut hash, &file.metadata()?);
+        let mut content = blake3::Hasher::new();
+        content.update_reader(file)?;
+        hash.update(content.finalize().as_bytes());
+        /// Slang's files directly in one directory the loader may take them from.
+        fn directory(hash: &mut blake3::Hasher, directory: &Path) -> Result<()> {
+            part(hash, directory.as_os_str().as_encoded_bytes());
+            // Only a directory that is not there holds nothing; one that cannot be listed
+            // leaves the toolchain without an identity.
+            if matches!(fs::metadata(directory), Err(error) if error.kind() == std::io::ErrorKind::NotFound) {
+                hash.update(&u64::MAX.to_le_bytes());
+                return Ok(());
+            }
+            let owned: Vec<_> = children(directory)?.into_iter()
+                .filter(|path| path.file_name().is_some_and(slang_owned)).collect();
+            hash.update(&(owned.len() as u64).to_le_bytes());
+            for path in owned { observe(hash, &path)?; }
+            // glibc prefers a library in a hardware-capability subdirectory of a searched one.
+            let capabilities = directory.join("glibc-hwcaps");
+            match fs::metadata(&capabilities) {
+                Ok(meta) if meta.is_dir() => under(hash, &capabilities)?,
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error).with_context(|| format!("examine {}", capabilities.display())),
+            }
+            Ok(())
+        }
+        /// Slang's files anywhere under a directory.
+        fn under(hash: &mut blake3::Hasher, directory: &Path) -> Result<()> {
+            for path in children(directory)? {
+                if fs::metadata(&path).is_ok_and(|meta| meta.is_dir()) {
+                    part(hash, path.file_name().unwrap_or_default().as_encoded_bytes());
+                    under(hash, &path)?;
+                } else if path.file_name().is_some_and(slang_owned) {
+                    observe(hash, &path)?;
+                }
+            }
+            Ok(())
+        }
+        let beside = self.executable.parent().filter(|p| !p.as_os_str().is_empty());
+        let libraries = beside.and_then(Path::parent).map(|p| p.join("lib"));
+        for path in beside.map(Path::to_path_buf).into_iter().chain(libraries) {
+            directory(&mut hash, &path)?;
+        }
+        // The loader's own environment is followed only where it names directories. A list
+        // it would interpret (an expansion like `$ORIGIN`, a `;` separator) or a library it
+        // is told to inject cannot be observed faithfully: no identity, so the compiler is run.
+        for (name, value) in &loader.other {
+            ensure!(value.is_empty(), "{name} changes how the compiler's libraries load; its toolchain has no identity");
+        }
+        for (name, value) in &loader.searched {
+            part(&mut hash, name.as_bytes());
+            part(&mut hash, value.as_encoded_bytes());
+            if value.is_empty() { continue; }
+            ensure!(!value.to_string_lossy().contains(['$', ';']), "{name} is a loader expression; the compiler's toolchain has no identity");
+            for path in std::env::split_paths(value) {
+                // An empty or relative entry is the directory the compiler is started in:
+                // this process's, for the version check. (A compile starts it in a fresh
+                // workspace that holds only the modules written there.)
+                directory(&mut hash, &loader.started_in.join(path))?;
+            }
+        }
+        Ok(hash.finalize())
     }
 
     fn probe_version(&self) -> Result<String> {
         let output = compiler_output(Command::new(&self.executable).arg("-version"))
-            .context("run Slang compiler; install the pinned toolchain or set VORK_SLANGC")?;
+            .with_context(|| format!("cannot start Slang at {}; {}", self.executable.display(), compiler_start_advice(cfg!(target_os = "macos"))))?;
+        ensure!(output.status.success(), "Slang at {} could not run ({}); {}\n{}{}",
+            self.executable.display(), output.status, compiler_start_advice(cfg!(target_os = "macos")),
+            String::from_utf8_lossy(&output.stderr), String::from_utf8_lossy(&output.stdout));
         // slangc prints its version on stderr.
         let version = String::from_utf8_lossy(&output.stderr).trim().to_owned();
         ensure!(
-            output.status.success() && version == VERSION,
-            "Slang {VERSION} required, found {version:?}"
+            version == VERSION,
+            "Slang {VERSION} required, found {version:?}; select the pinned toolchain with VORK_SLANGC"
         );
         Ok(version)
     }
@@ -942,7 +1228,7 @@ impl Compiler {
             fs::write(path, source)?;
         }
         let output = work.0.join("out");
-        let _progress = progress::Job::start(false);
+        let _progress = progress::Job::start(false).named(main);
         let mut command = Command::new(&self.executable);
         command
             .arg(work.0.join(format!("{main}.slang")))
@@ -1184,17 +1470,21 @@ impl Compiler {
         let surface_wavelength=registry::EFFECT_SURFACE_WAVELENGTH;
         let lit_wavelength=registry::EFFECT_LIT_WAVELENGTH;
         let hair_wavelength=slots(&hair_fields()).into_iter().map(|(_,f,at)|format!("{WAVELENGTH_EFFECT}({})",to_f32_slang(f.ty,&format!("h.{}{at}",f.name)))).collect::<Vec<_>>().join("+");
-        let lit_probe = if lit { format!("Closure l=lit(vork_context,inputs,vork_light); vork_effects[4]={reflects}; let lr=vork_response_of(l); vork_effects[9]=lr.x; vork_effects[10]=lr.y; vork_effects[{lit_dispersion}]=lr.z; vork_effects[{lit_wavelength}]=vork_wavelength_of(l); let lit_layers=vork_layers_of(l); vork_effects[14]=lit_layers.x; vork_effects[15]=lit_layers.y; vork_effects[16]=lit_layers.z;") } else { String::new() };
+        let surface_coat_anisotropy=registry::EFFECT_SURFACE_COAT_ANISOTROPY;
+        let lit_coat_anisotropy=registry::EFFECT_LIT_COAT_ANISOTROPY;
+        let surface_weighted_ior=registry::EFFECT_SURFACE_WEIGHTED_IOR;
+        let lit_weighted_ior=registry::EFFECT_LIT_WEIGHTED_IOR;
+        let lit_probe = if lit { format!("Closure l=lit(vork_context,inputs,vork_light); vork_effects[4]={reflects}; vork_effects[{lit_weighted_ior}]=vork_weighted_ior_of(l); let lr=vork_response_of(l); vork_effects[9]=lr.x; vork_effects[10]=lr.y; vork_effects[{lit_coat_anisotropy}]=lr.w; vork_effects[{lit_dispersion}]=lr.z; vork_effects[{lit_wavelength}]=vork_wavelength_of(l); let lit_layers=vork_layers_of(l); vork_effects[14]=lit_layers.x; vork_effects[15]=lit_layers.y; vork_effects[16]=lit_layers.z;") } else { String::new() };
         let spatial = openpbr::spatial_subsurface(&abi.closure);
         let tint = if abi.closure.iter().any(|f| f.name == "specular_color") { "(c.specular_color.x-1.)*(c.specular_color.x-1.)+(c.specular_color.y-1.)*(c.specular_color.y-1.)+(c.specular_color.z-1.)*(c.specular_color.z-1.)" } else { "0." };
-        let probe = format!("{}\nfloat vork_emission_of(Closure c) {{return vork_closure_emission(c);}}\nfloat vork_emission_of(Blend s) {{return vork_blend_emission(s);}}\nfloat vork_emission_of(Hair h) {{return 0.;}}\nfloat vork_wavelength_of(Closure c) {{return vork_closure_wavelength(c);}}\nfloat vork_wavelength_of(Blend s) {{return vork_blend_wavelength(s);}}\nfloat vork_wavelength_of(Hair h) {{return {hair_wavelength};}}\nfloat3 vork_layers_of(Closure c) {{return float3({coat},{fuzz},{tint});}}\nfloat3 vork_layers_of(Blend s) {{return vork_blend_layers(s);}}\nfloat3 vork_layers_of(Hair h) {{return float3(0.);}}\nfloat3 vork_response_of(Closure c) {{return float3({anisotropy},{film},{dispersion});}}\nfloat3 vork_response_of(Blend s) {{return vork_blend_response(s);}}\nfloat3 vork_response_of(Hair h) {{return float3(0.);}}\nfloat vork_spatial_of(Closure c) {{return {spatial};}}\nfloat vork_spatial_of(Blend s) {{return vork_blend_effects(s).w;}}\nfloat vork_spatial_of(Hair h) {{return 0.;}}\nfloat4 vork_effects_of(Closure c) {{ return float4({},{opacity},{},0.); }}\n\
+        let probe = format!("{}\nfloat vork_weighted_ior_of(Closure c) {{return vork_closure_weighted_ior(c);}}\nfloat vork_weighted_ior_of(Blend s) {{return vork_blend_weighted_ior(s);}}\nfloat vork_weighted_ior_of(Hair h) {{return 1.;}}\nfloat vork_emission_of(Closure c) {{return vork_closure_emission(c);}}\nfloat vork_emission_of(Blend s) {{return vork_blend_emission(s);}}\nfloat vork_emission_of(Hair h) {{return 0.;}}\nfloat vork_wavelength_of(Closure c) {{return vork_closure_wavelength(c);}}\nfloat vork_wavelength_of(Blend s) {{return vork_blend_wavelength(s);}}\nfloat vork_wavelength_of(Hair h) {{return {hair_wavelength};}}\nfloat3 vork_layers_of(Closure c) {{return float3({coat},{fuzz},{tint});}}\nfloat3 vork_layers_of(Blend s) {{return vork_blend_layers(s);}}\nfloat3 vork_layers_of(Hair h) {{return float3(0.);}}\nfloat4 vork_response_of(Closure c) {{return float4({anisotropy},{film},{dispersion},{coat_anisotropy});}}\nfloat4 vork_response_of(Blend s) {{return vork_blend_response(s);}}\nfloat4 vork_response_of(Hair h) {{return float4(0.);}}\nfloat vork_spatial_of(Closure c) {{return {spatial};}}\nfloat vork_spatial_of(Blend s) {{return vork_blend_effects(s).w;}}\nfloat vork_spatial_of(Hair h) {{return 0.;}}\nfloat4 vork_effects_of(Closure c) {{ return float4({},{opacity},{},0.); }}\n\
             float4 vork_effects_of(Blend s) {{ let e=vork_blend_effects(s); return float4(e.x,e.y,e.z,1.); }}\n\
             float4 vork_effects_of(Hair h) {{ return float4(0.); }}\n\
             float vork_count_of(Closure c) {{return 1.;}} float vork_count_of(Hair h) {{return 1.;}} float vork_count_of(Blend s) {{return float(vork_blend_count(s));}}\n\
             float vork_is_hair(Closure c) {{ return 0.; }} float vork_is_hair(Blend s) {{ return 0.; }} float vork_is_hair(Hair h) {{ return 1.; }}\n\
             float vork_physical_of(Closure c) {{ return 0.; }} float vork_physical_of(Blend s) {{ return 0.; }} float vork_physical_of(Hair h) {{ return h.scattering ? 1. : 0.; }}\n\
-            ConstantBuffer<ShadingContext> vork_context; ConstantBuffer<Lighting> vork_light; RWStructuredBuffer<float> vork_effects; [shader(\"compute\")][numthreads(1,1,1)] void vork_entry() {{ uint base=0u;\n{decode} let vork_s=surface(vork_context,inputs); vork_effects[{emission_effect}]=vork_emission_of(vork_s); vork_effects[17]=vork_physical_of(vork_s); vork_effects[18]=vork_spatial_of(vork_s); let response=vork_response_of(vork_s); vork_effects[7]=response.x; vork_effects[8]=response.y; vork_effects[{surface_wavelength}]=vork_wavelength_of(vork_s); vork_effects[{lit_wavelength}]=0.; vork_effects[{surface_dispersion}]=response.z; vork_effects[{lit_dispersion}]=0.; vork_effects[9]=0.;vork_effects[10]=0.; let ll=vork_layers_of(vork_s); vork_effects[11]=ll.x;vork_effects[12]=ll.y;vork_effects[13]=ll.z;vork_effects[14]=0.;vork_effects[15]=0.;vork_effects[16]=0.; let e=vork_effects_of(vork_s); vork_effects[0]=e.x;vork_effects[1]=e.y;vork_effects[2]=e.z;vork_effects[3]=e.w; vork_effects[5]=vork_is_hair(vork_s); vork_effects[6]=vork_count_of(vork_s); {lit_probe} }}",
-            program_text(source,origin), field("subsurface_weight"), field("transmission_weight"), anisotropy=field("specular_roughness_anisotropy"), film=field("thin_film_weight"), dispersion=format!("({})*({})",field("transmission_weight"),field("transmission_dispersion_scale")), coat=field("coat_weight"), fuzz=field("fuzz_weight"), decode=inputs.slang_decode(), emission_effect=registry::EFFECT_SURFACE_EMISSION);
+            ConstantBuffer<ShadingContext> vork_context; ConstantBuffer<Lighting> vork_light; RWStructuredBuffer<float> vork_effects; [shader(\"compute\")][numthreads(1,1,1)] void vork_entry() {{ uint base=0u;\n{decode} let vork_s=surface(vork_context,inputs); vork_effects[{surface_weighted_ior}]=vork_weighted_ior_of(vork_s); vork_effects[{lit_weighted_ior}]=0.; vork_effects[{emission_effect}]=vork_emission_of(vork_s); vork_effects[17]=vork_physical_of(vork_s); vork_effects[18]=vork_spatial_of(vork_s); let response=vork_response_of(vork_s); vork_effects[7]=response.x; vork_effects[8]=response.y; vork_effects[{surface_coat_anisotropy}]=response.w; vork_effects[{lit_coat_anisotropy}]=0.; vork_effects[{surface_wavelength}]=vork_wavelength_of(vork_s); vork_effects[{lit_wavelength}]=0.; vork_effects[{surface_dispersion}]=response.z; vork_effects[{lit_dispersion}]=0.; vork_effects[9]=0.;vork_effects[10]=0.; let ll=vork_layers_of(vork_s); vork_effects[11]=ll.x;vork_effects[12]=ll.y;vork_effects[13]=ll.z;vork_effects[14]=0.;vork_effects[15]=0.;vork_effects[16]=0.; let e=vork_effects_of(vork_s); vork_effects[0]=e.x;vork_effects[1]=e.y;vork_effects[2]=e.z;vork_effects[3]=e.w; vork_effects[5]=vork_is_hair(vork_s); vork_effects[6]=vork_count_of(vork_s); {lit_probe} }}",
+            program_text(source,origin), field("subsurface_weight"), field("transmission_weight"), anisotropy=format!("({})+({})*({})",field("specular_roughness_anisotropy"),field("coat_weight"),field("coat_roughness_anisotropy")), coat_anisotropy=format!("({})*({})",field("coat_weight"),field("coat_roughness_anisotropy")), film=field("thin_film_weight"), dispersion=format!("({})*({})",field("transmission_weight"),field("transmission_dispersion_scale")), coat=field("coat_weight"), fuzz=field("fuzz_weight"), decode=inputs.slang_decode(), emission_effect=registry::EFFECT_SURFACE_EMISSION);
         let output = self.run(&work, &probe, &includes, false)?;
         Ok((EffectProbe::parse(&output.wgsl, lit)?.capabilities(&[]), output.wgsl))
     }
@@ -1316,7 +1606,7 @@ impl Compiler {
             work.0.join("program.d"),
         );
         fs::write(&input, source)?;
-        let _progress = progress::Job::start(false);
+        let _progress = progress::Job::start(false).named("program");
         let mut command = Command::new(&self.executable);
         command.arg(&input).arg(INITIALIZATION).current_dir(&work.0);
         // Image programs execute directly as WGSL; give their numeric loops
@@ -1573,14 +1863,31 @@ mod ast_tests {
 
     #[cfg(unix)]
     #[test]
-    fn version_is_checked_once_across_instances_and_threads() -> Result<()> {
+    fn compiler_start_failure_preserves_loader_diagnostic() -> Result<()> {
         use std::os::unix::fs::PermissionsExt;
+        let work = Workspace::new()?;
+        let executable = work.0.join("cannot-run");
+        fs::write(&executable, "#!/bin/sh\necho 'dyld: library built for macOS 26.0; symbol not found' >&2\nexit 1\n")?;
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+        let error = Compiler::new(&executable).version().unwrap_err();
+        assert!(error.downcast_ref::<CompilerUnavailable>().is_some());
+        let message = error.to_string();
+        assert!(message.contains("could not run"), "{message}");
+        assert!(message.contains("built for macOS 26.0"), "{message}");
+        assert!(!message.contains("required, found"), "{message}");
+        assert!(compiler_start_advice(true).contains("update macOS or use a compatible vork build"));
+        assert!(!compiler_start_advice(true).contains("reinstall"));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn version_is_checked_once_across_instances_and_threads() -> Result<()> {
         let work = Workspace::new()?;
         for (name, version) in [("pinned", VERSION), ("wrong", "wrong-version")] {
             let executable = work.0.join(name);
             let count = work.0.join(format!("{name}.count"));
-            fs::write(&executable, format!("#!/bin/sh\necho check >> '{}'\necho '{version}' >&2\n", count.display()))?;
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+            crate::test_support::write_executable(&executable, format!("#!/bin/sh\necho check >> '{}'\necho '{version}' >&2\n", count.display()))?;
             std::thread::scope(|scope| {
                 for _ in 0..8 {
                     let executable = &executable;
@@ -1604,6 +1911,155 @@ mod ast_tests {
         Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_toolchain_is_run_once_and_again_only_when_its_files_change() -> Result<()> {
+        // audit-3d 9: admission is by the toolchain's identity, so a warm process does not
+        // run the compiler and a changed one is still checked.
+        struct Ledger(&'static str, Mutex<Vec<PathBuf>>);
+        impl AdmissionLedger for Ledger {
+            fn entry(&self, toolchain: blake3::Hash) -> Option<PathBuf> { Some(PathBuf::from(self.0).join(toolchain.to_hex().as_str())) }
+            fn admitted(&self, entry: &Path, _: blake3::Hash) -> bool { self.1.lock().unwrap().iter().any(|held| held == entry) }
+            fn record(&self, entry: &Path, _: blake3::Hash) { self.1.lock().unwrap().push(entry.to_path_buf()) }
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let work = Workspace::new()?;
+        let bin = work.0.join("toolchain/bin");
+        let lib = work.0.join("toolchain/lib");
+        fs::create_dir_all(&bin)?;
+        fs::create_dir_all(&lib)?;
+        let executable = bin.join("slangc");
+        let count = work.0.join("count");
+        let script = |version: &str| format!("#!/bin/sh\necho check >> '{}'\necho '{version}' >&2\n", count.display());
+        let runs = || fs::read_to_string(&count).map_or(0, |text| text.lines().count());
+        crate::test_support::write_executable(&executable, script(VERSION))?;
+        fs::write(lib.join("libslang.so"), "one")?;
+        let compiler = Compiler::new(&executable);
+        let ledger = Ledger("store", Mutex::default());
+        // The test's own loader environment, not the runner's.
+        let loader = |searched: &str, injected: &str| Loader {
+            searched: vec![("LD_LIBRARY_PATH".to_owned(), searched.into())],
+            other: vec![("LD_PRELOAD".to_owned(), injected.into())],
+            started_in: work.0.join("started-in"),
+        };
+        let bare = loader("", "");
+        let held = |ledger: &Ledger| ledger.1.lock().unwrap().len();
+        // Each `check` stands for a new process: the per-process memo is above it.
+        compiler.check(Some(&ledger), &bare)?;
+        assert_eq!((runs(), held(&ledger)), (1, 1), "first seen: run and recorded");
+        compiler.check(Some(&ledger), &bare)?;
+        let mut checked = compiler.check(Some(&ledger), &bare)?;
+        assert_eq!((runs(), held(&ledger)), (1, 1), "the same files are not run again");
+        // The same process meeting another store publishes the admission there, once.
+        let other = Ledger("other-store", Mutex::default());
+        checked.publish(Some(&other));
+        checked.publish(Some(&other));
+        checked.publish(Some(&ledger));
+        assert_eq!((runs(), held(&other), held(&ledger)), (1, 1, 1));
+        compiler.check(Some(&other), &bare)?;
+        assert_eq!(runs(), 1, "and a process that asks that store first does not run it");
+        // Files that are not Slang's, installed beside the compiler or its libraries, are
+        // not the toolchain: nothing is run.
+        fs::write(bin.join("another-tool"), "unrelated")?;
+        fs::write(lib.join("libother.so"), "unrelated")?;
+        compiler.check(Some(&ledger), &bare)?;
+        assert_eq!((runs(), held(&ledger)), (1, 1));
+        // A file under Slang's standard-module directory is.
+        fs::create_dir_all(lib.join("slang-standard-module-test/slang"))?;
+        compiler.check(Some(&ledger), &bare)?;
+        fs::write(lib.join("slang-standard-module-test/slang/core.slang-module"), "module")?;
+        compiler.check(Some(&ledger), &bare)?;
+        assert_eq!((runs(), held(&ledger)), (3, 3));
+        fs::remove_dir_all(lib.join("slang-standard-module-test"))?;
+        compiler.check(Some(&ledger), &bare)?;
+        assert_eq!((runs(), held(&ledger)), (3, 3), "back to the files first admitted");
+        // A directory the environment tells the loader to search is part of the toolchain
+        // when it holds a Slang library, and by its place in the list either way.
+        let elsewhere = work.0.join("other-sdk");
+        fs::create_dir_all(&elsewhere)?;
+        let listed = |value: &str| compiler.toolchain_under(&loader(value, ""));
+        let there = elsewhere.to_str().context("workspace path")?;
+        let plain = compiler.toolchain_under(&bare)?;
+        let searched = listed(there)?;
+        assert_ne!(plain, searched);
+        fs::write(elsewhere.join("unrelated.so"), "x")?;
+        assert_eq!(listed(there)?, searched, "a file that is not Slang's there changes nothing");
+        fs::write(elsewhere.join("libslang-compiler.so"), "another sdk")?;
+        let shadowed = listed(there)?;
+        assert_ne!(shadowed, searched, "a Slang library on the loader's path is another toolchain");
+        fs::write(elsewhere.join("libslang-compiler.so"), "another sdk, upgraded")?;
+        assert_ne!(listed(there)?, shadowed, "and replacing it there is seen");
+        // glibc takes a library from a hardware-capability subdirectory of a searched one first.
+        fs::create_dir_all(elsewhere.join("glibc-hwcaps/x86-64-v3"))?;
+        let capable = listed(there)?;
+        fs::write(elsewhere.join("glibc-hwcaps/x86-64-v3/libslang-compiler.so"), "for this processor")?;
+        assert_ne!(listed(there)?, capable);
+        // An empty or relative entry is the directory the compiler starts in.
+        fs::create_dir_all(work.0.join("started-in/relative"))?;
+        let trailing = listed("/nonexistent:")?;
+        fs::write(work.0.join("started-in/libslang-rt.so"), "in the working directory")?;
+        assert_ne!(listed("/nonexistent:")?, trailing);
+        let relative = listed("relative")?;
+        fs::write(work.0.join("started-in/relative/libslang-rt.so"), "relative")?;
+        assert_ne!(listed("relative")?, relative);
+        // What the loader would interpret, or inject, cannot be observed: no identity.
+        for value in ["$ORIGIN/../alternate-lib", "/opt/a;/opt/b"] {
+            assert!(listed(value).is_err(), "{value}");
+        }
+        assert!(compiler.toolchain_under(&loader("", "/opt/other-sdk/libslang-compiler.so")).is_err());
+        let injected = loader("", "/opt/other-sdk/libslang-compiler.so");
+        let before = runs();
+        assert_eq!(compiler.check(Some(&ledger), &injected)?.toolchain, None);
+        compiler.check(Some(&ledger), &injected)?;
+        assert_eq!((runs(), held(&ledger)), (before + 2, 3), "an injected library: run every time, nothing recorded");
+        // A library replaced beside it: another toolchain, checked by running it.
+        fs::write(lib.join("libslang.so"), "another build")?;
+        compiler.check(Some(&ledger), &bare)?;
+        assert_eq!((runs(), held(&ledger)), (6, 4));
+        // The same bytes without their execute bits are not the admitted compiler.
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o644))?;
+        assert!(compiler.check(Some(&ledger), &bare).is_err(), "a compiler that cannot be run was admitted");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))?;
+        assert_eq!((runs(), held(&ledger)), (6, 4));
+        // The executable replaced by one that reports another version: run, refused, not recorded.
+        crate::test_support::write_executable(&executable, script("1900.0"))?;
+        for _ in 0..2 {
+            let error = compiler.check(Some(&ledger), &bare).err().context("a wrong version was admitted")?.to_string();
+            assert!(error.contains("required, found \"1900.0\""), "{error}");
+        }
+        assert_eq!((runs(), held(&ledger)), (8, 4), "a refused toolchain is run every time");
+        // Without a ledger the check runs the compiler and keeps the identity to publish later.
+        crate::test_support::write_executable(&executable, script(VERSION))?;
+        let mut checked = compiler.check(None, &bare)?;
+        assert_eq!((runs(), checked.toolchain), (9, Some(compiler.toolchain_under(&bare)?)));
+        checked.publish(Some(&ledger));
+        assert_eq!(held(&ledger), 5);
+        // A library directory that cannot be listed leaves no identity: the compiler is run
+        // each time and nothing is recorded, however its libraries then change.
+        // (A user who may list any directory, such as root, cannot be denied: nothing to check.)
+        fs::set_permissions(&lib, fs::Permissions::from_mode(0o300))?;
+        if fs::read_dir(&lib).is_err() {
+            assert!(compiler.toolchain_under(&bare).is_err());
+            let unlisted = compiler.check(Some(&ledger), &bare)?;
+            compiler.check(Some(&ledger), &bare)?;
+            assert_eq!((runs(), held(&ledger), unlisted.toolchain), (11, 5, None));
+        }
+        fs::set_permissions(&lib, fs::Permissions::from_mode(0o755))?;
+        let (ran, kept) = (runs(), held(&ledger));
+        // Files that change during the check (here the stand-in rewrites its own library;
+        // in a shared directory, anything) leave nothing to vouch for: no record, run again.
+        let changing = format!("#!/bin/sh\necho check >> '{}'\necho more >> '{}'\necho '{VERSION}' >&2\n", count.display(), lib.join("libslang.so").display());
+        crate::test_support::write_executable(&executable, changing)?;
+        let unstable = compiler.check(Some(&ledger), &bare)?;
+        compiler.check(Some(&ledger), &bare)?;
+        assert_eq!((runs(), held(&ledger), unstable.toolchain), (ran + 2, kept, None));
+        // A missing executable has no identity and takes the launch diagnostic.
+        fs::remove_file(&executable)?;
+        let error = compiler.check(Some(&ledger), &bare).err().context("a missing compiler was admitted")?.to_string();
+        assert!(error.contains("cannot start Slang"), "{error}");
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires pinned Slang toolchain"]
     fn metal_source_is_identical_across_workspaces() -> Result<()> {
@@ -1624,11 +2080,15 @@ mod ast_tests {
     fn mesh_stage_discovery_handles_imported_medium_and_combined_surface() -> Result<()> {
         let compiler = Compiler::discover();
         let abi = Abi { aov_count: 0, context: Abi::spec_context(), closure: openpbr_fields() };
-        let origin = Path::new("stage-discovery.slang");
+        let root=std::env::temp_dir().join(format!("vork-medium-discovery-{}",std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("authored_medium.slang"),include_str!("../../vork-scene/tests/fixtures/medium.slang"))?;
+        let origin_path=root.join("stage-discovery.slang");
+        let origin=origin_path.as_path();
         for (source, surface, medium) in [
             ("struct Inputs {}; Closure surface(ShadingContext c, Inputs i) {return Closure();} // MediumCoefficients medium(...) {}", true, false),
-            ("import std.fog;", false, true),
-            ("import std.fog; Closure surface(ShadingContext c, Inputs i) {return Closure();}", true, true),
+            ("import authored_medium;", false, true),
+            ("import authored_medium; Closure surface(ShadingContext c, Inputs i) {return Closure();}", true, true),
         ] {
             let (stages, _) = compiler.stages(&abi, source, origin)?;
             assert_eq!(stages.contains("surface"), surface);
@@ -1636,6 +2096,7 @@ mod ast_tests {
             if surface { compiler.compile_surface(&abi, source, origin, "stagesurface")?; }
             if medium { compiler.compile_medium(&abi, source, origin, "stagemedium")?; }
         }
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -1802,6 +2263,7 @@ fn validated_module(wgsl: &str, abi: &Abi) -> Result<naga::Module> {
     module.push_str("fn vork_compositor_context(index:u32)->vec4<f32>{return vec4(f32(index));}\n");
     module.push_str("fn vork_compositor_size(slot:u32)->vec2<f32>{return vec2(1.); }\n");
     module.push_str("fn vork_compositor_load(slot:u32,p:vec2<i32>)->vec4<f32>{return vec4(vec2<f32>(p),f32(slot),1.); }\n");
+    module.push_str("fn vork_view_load(slot:u32,p:vec2<i32>)->vec4<f32>{return vec4(vec2<f32>(p),f32(slot),1.); }\n");
     write!(
         module,
         "fn {MATERIAL_WORD}(i:u32)->u32 {{ return i; }}\n\

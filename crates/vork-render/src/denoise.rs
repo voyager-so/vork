@@ -12,6 +12,18 @@ const OIDN_QUALITY_HIGH: i32 = 6;
 pub(crate) mod gpu;
 pub(crate) mod spatial;
 
+// Inputs are bytes; OIDN's maxMemoryMB uses MiB. Camera budget is headroom at
+// renderer creation (including any lowering override), so charge only usage
+// growth since that same snapshot. Current native headroom also bounds scratch.
+fn memory_limit_mb(budget: u64, usage_at_creation: u64, usage: u64, headroom: u64) -> Result<i32> {
+    let growth = usage.saturating_sub(usage_at_creation);
+    let mb = budget.saturating_sub(growth).min(headroom) / (1024 * 1024);
+    if mb == 0 {
+        return Err(OutOfMemory("denoising needs more memory; reduce resolution or use --set denoise=false".into()).into());
+    }
+    Ok(mb.min(i32::MAX as u64) as i32)
+}
+
 // OIDN's HDR input processor clamps negative channels. Spectral Rec.709 has
 // negative matching lobes, so filter in a white-preserving XYZ basis and invert
 // after reconstruction. Alpha and normal vectors never enter this transform.
@@ -83,8 +95,9 @@ api! {
     commit_filter: "oidnCommitFilter" (Handle) -> ();
     execute: "oidnExecuteFilter" (Handle) -> ();
 }
+/// The denoiser or its device could not allocate; residency eviction retries on it.
 #[derive(Debug)]
-struct OutOfMemory(String);
+pub(crate) struct OutOfMemory(String);
 impl std::fmt::Display for OutOfMemory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
 }
@@ -169,7 +182,7 @@ impl Device {
         let handle = unsafe { (self.api.new_buffer)(self.handle as Handle, bytes) };
         let buffer = Buffer {engine: self.clone(), handle: handle as usize, bytes};
         self.check()?;
-        ensure!(!handle.is_null(), "OIDN returned null buffer");
+        if handle.is_null() { return Err(anyhow::anyhow!("OIDN returned null buffer").context(crate::failure::FailureKind::Device)); }
         Ok(buffer)
     }
     fn filter(self: &Arc<Self>) -> Result<Filter> {
@@ -179,7 +192,7 @@ impl Device {
             handle,
         };
         self.check()?;
-        ensure!(!handle.is_null(), "OIDN returned null RT filter");
+        if handle.is_null() { return Err(anyhow::anyhow!("OIDN returned null RT filter").context(crate::failure::FailureKind::Device)); }
         Ok(filter)
     }
 }
@@ -687,6 +700,75 @@ impl Stage {
         timing.filter_ms += filter_ms;
         timing.upload_ms += upload_start.elapsed().as_secs_f64() * 1000.;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod memory_tests {
+    use super::*;
+    const MIB: u64 = 1024 * 1024;
+    const GIB: u64 = 1024 * MIB;
+
+    #[test]
+    fn usage_growth_spans_renderer_and_workspace_creation() -> Result<()> {
+        // Existing renderers own 2 GiB before this renderer snapshots 6 GiB free.
+        // Later allocations (including shared OIDN planes) bring total use to 6.
+        assert_eq!(memory_limit_mb(6 * GIB, 2 * GIB, 6 * GIB, 2 * GIB)?, 2048);
+        assert_eq!(memory_limit_mb(6 * GIB, 2 * GIB, 2 * GIB, 6 * GIB)?, 6144);
+        // Releasing pre-existing allocations must not increase the stable quota.
+        assert_eq!(memory_limit_mb(6 * GIB, 2 * GIB, GIB, 7 * GIB)?, 6144);
+        Ok(())
+    }
+
+    #[test]
+    fn shared_card_does_not_charge_unavailable_capacity_twice() -> Result<()> {
+        let heap_budget = 76 * GIB / 10;
+        let usage_at_creation = 37 * GIB / 10;
+        let headroom = heap_budget - usage_at_creation;
+        assert_eq!(memory_limit_mb(headroom, usage_at_creation, usage_at_creation, headroom)?, 3993);
+        // Other applications lower the process's native budget, not its usage.
+        let shared_heap_budget = heap_budget - 3700 * MIB;
+        let camera_budget = shared_heap_budget - 50 * MIB;
+        assert_eq!(memory_limit_mb(camera_budget, 50 * MIB, 300 * MIB,
+            shared_heap_budget - 300 * MIB)?, 3782);
+        Ok(())
+    }
+
+    #[test]
+    fn exclusive_card_bounds_scratch_by_its_remaining_budget() -> Result<()> {
+        let heap_budget = 76 * GIB / 10;
+        let camera_budget = heap_budget - 50 * MIB;
+        assert_eq!(memory_limit_mb(camera_budget, 50 * MIB, 300 * MIB,
+            heap_budget - 300 * MIB)?, 7482);
+        Ok(())
+    }
+
+    #[test]
+    fn oidn_memory_target_uses_remaining_camera_budget() -> Result<()> {
+        // Qualification lowers startup headroom; only subsequent growth spends it.
+        assert_eq!(memory_limit_mb(5 * GIB, 2 * GIB, 6 * GIB, 2 * GIB)?, 1024);
+        assert_eq!(memory_limit_mb(8192 * MIB, 2000 * MIB, 7000 * MIB, 17000 * MIB)?, 3192);
+        // Native headroom can shrink after the camera budget was established.
+        assert_eq!(memory_limit_mb(8192 * MIB, 2000 * MIB, 7000 * MIB, 600 * MIB)?, 600);
+        assert_eq!(memory_limit_mb(24000 * MIB, 0, 8000 * MIB, 16000 * MIB)?, 16000);
+        assert_eq!(memory_limit_mb(3 * MIB - 1, MIB, 2 * MIB, 2 * MIB)?, 1);
+        assert_eq!(memory_limit_mb(u64::MAX, 0, 0, u64::MAX)?, i32::MAX);
+        Ok(())
+    }
+
+    #[test]
+    fn exhausted_oidn_budget_refuses_with_one_actionable_line() {
+        for (budget, initial, usage, headroom) in [(0, 0, 0, 0),
+            (6 * GIB, 2 * GIB, 8 * GIB, 0), (3 * GIB, 2 * GIB, 6 * GIB, 2 * GIB),
+            (u64::MAX, 0, 0, 0), (MIB - 1, 0, 0, MIB), (8 * MIB, MIB, 8 * MIB + 1, 4 * MIB)] {
+            let error = memory_limit_mb(budget, initial, usage, headroom).unwrap_err();
+            assert!(error.is::<OutOfMemory>(), "budget pressure must use the existing eviction retry");
+            let message = error.to_string();
+            assert_eq!(message, "denoising needs more memory; reduce resolution or use --set denoise=false");
+            assert_eq!(message.lines().count(), 1);
+            // Whichever caller it reaches (a still beside a video, a world in a canvas), it is the device's.
+            assert_eq!(crate::failure::exit_code(&crate::failure::scene(error.context("denoise"))), 4);
+        }
     }
 }
 

@@ -9,9 +9,9 @@ fn scene(program: bool, blur: bool) -> Result<Scene> {
         json!({"inputs":{"base_weight":0,"specular_weight":0,"emission_luminance":1,"emission_color":[1,0,0]}})
     };
     Ok(vork_scene::v2::from_test_value(json!({"version":2,
-        "render":{"resolution":[4,4],"fps":1,"duration":2,
+        "composition":{"space":"3d","view":{"program":"std/agx","inputs":{}}},"render":{"dither":false,"resolution":[4,4],"fps":1,"duration":2,
             "motion_blur":if blur {json!({"shutter":1,"position":"center"})}else{json!(null)},
-            "settings":{"integrator":"raster","samples":16,"reflections":"environment"},"display":{"program":"std/agx","inputs":{"dither_intensity":0}}},
+            "settings":{"integrator":"raster","samples":16,"reflections":"environment"}},
         "nodes":[{"type":"camera","material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":1}}},
             {"type":"mesh","geometry":"quad","materials":["m"]}],
         "buffers":{"p":{"type":"vec3","data":[[-20,-20,-2],[20,-20,-2],[20,20,-2],[-20,20,-2]]},
@@ -44,10 +44,9 @@ fn pixels(
     slot.collect(r)?.linear_rgba.context("float colour")
 }
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn animated_emission_program_shutter_and_seek() -> Result<()> {
-    let Some(r) = test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     for program in [false, true] {
         let installed = r.install(scene(program, true)?, Path::new("."))?;
         assert!(installed.animation.has_material_bindings());
@@ -88,9 +87,9 @@ fn constant_input_tracks_keep_static_install_path_and_loop_span() -> Result<()> 
         .push(vork_scene::v2::from_test_value(json!({
             "path":["nodes","camera","translation"],"keys":[[0,[0,0,0]],[0.25,[1,0,0]]]
         }))?);
-    animation::fold_material_inputs(&mut looped, Path::new("."))?;
+    animation::fold_material_inputs(&mut looped, Path::new("."), &Default::default())?;
     assert_eq!(looped.animation[0].source_span, Some((0., 0.5)));
-    animation::fold_material_inputs(&mut source, Path::new("."))?;
+    animation::fold_material_inputs(&mut source, Path::new("."), &Default::default())?;
     assert!(materials::animated_inputs(&source)?.is_empty());
     assert!(source.animation.is_empty());
     let plan = animation::Plan::compile(&source, Path::new("."))?;
@@ -127,10 +126,9 @@ fn reflected_program_inputs_use_ordered_layers_and_seek() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn animated_medium_parameter_matches_static_and_seek() -> Result<()> {
-    let Some(r) = test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     let mut source = scene(false, false)?;
     source.animation.clear();
     source.programs.insert("fog".into(),vork_scene::v2::from_test_value(json!({"source":"struct Inputs {float density=.1;}; MediumCoefficients medium(MediumContext ctx,Inputs i){MediumCoefficients m={};m.absorption=float3(i.density);return m;}"}))?);
@@ -169,10 +167,9 @@ fn animated_medium_parameter_matches_static_and_seek() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn animated_sky_parameter_updates_atmosphere_and_seeks() -> Result<()> {
-    let Some(r) = test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     let source: Scene = vork_scene::v2::from_test_value(json!({"version":2,"nodes":[],
         "materials":{"sky":{"program":"std/sky","inputs":{"sun_elevation":0.2}}},
         "animation":[{"tracks":[{"path":["materials","sky","inputs","sun_elevation"],"keys":[[0,0.2],[1,0.8]]}]}]}))?;
@@ -250,7 +247,7 @@ fn weighted_constant_program_inputs_fold_to_the_evaluated_baseline() -> Result<(
         programs::InputAnimation::new(&source, Path::new("."), "m", &layout, &mut words)?.unwrap();
     animation.words(0.5, &mut words);
     let evaluated: Vec<_> = words[1..].iter().map(|w| f32::from_bits(*w)).collect();
-    animation::fold_material_inputs(&mut source, Path::new("."))?;
+    animation::fold_material_inputs(&mut source, Path::new("."), &Default::default())?;
     assert_eq!(
         serde_json::to_value(&source.materials["m"].inputs["color"])?,
         json!(evaluated)
@@ -261,10 +258,9 @@ fn weighted_constant_program_inputs_fold_to_the_evaluated_baseline() -> Result<(
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn animated_rgb_background_uses_the_same_shutter_rule() -> Result<()> {
-    let Some(r) = test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     let mut source = scene(false, true)?;
     source.nodes.truncate(1);
     source.render.background = vork_scene::Background::Color([1., 0., 0.]);
@@ -288,7 +284,7 @@ fn normal_map_factors_are_ordinary_numeric_program_inputs() -> Result<()> {
         "programs":{"mapped":{"source":"import vork; struct Inputs {Image normal;float3 strength;}; Closure surface(ShadingContext ctx,Inputs p) {Closure c={};return c;}"}},
         "materials":{"m":{"program":"mapped","inputs":{"normal":{"image":"normal"},"strength":[0.5,0.5,1.]}}},
         "animation":[{"weight":0.5,"tracks":[{"path":["materials","m","inputs","strength"],"keys":[[0,[1,2,3]],[1,[1,2,3]]]}]}]}))?;
-    animation::fold_material_inputs(&mut source,Path::new("."))?;
+    animation::fold_material_inputs(&mut source, Path::new("."), &Default::default())?;
     assert_eq!(serde_json::to_value(&source.materials["m"].inputs["strength"])?,json!([0.75,1.25,2.]));
     assert_eq!(serde_json::to_value(&source.materials["m"].inputs["normal"])?,json!({"image":"normal"}));
     source.validate()?;
@@ -297,12 +293,11 @@ fn normal_map_factors_are_ordinary_numeric_program_inputs() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn animated_fog_preserves_proofs_of_static_inputs() -> Result<()> {
-    let Some(r) = test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     let mut source: Scene = vork_scene::v2::from_test_value(json!({"version":2,"nodes":[],
-        "materials":{"fog":{"program":"std/fog","inputs":{"density":0.1}}},
+        "materials":{"fog":{"program":{"source":include_str!("../../vork-scene/tests/fixtures/medium.slang")},"inputs":{"density":0.1}}},
         "animation":[{"tracks":[{"path":["materials","fog","inputs","density"],"keys":[[0,0.1],[1,0.8]]}]}]}))?;
     let medium = medium::install(
         &r,
@@ -334,19 +329,19 @@ fn animated_fog_preserves_proofs_of_static_inputs() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn medium_input_tracks_follow_instance_time_offsets() -> Result<()> {
-    let Some(r) = test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     let mut source: Scene = vork_scene::v2::from_test_value(vork_scene::v2::with_test_settings(
         include_str!("../tests/fixtures/analytic.json"),
         include_str!("../tests/presets/analytic-7fefd52a.json"),
     )?)?;
     source.nodes.truncate(2);
     source.render.resolution = [4, 4];
+    source.programs.insert("test-medium".into(), serde_json::from_value(json!({"source":include_str!("../../vork-scene/tests/fixtures/medium.slang")}))?);
     source.materials.insert(
         "fog".into(),
-        vork_scene::v2::from_test_value(json!({"program":"std/fog","inputs":{"density":0.1}}))?,
+        vork_scene::v2::from_test_value(json!({"program":"test-medium","inputs":{"density":0.1}}))?,
     );
     source.buffers.insert(
         "translations".into(),
@@ -387,8 +382,9 @@ fn medium_input_tracks_follow_instance_time_offsets() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn animated_bounded_path_extinction_requires_an_input_independent_certificate() -> Result<()> {
-    let Some(r) = test_renderer()? else { return Ok(()); };
+    let r = crate::test_renderer()?;
     let mut value = json!({"version":2,"render":{"resolution":[4,4],"duration":2},
         "nodes":[{"type":"camera"}],"materials":{},"programs":{}});
     value["render"]["settings"] = json!({"integrator":"path","samples":1,"denoiser":null});
@@ -411,12 +407,13 @@ fn animated_bounded_path_extinction_requires_an_input_independent_certificate() 
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn animated_compositor_inputs_match_static_and_seek() -> Result<()> {
-    let Some(r) = test_renderer()? else { return Ok(()); };
+    let r = crate::test_renderer()?;
     let mut source = scene(false, false)?;
     source.animation.clear();
     source.render.resolution = [16, 16];
-    source.render.compositor = vec!["glow".into(), "glow".into()];
+    *source.compositor_mut() = vec!["glow".into(), "glow".into()];
     source.programs.insert("gain".into(), vork_scene::v2::from_test_value(json!({"source":"import vork; struct Inputs { float strength=0.; }; float4 composite(CompositeContext c,Inputs i) { float4 v=compositor_sample(c.uv);return float4(v.rgb*(1.+i.strength),v.a); }"}))?);
     source.materials.insert("glow".into(), vork_scene::v2::from_test_value(json!({
         "program":"gain", "inputs":{"strength":0}
@@ -439,8 +436,9 @@ fn animated_compositor_inputs_match_static_and_seek() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn camera_cut_left_limit_keeps_step_emission_and_visibility() -> Result<()> {
-    let Some(r)=test_renderer()? else {return Ok(());};
+    let r = crate::test_renderer()?;
     for (program,visibility) in [(false,false),(true,false),(false,true)] {
         let mut input=scene(program,true)?;
         input.render.fps=vork_time::Time::integer(24);
@@ -470,8 +468,9 @@ fn camera_cut_left_limit_keeps_step_emission_and_visibility() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn discrete_pose_reuse_distinguishes_left_limit_from_equal_numeric_point()->Result<()> {
-    let Some(r)=test_renderer()? else {return Ok(());};
+    let r = crate::test_renderer()?;
     let mut input=scene(true,false)?;input.render.fps=vork_time::Time::integer(24);
     let installed=r.install(input,Path::new("."))?;
     let mut slot=installed.create_frame_slot(&r,Default::default())?;

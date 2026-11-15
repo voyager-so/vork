@@ -60,7 +60,7 @@ fn interface(source: &str) -> BTreeSet<String> {
 
 #[test]
 fn catalog_matches_generated_compute_interface() -> Result<()> {
-    let r = pollster::block_on(Renderer::create(|_| Ok(true), true))?;
+    let r = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
     let base = Path::new(".");
     // Every buffer element kind, dimensions, atomics, previous state, numbered
     // and semantic geometry attributes, optional streams, and Geometry overloads.

@@ -148,10 +148,9 @@ fn dispatch(r: &Renderer, tree: &Tree, body: &str, count: u32) -> Result<Vec<[f3
     Ok(values)
 }
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn weighted_remapping_never_enters_a_zero_power_branch() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     // #1186: the old selector remapped a finite coordinate to 1, entered a
     // zero-power branch, and divided 0/0. A zero light contribution then became
     // NaN when divided by the selected probability. Each subtree here has one
@@ -188,10 +187,9 @@ fn weighted_remapping_never_enters_a_zero_power_branch() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn compiled_sampler_matches_brute_force_and_reduces_many_light_noise() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     let mut sources = Vec::new();
     for y in 0..32 {
         for x in 0..32 {
@@ -376,10 +374,9 @@ float3 center(uint n) {{return .5*nodes[n].lower_power.xyz+.5*nodes[n].upper_inf
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn installed_scene_source_identities_and_shapes() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     let mut input: serde_json::Value =
         serde_json::from_str(include_str!("../../tests/fixtures/analytic.json"))?;
     input["animation"] = serde_json::json!([]);

@@ -14,6 +14,16 @@
     "repository": "https://github.com/madsmtm/objc2",
     "version": "0.6.2"
   },
+  "crc-catalog": {
+    "note": "The crate ships its licence texts in LICENSES/, which the notice generator does not read; these are those files. Review on each locked version update.",
+    "repository": "https://github.com/akhilles/crc-catalog",
+    "version": "2.5.0"
+  },
+  "cssparser-color": {
+    "note": "MPL-2.0 text from the published cssparser-color 0.5.0 package at VCS commit 4c49486494fb24dc01390e3baca9698ef1744c71; used unmodified for CSS Color 4 text paints. Review on locked version update.",
+    "repository": "https://github.com/servo/rust-cssparser",
+    "version": "0.5.0"
+  },
   "dispatch2": {
     "note": "Upstream repository licence; review on each locked version update. r-efi uses published AUTHORS.",
     "repository": "https://github.com/madsmtm/objc2",
@@ -34,10 +44,25 @@
     "repository": "https://github.com/zakarumych/gpu-descriptor",
     "version": "0.2.0"
   },
+  "harfrust": {
+    "note": "Upstream repository licence (the crates.io 0.5.2 package ships none; copied from the same project's 0.15.0 package); review on each locked version update.",
+    "repository": "https://github.com/harfbuzz/harfrust",
+    "version": "0.5.2"
+  },
   "hexf-parse": {
     "note": "Upstream repository licence; review on each locked version update. r-efi uses published AUTHORS.",
     "repository": "https://github.com/lifthrasiir/hexf",
     "version": "0.2.1"
+  },
+  "i_key_sort": {
+    "note": "Upstream repository licence; review on each locked version update. r-efi uses published AUTHORS.",
+    "repository": "https://github.com/iShape-Rust/iKeySort",
+    "version": "0.11.0"
+  },
+  "i_overlay": {
+    "note": "Upstream repository licence; review on each locked version update. r-efi uses published AUTHORS.",
+    "repository": "https://github.com/iShape-Rust/iOverlay",
+    "version": "9.0.0"
   },
   "ispc_rt": {
     "note": "Upstream repository licence; review on each locked version update. r-efi uses published AUTHORS.",
@@ -123,6 +148,16 @@
     "note": "Workspace licence copied from the published rquickjs 0.12.2 crate; rquickjs-core publication omits it. Review on version update.",
     "repository": "https://github.com/DelSkayn/rquickjs",
     "version": "0.12.2"
+  },
+  "selectors": {
+    "note": "MPL-2.0 licence text (the crates.io package ships none; the text is the Mozilla Public License 2.0 as cssparser ships it); review on each locked version update.",
+    "repository": "https://github.com/servo/stylo",
+    "version": "0.38.0"
+  },
+  "servo_arc": {
+    "note": "MIT OR Apache-2.0 licence texts (the crates.io package ships none; the Servo Project's texts as smallvec ships them); review on each locked version update.",
+    "repository": "https://github.com/servo/stylo",
+    "version": "0.4.3"
   },
   "spirv": {
     "note": "Upstream repository licence; review on each locked version update. r-efi uses published AUTHORS.",

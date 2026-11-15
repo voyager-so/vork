@@ -157,8 +157,9 @@ fn medium_mixed_stages_position_dependence_and_errors() {
         let program=compiler.compile_medium(&abi,&source,path,"dependency").unwrap();
         assert_eq!(program.homogeneous, homogeneous, "{body}\n{}",program.wgsl);
     }
-    for source in [vork_slang::module_source("std/fog").unwrap(),"import std.fog; Closure surface(ShadingContext ctx, Inputs inputs) {Closure c={};return c;}"] {
-    let fog=compiler.compile_medium(&abi,source,Path::new("fog.slang"),"boundfog").unwrap();
+    let medium=include_str!("../../vork-scene/tests/fixtures/medium.slang");
+    for source in [medium.to_owned(), format!("{medium} Closure surface(ShadingContext ctx, Inputs inputs) {{Closure c={{}};return c;}}")] {
+    let fog=compiler.compile_medium(&abi,&source,Path::new("fog.slang"),"boundfog").unwrap();
     for (values,expected) in [(serde_json::json!({}),true),(serde_json::json!({"density":0.4,"height_falloff":0}),true),(serde_json::json!({"density":0.4,"height_falloff":0.7}),false)] {
         let words=fog.inputs.pack(&serde_json::from_value(values.clone()).unwrap(),|_,_|unreachable!()).unwrap();
         assert_eq!(fog.homogeneous_for_inputs(&abi,&words.iter().copied().map(Some).collect::<Vec<_>>()).unwrap(),expected,"{values}");
@@ -534,7 +535,7 @@ fn displacement_resource_probe_identifies_images()->anyhow::Result<()> {
 #[ignore="requires pinned Slang toolchain"]
 fn displacement_rejects_scene_queries_and_surface_evaluation()->anyhow::Result<()> {
     let base="import vork; struct Inputs {}; Closure surface(ShadingContext ctx,Inputs i){return {}; }";
-    for body in ["return world_to_camera(ctx.POSITION);","ShadingContext s={};return surface(s,i).base_color;"] {
+    for body in ["return world_to_camera(ctx.POSITION);", "ShadingContext s={};return object_direction_to_world(s,float3(1.,0.,0.));", "ShadingContext s={};return object_normal_to_world(s,float3(0.,1.,0.));","ShadingContext s={};return surface(s,i).base_color;"] {
         let error=Compiler::discover().compile_surface(&abi(),&format!("{base} float3 displace(DisplacementContext ctx,Inputs i){{{body}}}"),Path::new("restricted.slang"),"restricted").err().expect("invalid displacement stage installed");
         assert!(format!("{error:#}").contains("displace cannot call"),"{error:#}");
     }
@@ -560,6 +561,30 @@ fn implicit_closure_defaults_match_effect_analysis() {
 
 #[test]
 #[ignore = "requires pinned Slang toolchain"]
+fn constant_blender_math_drops_unused_native_operations() {
+    // Compile the real scalar helper independently of surface ABI plumbing.
+    let library=vork_slang::module_source("blender/nodes").unwrap();
+    let start=library.find("public enum MathOperation").unwrap();
+    let end=library.find("// Tangent-space Normal Map").unwrap();
+    let math=&library[start..end];
+    let compiler=Compiler::discover();
+    for operation in ["ADD","MULTIPLY"] {
+        let main=format!("import math;RWStructuredBuffer<float> values;[shader(\"compute\")][numthreads(1,1,1)] void main() {{values[0]=Math(MathOperation.{operation},values[0],values[1],0.,false);}}");
+        let code=compiler.compile_modules(&[("math",math),("main",&main)],"main",&[("main","compute")],
+            &["-target","spirv","-O1"]).unwrap();
+        let words:Vec<_>=code.chunks_exact(4).map(|b|u32::from_le_bytes(b.try_into().unwrap())).collect();
+        let mut cursor=5;
+        while cursor<words.len() {
+            let instruction=words[cursor];let opcode=instruction&0xffff;
+            // OpFunctionCall, OpBranchConditional, OpSwitch.
+            assert!(!matches!(opcode,57|250|251),"constant {operation} retained a call or conditional dispatcher (opcode {opcode})");
+            cursor+=(instruction>>16) as usize;
+        }
+    }
+}
+
+#[test]
+#[ignore = "requires pinned Slang toolchain"]
 fn compile_blender_socket_helpers() {
     let source = r#"
 import vork;
@@ -567,7 +592,7 @@ import blender.nodes;
 struct Inputs { float value; };
 Closure surface(ShadingContext ctx,Inputs inputs) {
     float value=0.;
-    for(int op=0;op<27;op++) value+=Math(MathOperation(op),inputs.value,.5,.25,false);
+    for(int op=0;op<41;op++) value+=Math(MathOperation(op),inputs.value,.5,.25,false);
     value+=Fresnel(1.45,ctx.NORMAL,ctx)+Layer_Weight_Fresnel(.5,ctx.NORMAL,ctx);
     value+=Normal_Map(1.,float3(.5,.5,1.),ctx).x;
     let glass=Glass_BSDF(float3(1.),.15,1.45,ctx.NORMAL,0.,1.33);
@@ -626,10 +651,11 @@ fn std_display_programs_own_grading_and_pixel_context() {
     for (name, has_look) in [("std/agx", true), ("std/standard", false), ("blender/filmic", true)] {
         let program = compiler.compile_display(&abi(), vork_slang::module_source(name).unwrap(),
             Path::new(&format!("{name}.slang")), "displaytest").unwrap();
-        for input in ["exposure", "gamma", "dither_intensity"] {
+        for input in ["exposure", "gamma"] {
             assert!(program.inputs.fields.iter().any(|f| f.name == input));
         }
         assert_eq!(program.inputs.fields.iter().any(|f| f.name == "look"), has_look);
+        assert!(!program.inputs.fields.iter().any(|f| f.name == "dither_intensity"));
         for gamma in [0., -1.] {
             let values = BTreeMap::from([("gamma".to_owned(), serde_json::json!(gamma))]);
             assert!(program.inputs.pack(&values, |_,_| Ok(0)).is_err());
@@ -676,6 +702,56 @@ fn geometric_queries_require_bounded_caller_loops() {
         let result = compiler.compile_surface(&abi(), &source, Path::new("trace-loops.slang"), &format!("traceLoops{index}"));
         if index == 0 {result.unwrap();} else {assert!(format!("{:#}",result.unwrap_err()).contains("provably finite"));}
     }
+}
+
+#[test]
+#[ignore = "requires pinned Slang toolchain"]
+fn geometric_queries_admit_finite_procedural_helpers() {
+    let compiler=Compiler::discover();
+    for (index,expr) in [
+        "noise(ctx.POSITION)",
+        "noise(ctx.POSITION,5.,2.5)",
+        "noise(ctx.POSITION,5.,2.,0.5,2.,1.,true,NoiseType.FBM,1)",
+        "noise(ctx.POSITION,5.,2.,0.5,2.,1.,true,NoiseType.FBM,2)",
+        "noise(ctx.POSITION,5.,2.,0.5,2.,1.,true,NoiseType.FBM,4)",
+        "noise_color(ctx.POSITION).x", "voronoi(ctx.POSITION).distance",
+        "white_noise(ctx.POSITION).value", "gabor(ctx.POSITION).value",
+        "magic(ctx.POSITION).factor", "wave(ctx.POSITION)",
+    ].iter().enumerate() {
+        let source=format!("import vork; import blender.procedurals; struct Inputs {{}}; Closure surface(ShadingContext ctx,Inputs inputs) {{let h=trace(ctx.POSITION,ctx.NORMAL,0.,1.);Closure c={{}};c.base_color=float3({expr})+float3(h.hit?0.:.1);return c;}}");
+        eprintln!("admitting {expr}");
+        compiler.compile_surface(&abi(),&source,Path::new("finite-procedurals.slang"),&format!("finiteProcedural{index}")).unwrap_or_else(|e|panic!("{expr}: {e:#}"));
+    }
+}
+
+#[test]
+#[ignore = "requires pinned Slang toolchain"]
+fn geometric_queries_prove_returns_and_name_unbounded_helpers() {
+    let compiler=Compiler::discover();
+    for (index,body) in [
+        "for(int i=0;i<4;i++){if(i==3)return .5;}return 0.;",
+        "for(int i=0;i<4;i++){if(x>float(i))return .5;}return 0.;",
+        "for(int i=0;i<4;i++){for(int j=0;j<3;j++){if(x>float(j))return .5;}}return 0.;",
+        "while(x>0.){x+=1.;}return x;",
+        "for(int i=0;i<4;i++){if(x>0.)return .5;while(x<0.){x-=1.;}}return 0.;",
+    ].iter().enumerate() {
+        let source=format!("import vork;float failingHelper(float x) {{{body}}} struct Inputs {{}};Closure surface(ShadingContext ctx,Inputs inputs) {{Closure c={{}};c.base_color=float3(failingHelper(ctx.time))+float3(trace(ctx.POSITION,ctx.NORMAL,0.,1.).hit?0.:.1);return c;}}");
+        let result=compiler.compile_surface(&abi(),&source,Path::new("helper-bounds.slang"),&format!("helperBounds{index}"));
+        if index<3 {result.unwrap();} else {
+            let error=format!("{:#}",result.unwrap_err());
+            assert!(error.contains("failingHelper") && error.contains("loop count is not provably finite"),"{error}");
+            assert_eq!(error.lines().count(),1,"{error}");
+        }
+    }
+    // A finite graph is bounded by its function count, not a fixed depth cap.
+    let mut source=String::from("import vork;float chain0(float x){return x;}");
+    for i in 1..48 {source+=&format!("float chain{i}(float x){{return chain{}(x);}}",i-1);}
+    source+="struct Inputs {};Closure surface(ShadingContext ctx,Inputs inputs){Closure c={};c.base_color=float3(chain47(ctx.time))+float3(trace(ctx.POSITION,ctx.NORMAL,0.,1.).hit?0.:.1);return c;}";
+    compiler.compile_surface(&abi(),&source,Path::new("finite-chain.slang"),"finiteChain").unwrap();
+    let source="import vork;float recursiveHelper(float x){return recursiveHelper(x);}
+        struct Inputs {};Closure surface(ShadingContext ctx,Inputs inputs){Closure c={};c.base_color=float3(recursiveHelper(ctx.time))+float3(trace(ctx.POSITION,ctx.NORMAL,0.,1.).hit?0.:.1);return c;}";
+    let error=format!("{:#}",compiler.compile_surface(&abi(),source,Path::new("recursive-helper.slang"),"recursiveChain").unwrap_err());
+    assert!(error.contains("recursiveHelper") && error.to_lowercase().contains("recurs"),"{error}");
 }
 
 #[test]
@@ -801,35 +877,72 @@ fn exponential_world_proof_refuses_vanished_positive_amplitude() {
 }
 
 #[test]
-fn permanent_std_imports_have_no_compatibility_warnings() -> anyhow::Result<()> {
-    let source = "import vork; import std.procedurals; import std.vector; struct Inputs {}; Closure surface(ShadingContext c, Inputs i) { Closure r={}; r.base_color=float3(noise(c.POSITION)); return r; }";
+fn removed_imports_refuse_with_replacement() {
     let compiler = Compiler::discover();
-    let prepared = compiler.prepare_bound_program(&abi(), source, Path::new("compatibility.slang"), "")?;
-    let receipt = prepared.receipt();
-    assert!(receipt.compatibility_modules.is_empty());
-    compiler.compile_surface(&abi(), source, Path::new("compatibility.slang"), "compat")?;
-    let encoded = serde_json::to_vec(&receipt)?;
-    let restored: vork_slang::InputIdentity = serde_json::from_slice(&encoded)?;
-    assert_eq!(receipt.compatibility_modules, restored.compatibility_modules);
-    Ok(())
-}
-
-#[test]
-fn compatibility_compositors_compile() -> anyhow::Result<()> {
-    let compiler = Compiler::discover();
-    for name in ["std/bloom", "post/white_balance"] {
-        let source = vork_slang::module_source(name).unwrap();
-        compiler.compile_composite(&abi(), source, Path::new(&format!("{name}.slang")), "compat")?;
+    for (module, replacement) in [("post.white_balance", "std.white_balance"), ("std.particles", "fluid.particles")] {
+        let source = format!("import {module}; struct Inputs {{}}; import std.view; ViewResult view(ViewContext c, Inputs i) {{return finish_view(float3(0.25),c,1.);}}");
+        let error = match compiler.prepare_program(&abi(), &source, Path::new("removed.slang")) {
+            Ok(_) => panic!("removed module {module} accepted"),
+            Err(error) => error.to_string(),
+        };
+        assert_eq!(error.lines().count(), 1, "{error}");
+        assert!(error.contains(replacement) && error.contains("vork help upgrade"), "{error}");
+        let rewritten = source.replace(module, replacement);
+        compiler.prepare_program(&abi(), &rewritten, Path::new("rewritten.slang")).unwrap();
+        let nested = compiler.prepare_modules(&[("main", "import helper;"), ("helper", &format!("import {module};"))], "main", &[], &[]);
+        let error = nested.err().expect("nested removed import accepted").to_string();
+        assert_eq!(error.lines().count(), 1, "{error}");
+        assert!(error.contains(replacement), "{error}");
+        let inactive = format!("// import {module};\n#if 0\nimport {module};\n#endif\n{rewritten}");
+        compiler.prepare_program(&abi(), &inactive, Path::new("inactive.slang")).unwrap();
     }
+}
+
+#[test]
+fn bloom_compositor_compiles() -> anyhow::Result<()> {
+    Compiler::discover().compile_composite(&abi(), vork_slang::module_source("std/bloom").unwrap(), Path::new("std/bloom.slang"), "bloom")?;
     Ok(())
 }
 
 #[test]
-fn compatibility_particle_math_keeps_loading() -> anyhow::Result<()> {
-    let source = "import vork; import std.particles; struct Inputs {}; Closure surface(ShadingContext c, Inputs i) { Closure r={}; r.base_color=float3(particle_kernel(c.POSITION,float3x3(1,0,0,0,1,0,0,0,1))); return r; }";
+#[ignore = "requires pinned Slang toolchain"]
+fn blender_math_uses_rna_fract_and_refuses_fraction() {
+    let compiler=Compiler::discover();
+    let abi=Abi {aov_count:0,context:Abi::spec_context(),closure:vork_slang::openpbr_fields()};
+    let source="import blender.nodes; struct Inputs {}; Closure surface(ShadingContext ctx, Inputs i) { return unlit(float3(Math(MathOperation.FRACT,1.25,0.,0.,false))); }";
+    compiler.compile_surface(&abi,source,Path::new("fract.slang"),"fract").unwrap();
+    let error=compiler.prepare_program(&abi,&source.replace("FRACT,","FRACTION,"),Path::new("fraction.slang"));
+    let error=match error {Ok(_)=>panic!("retired FRACTION accepted"),Err(error)=>error.to_string()};
+    assert_eq!(error.lines().count(), 1, "{error}");
+    assert!(error.contains("FRACTION"), "{error}");
+    assert!(error.split(|c: char| !c.is_ascii_alphanumeric()).any(|token| token == "FRACT"), "{error}");
+}
+
+#[test]
+#[ignore = "requires pinned Slang toolchain"]
+fn missing_enum_members_name_actual_supported_values() {
     let compiler = Compiler::discover();
-    let prepared = compiler.prepare_bound_program(&abi(), source, Path::new("compatibility-particles.slang"), "")?;
-    assert_eq!(prepared.receipt().compatibility_modules, ["std/particles"]);
-    compiler.compile_surface(&abi(), source, Path::new("compatibility-particles.slang"), "compatparticles")?;
-    Ok(())
+    let abi = Abi { aov_count: 0, context: Abi::spec_context(), closure: vork_slang::openpbr_fields() };
+    let source = "enum Finish { Matte, Glossy }; struct Inputs {}; Closure surface(ShadingContext c, Inputs i) { return unlit(float3(int(Finish.Gloss))); }";
+    let error = match compiler.prepare_program(&abi, source, Path::new("finish.slang")) {
+        Ok(_) => panic!("unknown enum member accepted"),
+        Err(error) => error.to_string(),
+    };
+    assert_eq!(error.lines().count(), 1, "{error}");
+    assert!(error.contains("Gloss") && error.contains("Glossy"), "{error}");
+    // A user's own enum can still declare the same spelling as a removed library member.
+    let source = "enum MathOperation { FRACTION }; struct Inputs {}; Closure surface(ShadingContext c, Inputs i) { return unlit(float3(int(MathOperation.FRACTION))); }";
+    assert!(compiler.prepare_program(&abi, source, Path::new("own-enum.slang")).is_ok());
+}
+
+#[test]
+#[ignore = "requires pinned Slang toolchain"]
+fn object_vectors_and_normals_retain_runtime_material_effects() {
+    let mut abi = abi();
+    abi.closure.push(Field::new("transmission_weight", Type::Float, Some("0.")));
+    for helper in ["object_direction_to_world", "object_normal_to_world"] {
+        let source = format!("import vork; struct Inputs {{}}; Closure surface(ShadingContext ctx, Inputs i) {{ Closure c={{}}; c.transmission_weight={helper}(ctx,float3(0.,1.,0.)).x; return c; }}");
+        let program = Compiler::discover().compile_surface(&abi,&source,Path::new("object-vector.slang"),"vectorEffects").unwrap();
+        assert!(program.capabilities.transmission, "{helper} depends on the installed object transform");
+    }
 }

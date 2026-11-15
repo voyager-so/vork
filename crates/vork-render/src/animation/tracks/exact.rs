@@ -11,7 +11,7 @@ impl DeferredTimeCurve {
     pub(super) fn new(source:&v2::Track,decoded:std::sync::Arc<Curve>)->Self {
         Self {source:source.clone(),decoded,value:Default::default()}
     }
-    fn get(&self)->Result<&TimeCurve> {
+    pub(super) fn get(&self)->Result<&TimeCurve> {
         self.value.get_or_init(||TimeCurve::compile(&self.source,&self.decoded).map_err(|e|format!("{e:#}")))
             .as_ref().map_err(|error|anyhow::anyhow!("{error}"))
     }
@@ -72,7 +72,10 @@ impl TimeCurve {
         ensure!(times.windows(2).all(|p|p[0] < p[1]), "time track keys must increase");
         Ok(Self { times, values, interpolation: decoded.interpolation })
     }
-    fn sample(&self, time: &Germ) -> Germ {
+    pub(super) fn key_tables(&self) -> (&[Rational], &[Rational]) { (&self.times, &self.values) }
+    pub(super) fn is_cubic(&self) -> bool { self.interpolation == Interpolation::Cubic }
+    pub(super) fn is_step(&self) -> bool { self.interpolation == Interpolation::Step }
+    pub(super) fn sample(&self, time: &Germ) -> Germ {
         let upper = self.times.partition_point(|key| time.compare_point(key).is_ge());
         let a = upper.saturating_sub(1);
         let b = upper.min(self.times.len()-1);
@@ -233,7 +236,7 @@ mod tests {
         assert_eq!(value.scale(&q("24")).floor_clamped(0,24)?,11);
         let cancellation = plan(serde_json::json!([
             {"tracks":[{"path":["images","plate","time"],"keys":[[0,-0.5],[1,0.5]]}]},
-            {"blend":"add","tracks":[{"path":["images","plate","time"],"interpolation":"CUBICSPLINE","keys":[[0,0.75,-2,-2],[1,-0.25,0,0]]}]}
+            {"blend":"combine","tracks":[{"path":["images","plate","time"],"interpolation":"CUBICSPLINE","keys":[[0,0.75,-2,-2],[1,-0.25,0,0]]}]}
         ]),serde_json::json!({}))?;
         let value = evaluate(&cancellation,&left)?;
         assert_eq!(value.value(),&q("0"));
@@ -257,14 +260,14 @@ mod tests {
 }
 
 impl CompiledLayer {
+    /// The exact span a looping layer's clock wraps over.
+    pub(super) fn loop_span(&self)->Option<&(Rational,Rational)> {
+        if !self.source.looping {return None}
+        self.time_span.as_ref().map(|span|span.get()).filter(|span|span.1>span.0)
+    }
     pub(super) fn exact_local(&self,time:&Germ)->Result<Germ> {
         let mut local=time.scale(&ieee(self.source.speed)?).add(&Germ::point(ieee(self.source.offset)?));
-        if self.source.looping {
-            if let Some(span)=&self.time_span {
-                let (start,end)=span.get();
-                if end>start {local=local.euclidean_loop(start,end)?;}
-            }
-        }
+        if let Some((start,end))=self.loop_span() {local=local.euclidean_loop(start,end)?;}
         Ok(local)
     }
 }
@@ -332,6 +335,7 @@ impl CompiledLayer {
         let times=if let Some(keys)=&track.camera_keys {keys.as_slice()}
             else {track.discrete_keys.as_ref().unwrap().exact_keys()};
         let equal=|a:usize,b:usize|match &track.channel {
+            Channel::Style(track)=>track.values[a]==track.values[b],
             Channel::Discrete {values,..}=>values[a]==values[b],
             Channel::Numeric(curve)=>curve.values[a]==curve.values[b],
         };
@@ -462,21 +466,38 @@ impl DiscreteKeys {
     pub(super) fn upper(&self,time:&Germ)->usize {
         self.exact_keys().partition_point(|key|time.compare_point(key).is_ge())
     }
+    /// The key at which `upper` next changes for a clock now at `time`: the first key above it
+    /// when the clock rises, the last key at or below it when it falls.
+    pub(super) fn next(&self,time:&Germ,rising:bool)->Option<&Rational> {
+        let upper=self.upper(time);
+        if rising {self.exact_keys().get(upper)} else {upper.checked_sub(1).map(|key|&self.exact_keys()[key])}
+    }
 }
 
 impl Plan {
     /// Include discrete ownership in pose reuse without keying on raw exact
     /// time: continuous tracks retain their numeric identity and reuse cost.
     pub fn append_discrete_key(&self,request:&vork_time::Request,out:&mut Vec<u8>)->Result<()> {
+        if self.has_clocks() {self.append_clock_key(&request.exact()?,out)?;}
         if !self.discrete_tracks {return Ok(());}
         let mut exact=None;
         for layer in &self.layers {
+            if layer.owner_node.is_some() {continue;}
             let mut local=None;
             for track in &layer.tracks {
                 if let Some(keys)=&track.discrete_keys {
                     if exact.is_none() {exact=Some(request.exact()?);}
                     if local.is_none() {local=Some(layer.exact_local(exact.as_ref().unwrap())?);}
                     out.extend_from_slice(&(keys.upper(local.as_ref().unwrap()) as u64).to_le_bytes());
+                    if let Channel::Style(style)=&track.channel {
+                        if let Some(clocks)=&style.clocks {
+                            for pair in clocks.windows(2) {
+                                let midpoint=(pair[0].exact()+pair[1].exact())/Rational::from_integer(2.into());
+                                out.push(u8::from(local.as_ref().unwrap().compare_point(&midpoint).is_ge()));
+                            }
+                        }
+                    }
+
                 }
             }
         }

@@ -45,6 +45,30 @@ impl Device {
             flags |= wgt::AccelerationStructureFlags::ALLOW_UPDATE;
         }
         let size_info = match &sizes {
+            wgt::BlasGeometrySizeDescriptors::Aabbs { descriptors } => {
+                let unsupported = flags & (wgt::AccelerationStructureFlags::USE_TRANSFORM
+                    | wgt::AccelerationStructureFlags::ALLOW_RAY_HIT_VERTEX_RETURN);
+                if !unsupported.is_empty() {
+                    return Err(CreateBlasError::InvalidAabbFlag(unsupported));
+                }
+                if descriptors.len() > self.limits.max_blas_geometry_count as usize {
+                    return Err(CreateBlasError::TooManyGeometries(self.limits.max_blas_geometry_count,
+                        descriptors.len().min(u32::MAX as usize) as u32));
+                }
+                let count: u64 = descriptors.iter().map(|d| u64::from(d.count)).sum();
+                if count > u64::from(self.limits.max_blas_primitive_count) {
+                    return Err(CreateBlasError::TooManyPrimitives(self.limits.max_blas_primitive_count,
+                        count.min(u64::from(u32::MAX)) as u32));
+                }
+                let entries = descriptors.iter().map(|d| hal::AccelerationStructureAABBs {
+                    buffer: Some(self.zero_buffer.as_ref()), offset: 0, count: d.count,
+                    stride: 24, flags: d.flags,
+                }).collect();
+                unsafe { self.raw().get_acceleration_structure_build_sizes(
+                    &hal::GetAccelerationStructureBuildSizesDescriptor {
+                        entries: &hal::AccelerationStructureEntries::AABBs(entries), flags,
+                    }) }
+            }
             wgt::BlasGeometrySizeDescriptors::Triangles { descriptors } => {
                 if descriptors.len() as u32 > self.limits.max_blas_geometry_count {
                     return Err(CreateBlasError::TooManyGeometries(

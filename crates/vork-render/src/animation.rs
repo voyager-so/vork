@@ -4,9 +4,11 @@ use super::*;
 use glam::Quat;
 use std::sync::Arc;
 mod tracks;
+pub(crate) mod style;
 use tracks::Combine;
 use tracks::{Curve, Interpolation};
-pub(crate) use tracks::{fold_material_inputs,MaterialBinding, Plan, Sample, Samples};
+pub(crate) use tracks::{blend, fold_material_inputs,ClockNode,FootageClock,MaterialBinding, Plan, Sample, Samples, SoundPlan};
+pub(crate) use tracks::Combine as BlendKind;
 
 type BindNodes = Vec<(Option<usize>, vork_scene::Transform, Vec<f32>)>;
 type SkinBindings = Vec<Vec<(usize, Mat4)>>;
@@ -348,7 +350,11 @@ impl Asset {
         if !self.animated() { return Arc::clone(self.bind_pose.as_ref().expect("installed bind pose")); }
         Arc::new(self.evaluate_sampled(Some(samples), Some(plan)))
     }
-    fn evaluate_sampled(&self, sampled: Option<&Samples>, plan: Option<&Plan>) -> Pose {
+    pub(crate) fn local_transforms_with_plan(&self, samples: &Samples, plan: &Plan) -> Vec<vork_scene::Transform> {
+        self.sample_local_inputs(Some(samples), Some(plan)).0
+    }
+    fn sample_local_inputs(&self, sampled: Option<&Samples>, plan: Option<&Plan>)
+        -> (Vec<vork_scene::Transform>, Vec<Vec<f32>>, Vec<vork_scene::Visibility>) {
         let mut transforms: Vec<_> = self.nodes.iter().map(|n| n.1.clone()).collect();
         let mut weights: Vec<_> = self.nodes.iter().map(|n| n.2.clone()).collect();
         let mut visibility = self.visibility.clone();
@@ -411,6 +417,10 @@ impl Asset {
                 plan.apply_asset_visibility(asset, samples, &mut visibility);
             }
         }
+        (transforms, weights, visibility)
+    }
+    fn evaluate_sampled(&self, sampled: Option<&Samples>, plan: Option<&Plan>) -> Pose {
+        let (transforms, weights, visibility) = self.sample_local_inputs(sampled, plan);
         fn world(
             i: usize,
             nodes: &[(Option<usize>, vork_scene::Transform, Vec<f32>)],
@@ -676,7 +686,7 @@ mod native_tests {
             &buffers,
             serde_json::json!({"animation":[
                 {"tracks":[{"path":["nodes","actor","nodes",name,"translation"],"keys":[[0,[0,0,0]],[2,[0,4,0]]]}],"weight":0.5},
-                {"tracks":[{"path":["nodes","actor","nodes",name,"translation"],"keys":[[0,[0,0,0]],[2,[0,2,0]]]}],"blend":"add"}
+                {"tracks":[{"path":["nodes","actor","nodes",name,"translation"],"keys":[[0,[0,0,0]],[2,[0,2,0]]]}],"blend":"combine"}
             ]}),
             &mut SourceCache::default(),
         )?;
@@ -731,7 +741,7 @@ mod unified_pose_tests {
             serde_json::json!({"animation":[
                 {"tracks":[{"path":["animation","walk","weight"],"keys":[[0,0],[1,1]]}]},
                 {"name":"walk","clip":{"target":"actor","index":0}},
-                {"blend":"add","weight":0.5,"tracks":[{"path":["nodes","actor","nodes","joint","translation"],"keys":[[0,[0,1,0]]]},{"path":["nodes","actor","nodes","joint","rotation"],"keys":[[0,Quat::from_rotation_y(0.8).to_array()]]}]}
+                {"blend":"combine","weight":0.5,"tracks":[{"path":["nodes","actor","nodes","joint","translation"],"keys":[[0,[0,1,0]]]},{"path":["nodes","actor","nodes","joint","rotation"],"keys":[[0,Quat::from_rotation_y(0.8).to_array()]]}]}
             ]}),
             &mut SourceCache::default(),
         )?;

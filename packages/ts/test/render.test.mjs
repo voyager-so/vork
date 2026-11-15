@@ -1,3 +1,4 @@
+import {writeExecutable} from './executable-fixture.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {mkdtemp, mkdir, writeFile, readFile, rm} from 'node:fs/promises';
@@ -20,7 +21,7 @@ test('render preserves exposure and warnings', async () => {
    await writeFile(path,JSON.stringify({...(i<3?{exposure:summaries[i]}:{}), warnings:[warning, degradation]}));
   }
   const executable=join(directory,'vork');
-  await writeFile(executable,'#!/usr/bin/env node\nconsole.log("exposure: 12% clipped, 20% near-black, mean 0.41");\n',{mode:0o700});
+  writeExecutable(executable,'#!/usr/bin/env node\nconsole.log("exposure: 12% clipped, 20% near-black, mean 0.41");\n',{mode:0o700});
   const module=new URL('../dist/index.js',import.meta.url).href;
   const source=`import {render} from ${JSON.stringify(module)}; console.log(JSON.stringify(render('shot.json',{out:${JSON.stringify(outputs)}})));`;
   const output=execFileSync(process.execPath,['--input-type=module','-e',source],{env:{...process.env,VORK_BIN:executable},encoding:'utf8'});
@@ -34,7 +35,7 @@ test('render preserves rational output rates in the child arguments', async () =
  try {
   const output=join(directory,'frame.png'),capture=join(directory,'args.json'),executable=join(directory,'vork');
   await writeFile(output+'.meta.json',JSON.stringify({warnings:[]}));
-  await writeFile(executable,'#!/usr/bin/env node\nrequire("fs").writeFileSync(process.env.VORK_ARGS_CAPTURE,JSON.stringify(process.argv.slice(2)));\n',{mode:0o700});
+  writeExecutable(executable,'#!/usr/bin/env node\nrequire("fs").writeFileSync(process.env.VORK_ARGS_CAPTURE,JSON.stringify(process.argv.slice(2)));\n',{mode:0o700});
   const module=new URL('../dist/index.js',import.meta.url).href;
   const source=`import {render} from ${JSON.stringify(module)}; render('shot.json',{out:${JSON.stringify(output)},at:0.5,set:{fps:'30000/1001'}});`;
   execFileSync(process.execPath,['--input-type=module','-e',source],{env:{...process.env,VORK_BIN:executable,VORK_ARGS_CAPTURE:capture}});

@@ -1,6 +1,7 @@
 //! Pack native TLAS descriptors from the exact object snapshot consumed by shading.
-//! Native references/options are immutable templates supplied by the backend; the
-//! GPU only replaces affine coefficients and visibility. No address arithmetic.
+//! Native references are immutable templates supplied by the backend. Installed
+//! material policy sets backend-described traversal bits; the GPU replaces affine
+//! coefficients and visibility. No address arithmetic.
 use crate::*;
 use std::fmt::Write as _;
 
@@ -57,14 +58,16 @@ impl SoftwareMasked {
     }
 }
 
-/// Generate from backend layout facts, shared by production and packing tests.
+/// Generate from backend layout facts, shared by production and packing tests. The text
+/// holds no scene size: the instance count is the mapping's length and the dispatch row
+/// width follows from it and the device's workgroup limit (`row_groups`), as `dispatch`
+/// computes them, so one pipeline places any number of instances.
 fn source(
     stride: u32,
     transform: [u32; 12],
     mask_word: u32,
     mask_shift: u32,
-    count: u32,
-    width: u32,
+    row_groups: u32,
 ) -> String {
     let mut code = format!(
         r#"
@@ -74,7 +77,8 @@ fn source(
 @group(0) @binding(1) var<storage,read> mapping:array<vec4<u32>>;
 @group(0) @binding(2) var<storage,read_write> descriptors:array<u32>;
 @compute @workgroup_size(64) fn main(@builtin(global_invocation_id) gid:vec3<u32>) {{
-    let i=gid.x+gid.y*{width}u; if(i>={count}u) {{return;}}
+    let count=arrayLength(&mapping);
+    let i=gid.x+gid.y*min((count+63u)/64u,{row_groups}u)*64u; if(i>=count) {{return;}}
     let object=objects[mapping[i].x];
     var rows=object.model;
     let a=rows[0].xyz; let b=rows[1].xyz; let c=rows[2].xyz;
@@ -120,7 +124,7 @@ impl Placement {
         instances: &[(u32, bool, bool, bool, wgpu::Blas)],
         retained: &std::sync::OnceLock<wgpu::ComputePipeline>,
     ) -> Result<Self> {
-        Self::with_points(r,objects,instances,retained,&vec![None;instances.len()])
+        Self::with_points(r,objects,instances,retained,&vec![None;instances.len()],&vec![(false,false);instances.len()])
     }
     pub(crate) fn with_points(
         r: &Renderer,
@@ -128,14 +132,16 @@ impl Placement {
         instances: &[(u32,bool,bool,bool,wgpu::Blas)],
         retained: &std::sync::OnceLock<wgpu::ComputePipeline>,
         point_poses: &[Option<(wgpu::Buffer,u32)>],
+        triangle_sides: &[(bool,bool)],
     ) -> Result<Self> {
+        ensure!(triangle_sides.len()==instances.len(),"triangle sidedness mapping length differs from TLAS");
         ensure!(point_poses.len()==instances.len(),"point placement mapping length differs from TLAS");
         let mut bytes = Vec::new();
         let mut mapping = Vec::new();
         let mut references = Vec::new();
         let mut abi = None;
         let mut templates = std::collections::HashMap::new();
-        for (object, opaque, hardware_visible, shadow_solid, blas) in instances {
+        for ((object, opaque, hardware_visible, shadow_solid, blas), &(double_sided, solid_exit)) in instances.iter().zip(triangle_sides) {
             let (layout, template) = match templates.entry(blas.clone()) {
                 std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
                 std::collections::hash_map::Entry::Vacant(entry) => {
@@ -152,7 +158,15 @@ impl Placement {
                 abi = Some(*layout);
             }
             let custom_index = bytes.len() + layout.custom_index as usize * 4;
+            let flags = bytes.len() + layout.triangle_flags as usize * 4;
             bytes.extend_from_slice(template);
+            let mut options = u32::from_ne_bytes(bytes[flags..flags+4].try_into().unwrap());
+            options &= !(layout.disable_triangle_culling | layout.force_non_opaque);
+            if double_sided || solid_exit { options |= layout.disable_triangle_culling; }
+            // Path transport accepts solid exits; diffuse/reflection queries must
+            // still reject a single-sided rear surface through their candidate rule.
+            if solid_exit && !double_sided { options |= layout.force_non_opaque; }
+            bytes[flags..flags+4].copy_from_slice(&options.to_ne_bytes());
             // The backend owns this field's location. Its template has mask zero;
             // the installed object index is already admitted to the portable 24 bits.
             bytes[custom_index..custom_index + 4].copy_from_slice(&object.to_ne_bytes());
@@ -182,8 +196,7 @@ impl Placement {
                 layout.transform,
                 layout.mask,
                 layout.mask_shift,
-                instances.len() as u32,
-                width * 64,
+                r.device.limits().max_compute_workgroups_per_dimension,
             ),
             "native TLAS placement",
             &[Some(true), Some(true), Some(false)],
@@ -291,10 +304,9 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn native_descriptor_packing_preserves_references_and_masks_tails() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let r = crate::test_renderer()?;
         let mut visible = Object::new(Mat4::from_scale_rotation_translation(
             Vec3::new(-2., 3., 0.5),
             glam::Quat::from_rotation_y(0.7),
@@ -331,7 +343,7 @@ mod tests {
             );
             let pipeline = crate::compute::pipeline_layout(
                 &r,
-                &source(stride, transform, mask, shift, 4, 64),
+                &source(stride, transform, mask, shift, r.device.limits().max_compute_workgroups_per_dimension),
                 "test native packing",
                 &[Some(true), Some(true), Some(false)],
                 "main",

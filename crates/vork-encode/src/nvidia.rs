@@ -15,6 +15,22 @@ use std::{
 };
 use wgpu::hal::{api::Vulkan, vulkan};
 
+const VENDOR_ID: u32 = 0x10de;
+
+/// Whether the rendering device is NVIDIA's: NVENC, native or through FFmpeg, follows that adapter.
+pub(super) fn is_adapter(device: &wgpu::Device) -> bool {
+    // SAFETY: the HAL guard retains the instance and physical device.
+    unsafe { device.as_hal::<Vulkan>() }.is_some_and(|hal| {
+        unsafe {
+            hal.shared_instance()
+                .raw_instance()
+                .get_physical_device_properties(hal.raw_physical_device())
+        }
+        .vendor_id
+            == VENDOR_ID
+    })
+}
+
 unsafe extern "C" {
     fn vork_nv_prepare(error: *mut i32) -> *mut c_void;
     fn vork_nv_open(
@@ -29,6 +45,7 @@ unsafe extern "C" {
         fps_den: u32,
         bitrate: u32,
         gop_frames: u32,
+        primaries: u32,
         capacity: u32,
         error: *mut i32,
     ) -> *mut c_void;
@@ -132,6 +149,8 @@ impl Session {
         fps: Time,
         bitrate: u32,
         gop_frames: u32,
+        // The H.273 code of the frames' primaries, written to the stream's VUI.
+        primaries: u32,
         path: &Path,
         ring_depth: usize,
     ) -> Result<Self> {
@@ -147,7 +166,7 @@ impl Session {
         let physical = hal.raw_physical_device();
         let properties = unsafe { instance.get_physical_device_properties(physical) };
         ensure!(
-            properties.vendor_id == 0x10de,
+            properties.vendor_id == VENDOR_ID,
             "NVENC requires an NVIDIA Vulkan device"
         );
         let mut ids = vk::PhysicalDeviceIDProperties::default();
@@ -158,10 +177,9 @@ impl Session {
         let capacity = u32::try_from(ring_depth)?;
         ensure!(capacity > 0, "NVENC ring capacity must be positive");
         let bytes = u64::from(pitch) * u64::from(height) * u64::from(capacity);
-        ensure!(
-            bytes <= gpu.device.limits().max_buffer_size,
-            "NVENC ring exceeds device buffer limit"
-        );
+        validate_ring_limit(
+            bytes, gpu.device.limits().max_buffer_size, width, height, capacity,
+        )?;
         let mut external = vk::ExternalMemoryBufferCreateInfo::default()
             .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
         let info = vk::BufferCreateInfo::default()
@@ -231,6 +249,7 @@ impl Session {
                 fps.denominator() as u32,
                 bitrate,
                 gop_frames,
+                primaries,
                 capacity,
                 &mut error,
             )
@@ -279,29 +298,7 @@ impl Session {
         } else {
             None
         };
-        let mut child = Command::new("ffmpeg")
-            .args([
-                "-v",
-                "error",
-                "-nostdin",
-                "-y",
-                "-r",
-                &fps.to_string(),
-                "-f",
-                "h264",
-                "-i",
-                "pipe:0",
-                "-an",
-                "-c:v",
-                "copy",
-                "-video_track_timescale",
-                &fps.numerator().to_string(),
-                "-map_metadata",
-                "-1",
-                "-f",
-                "mp4",
-            ])
-            .arg(path)
+        let mut child = crate::ffmpeg::mux_command(fps, path)?
             .stdin(Stdio::piped())
             .spawn()
             .context("start ffmpeg H.264 MP4 muxer: Linux MP4 requires ffmpeg on PATH even with NVENC; install with sudo apt install ffmpeg")?;
@@ -554,4 +551,50 @@ fn drain_bitstreams(
         }
     }
     Ok(mux_write_ms)
+}
+
+// Keep the allocation predicate in one CPU-testable check; limits come from the device.
+fn validate_ring_limit(
+    bytes: u64,
+    max_buffer_size: u64,
+    width: u32,
+    height: u32,
+    capacity: u32,
+) -> Result<()> {
+    ensure!(
+        bytes <= max_buffer_size,
+        gpu_memory::device_limit(
+            "NVENC ring",
+            format_args!("{bytes} bytes at {width}x{height} across {capacity} frames"),
+            format_args!("max_buffer_size={max_buffer_size} bytes"),
+            "reduce the output resolution or use a GPU with a larger buffer limit",
+        )
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod limit_tests {
+    use super::*;
+
+    #[test]
+    fn nvenc_ring_refusal_reports_demand_limit_and_recovery() {
+        for (bytes, limit, width, height, capacity) in [(1024, 1023, 8, 2, 2), (4096, 2048, 16, 4, 4)] {
+            let error = validate_ring_limit(bytes, limit, width, height, capacity).unwrap_err();
+            assert!(error.is::<DeviceLimit>());
+            let message = error.to_string();
+            for expected in [
+                format!("{bytes} bytes"),
+                format!("{width}x{height}"),
+                format!("{capacity} frames"),
+                format!("max_buffer_size={limit} bytes"),
+                "reduce the output resolution".into(),
+                "vork help limits".into(),
+            ] {
+                assert!(message.contains(&expected), "{message}");
+            }
+            validate_ring_limit(bytes, bytes, width, height, capacity).unwrap();
+            validate_ring_limit(bytes, bytes + 1, width, height, capacity).unwrap();
+        }
+    }
 }

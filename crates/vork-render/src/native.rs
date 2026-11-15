@@ -1,6 +1,7 @@
 //! Native backend code paths (DESIGN §5: native calls live in one module).
 //! Slang compiles every renderer entry point at build time to SPIR-V for
-//! Vulkan and MSL for Metal; wgpu receives native backend code
+//! Vulkan and MSL for Metal. A build embeds the form its platform runs: MSL on
+//! Apple, SPIR-V everywhere else (tests embed both). wgpu receives native backend code
 //! through its passthrough path, so naga neither translates nor validates
 //! them. `tests` checks Slang's reflection against the pipeline layout tables
 //! instead, including the Metal resource indices wgpu-hal assigns.
@@ -12,6 +13,8 @@ pub(crate) struct Compiled {
     pub entry: &'static str,
     spirv: &'static [u8],
     msl: &'static str,
+    /// Exact shipped-entry identities, computed with the immutable code at build time.
+    input_keys: [[u8; 32]; 2],
     /// Compute threadgroup size (Metal reads it from the module descriptor); zero otherwise.
     pub(crate) threads: (u32, u32, u32),
     #[cfg(test)]
@@ -22,9 +25,17 @@ pub(crate) struct Compiled {
     msl_reflection: &'static str,
 }
 
+impl Compiled {
+    pub(crate) fn input_key(&self,metal:bool)->blake3::Hash {
+        self.input_keys[usize::from(metal)].into()
+    }
+}
+
 /// The shader module for `shader` on this device's backend.
 pub(crate) fn shader_module(device: &wgpu::Device, shader: &Compiled) -> wgpu::ShaderModule {
-    module(device, shader.name, Some(shader.spirv), Some(shader.msl), shader.threads)
+    // An Apple build embeds no SPIR-V; hand wgpu only code that exists. Metal
+    // source is always passed: its capture refuses an empty module by name.
+    module(device, shader.name, Some(shader.spirv).filter(|code| !code.is_empty()), Some(shader.msl), shader.threads)
 }
 
 /// Built-in surface capabilities are late constants, independent of the
@@ -104,6 +115,7 @@ pub(crate) fn module(
     // SAFETY: the code is the pinned Slang compiler's output for this entry
     // point; the layout tests check its bindings against the pipeline layouts.
     let start=std::time::Instant::now();
+    let _event=vork_slang::progress::announce("shader module",label);
     let module=unsafe {
         device.create_shader_module_passthrough(wgpu::ShaderModuleDescriptorPassthrough {
             label: Some(label),
@@ -134,12 +146,103 @@ pub(crate) mod tests {
     use wgpu::{BindGroupLayoutEntry, BindingType, ShaderStages};
 
     #[test]
+    fn shipped_reflections_retain_compiler_boundaries_with_driver_inlining() {
+        let code = REFLECTIONS_HITS_COMPUTE.spirv;
+        let mut normalized = code.to_vec();
+        vork_slang::spirv::allow_driver_inlining(&mut normalized).unwrap();
+        assert_eq!(code, normalized, "shipped reflection boundaries must permit driver inlining");
+        let words: Vec<u32> = code.chunks_exact(4)
+            .map(|w| u32::from_le_bytes(w.try_into().unwrap())).collect();
+        let mut at = 5;
+        let mut calls = 0;
+        while at < words.len() {
+            if words[at] & 0xffff == 57 { calls += 1; } // OpFunctionCall
+            at += (words[at] >> 16) as usize;
+        }
+        assert!(calls > 0, "reflection lighting must remain shared through Slang optimization");
+    }
+
+    #[test]
+    fn shipped_input_keys_match_embedded_code() {
+        for shader in ALL {
+            for metal in [false, true] {
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"shipped-entry-v1");
+                hash.update(&[u8::from(metal)]);
+                let code = if metal { shader.msl.as_bytes() } else { shader.spirv };
+                for part in [code, shader.entry.as_bytes()] {
+                    hash.update(&(part.len() as u64).to_le_bytes());
+                    hash.update(part);
+                }
+                let threads = if metal { shader.threads } else { (0, 0, 0) };
+                for size in [threads.0, threads.1, threads.2] {
+                    hash.update(&size.to_le_bytes());
+                }
+                assert_eq!(shader.input_key(metal), hash.finalize(), "{}, metal={metal}", shader.name);
+            }
+        }
+    }
+
+    #[test]
+    fn absent_anisotropy_prunes_base_and_coat_inputs() -> anyhow::Result<()> {
+        use crate::forward_variant::*;
+        let body = r#"
+import closure;
+import bsdf;
+[[vk::binding(0,7)]] StructuredBuffer<float> base_anisotropy;
+[[vk::binding(1,7)]] RWStructuredBuffer<float3> result;
+[[vk::binding(2,7)]] StructuredBuffer<Closure> closures;
+[[vk::binding(3,7)]] StructuredBuffer<float> coat_anisotropy;
+[shader("compute")][numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID) {
+    Surface s={};s.closure=closures[id.x];
+    s.closure.specular_roughness_anisotropy=base_anisotropy[id.x];
+    s.closure.coat_roughness_anisotropy=coat_anisotropy[id.x];
+    let c=surface_response<Key>(s).closure;
+    result[id.x]=float3(c.specular_roughness_anisotropy,c.coat_roughness_anisotropy,
+        coat_directional_albedo<Key>(c,float3(0.,0.,1.)));
+}
+"#;
+        let owned = crate::programs::abi().native_modules();
+        for prune_dielectric in [false, true] {
+        for (flags, base, coat) in [(0,false,false), (FEATURE_ANISOTROPY,true,false),
+            (FEATURE_ANISOTROPY|FEATURE_COAT_ANISOTROPY,true,true)] {
+            let source = variant_module(FEATURE_SPECIALIZED | FEATURE_COAT | flags,
+                false, false, false, None, body);
+            let mut modules = SOURCES.to_vec();
+            modules.extend(owned.iter().map(|(name, source)| (name.as_str(), source.as_str())));
+            modules.push(("anisotropy_pruning", &source));
+            let mut args = vec!["-target", "spirv", "-zero-initialize"];
+            if prune_dielectric {args.extend_from_slice(&["-DVORK_UNIT_IOR", "-DVORK_UNIT_BOUNDARY_IOR", "-DVORK_NO_GLTF_TINT"]);}
+            args.extend_from_slice(SLANG_FLAGS);
+            args.extend_from_slice(SPIRV_TARGET.2);
+            let code = vork_slang::Compiler::discover().compile_modules(
+                &modules, "anisotropy_pruning", &[("main", "compute")], &args)?;
+            let decorations=spirv_decorations(&code);
+            for (binding, enabled) in [(0,base),(3,coat)] {
+                assert_eq!(decorations.iter().any(|&(id,d,v)| d==33 && v==binding
+                    && decorations.contains(&(id,34,7))),
+                    enabled,"anisotropy binding {binding}, flags {flags:x}");
+            }
+            let words:Vec<u32>=code.chunks_exact(4).map(|w|u32::from_le_bytes(w.try_into().unwrap())).collect();
+            let mut at=5;let mut quadrature=false;
+            while at<words.len() {
+                quadrature |= words[at]&0xffff==246; // OpLoopMerge
+                at+=(words[at]>>16) as usize;
+            }
+            assert_eq!(quadrature,coat,"coat quadrature, flags {flags:x}");
+        }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn installed_metal_capture_rejects_empty_implicit_modules() -> anyhow::Result<()> {
         const CHILD: &str = "VORK_TEST_EMPTY_IMPLICIT_MSL";
         if std::env::var_os(CHILD).is_some() {
             let (device, _) = wgpu::Device::noop(&Default::default());
             let shader = Compiled {
                 name: "empty implicit witness", entry: "main", spirv: &[], msl: "",
+                input_keys: [[0; 32]; 2],
                 threads: (1, 1, 1), stage: "compute",
                 spirv_reflection: "", msl_reflection: "",
             };
@@ -184,6 +287,19 @@ pub(crate) mod tests {
             assert_ne!(minimal,complete,"{} has no late capabilities",shader.name);
         }
         Ok(())
+    }
+
+    #[test]
+    fn path_engine_families_are_complete_and_keep_the_path_dispatch_size() {
+        use crate::surface_native::PathEngine;
+        assert_eq!(PATH_ENGINES.len(),PathEngine::ALL.len());
+        for engine in PathEngine::ALL {
+            let (_,shader)=PATH_ENGINES.iter().find(|(family,_)|*family==engine).expect("a prebuilt module per family");
+            assert_eq!(shader.entry,PathEngine::ENTRY);
+            // REG_COMPUTE_TILE, the side passes::path dispatches by.
+            assert_eq!(shader.threads,(8,8,1),"{}",shader.name);
+            assert!(engine.boundaries<=PathEngine::BOUNDARIES);
+        }
     }
 
     #[test]
@@ -519,9 +635,7 @@ pub(crate) mod tests {
                 *counter.0 += 1;
             }
         }
-        assert!(buffers <= 31, "{buffers} Metal buffer slots");
-        assert!(textures <= 128, "{textures} Metal texture slots");
-        assert!(samplers <= 16, "{samplers} Metal sampler slots");
+        crate::pipelines::check_stage_limits("native shader ABI",groups,stage).unwrap();
         slots
     }
 
@@ -583,6 +697,11 @@ pub(crate) mod tests {
                 (shader.entry, shader.spirv_reflection, shader.msl_reflection);
             let name = shader.name;
             let stage = stage(name, shader.stage);
+            // Metal validates the complete layout, including stages unused by
+            // this entry. Run this on CPU/Linux even when MSL was not built.
+            for visible in [ShaderStages::VERTEX,ShaderStages::FRAGMENT,ShaderStages::COMPUTE] {
+                crate::pipelines::check_stage_limits(name, groups, visible).unwrap();
+            }
             // wgpu-hal Vulkan renumbers each group's entries 0..n in binding order
             // and remaps only naga shaders; passthrough SPIR-V keeps our numbers.
             for (group, entries) in groups.iter().enumerate() {
@@ -803,7 +922,7 @@ pub(crate) mod tests {
         let object = fields!(crate::GpuObject: model, previous_model, next_model, opacity, material_index, reserved, metadata, padding);
         let light = fields!(crate::lights::Light: shadow_offsets, position,
             direction, radiance, params, emitter_u, emitter_v, emission, projection);
-        let reflection: Value = serde_json::from_str(PATH_PATH_FIXED.spirv_reflection).unwrap();
+        let reflection: Value = serde_json::from_str(PATH_ENGINES[0].1.spirv_reflection).unwrap();
         macro_rules! camera_fields {($($field:ident:$rust:ty=>$slang:ident),*) => {fields!(crate::passes::decoupled::CameraConfig: $($field),*)};}
         let camera=crate::camera_native::camera_config_fields!(camera_fields);
         let camera_reflection:Value=serde_json::from_str(CAMERAS[0].3.spirv_reflection).unwrap();
@@ -881,12 +1000,12 @@ pub(crate) mod tests {
         let emitter_weights = crate::emitter_weights::entries();
         let emitter_groups: &[&[BindGroupLayoutEntry]] = &[&emitter_weights, &[], &[], &hits];
         for shader in [&EMITTER_WEIGHTS_AREAS, &EMITTER_WEIGHTS_REDUCE] {checked.push((shader, emitter_groups));}
-        checked.push((&PATH_PATH_MAIN, path_groups));
         let fixed_path = crate::passes::path::layout_entries(false);
         let fixed_path_groups: &[&[BindGroupLayoutEntry]] = &[&fixed_path, &tables[1], &[], &hits];
-        checked.push((&PATH_PATH_FIXED, fixed_path_groups));
+        // Every prebuilt path engine family binds the layout its scenes install.
+        for (engine, shader) in PATH_ENGINES {checked.push((*shader, if engine.adaptive {path_groups} else {fixed_path_groups}));}
         let camera_cull = crate::passes::camera_cull::entries();
-        for shader in [&RECONSTRUCT_PREPARE, &RECONSTRUCT_FILTER, &RECONSTRUCT_FINISH] {checked.push((shader,reconstruction_groups));}
+        for shader in [&RECONSTRUCT_FINISH] {checked.push((shader,reconstruction_groups));}
         let camera_cull_groups: &[&[BindGroupLayoutEntry]] = &[&camera_cull];
         for shader in [&CAMERA_CULL_CLASSIFY,&CAMERA_CULL_OFFSETS,&CAMERA_CULL_COMPACT] {checked.push((shader,camera_cull_groups));}
         checked.push((&RENDER_IMAGES_PUBLISH, images));

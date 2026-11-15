@@ -47,7 +47,7 @@ impl LightPlan {
             (dynamic || mask & consumers != 0).then_some(id)
         }).collect();
         ensure!(nodes.len() <= limits.max_storage_buffer_binding_size as usize / std::mem::size_of::<Light>(),
-            "{}", crate::gpu_memory::limit_message("light buffer", format_args!("{} bytes",nodes.len()*std::mem::size_of::<Light>()), format_args!("max_storage_buffer_binding_size={} bytes",limits.max_storage_buffer_binding_size), "reduce light count"));
+            crate::gpu_memory::device_limit("light buffer", format_args!("{} bytes",nodes.len()*std::mem::size_of::<Light>()), format_args!("max_storage_buffer_binding_size={} bytes",limits.max_storage_buffer_binding_size), "reduce light count"));
         Ok(Self { nodes, blackbody: None })
     }
     pub fn evaluate(
@@ -362,8 +362,9 @@ mod tests {
     // Scaling a batch of individually faint lights must scale scene-linear
     // illumination even when every receiver lies outside the old cutoff.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn faint_lights_preserve_energy_under_display_gain() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut input:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/analytic.json"))?;
         input["animation"]=serde_json::json!([]);

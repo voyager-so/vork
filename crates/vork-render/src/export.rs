@@ -235,19 +235,23 @@ impl Writer {
             .with_context(|| format!("read export image {}", path.display()))?;
         self.input_hash.update(name.as_bytes());
         self.input_hash.update(&bytes);
-        let image_data = image::load_from_memory(&bytes)?;
+        // Precision is the file's own; colour conversion works in float and is judged by its range instead.
+        let (image_data, stored) = crate::texture_source::decode_color_stored(&path,&bytes,u32::MAX,image.color_space,crate::texture_source::upload(srgb))
+            .map_err(|error| crate::texture_source::for_image(error, name))?;
         ensure!(
-            image_data.color().bits_per_pixel() / u16::from(image_data.color().channel_count())
+            stored.bits_per_pixel() / u16::from(stored.channel_count())
                 <= 8,
             "image {name}: higher precision textures are not admitted; explicitly prepare an 8-bit PNG"
         );
         // Reject HDR rather than silently clamp it to a PNG.
         ensure!(
-            !matches!(
-                image_data,
-                image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_)
-            ),
+            !matches!(stored, image::ColorType::Rgb32F | image::ColorType::Rgba32F),
             "image {name}: HDR texture requires factor extraction; supply a bounded PNG and an emission factor"
+        );
+        ensure!(
+            !matches!(image_data, image::DynamicImage::ImageRgb32F(_) | image::DynamicImage::ImageRgba32F(_))
+                || image_data.to_rgb32f().pixels().all(|pixel| pixel.0.iter().all(|value| (-0.5 / 255. ..=1. + 0.5 / 255.).contains(value))),
+            "image {name}: its colours fall outside the exported 8-bit range after colour conversion; convert it to sRGB before exporting"
         );
         let mut encoded = std::io::Cursor::new(Vec::new());
         image::DynamicImage::ImageRgb8(image_data.to_rgb8())
@@ -293,9 +297,11 @@ impl Writer {
             );
             let bytes = std::fs::read(base.join(file))?;
             self.input_hash.update(&bytes);
-            let image = image::load_from_memory(&bytes)?;
+            // Precision is the file's own; colour conversion works in float.
+            let (image, stored) = crate::texture_source::decode_color_stored(&base.join(file),&bytes,u32::MAX,definition.color_space,crate::texture_source::upload(false))
+                .map_err(|error| crate::texture_source::for_image(error, &binding.image))?;
             ensure!(
-                image.color().bits_per_pixel() / u16::from(image.color().channel_count()) <= 8,
+                stored.bits_per_pixel() / u16::from(stored.channel_count()) <= 8,
                 "image {}: prepare an 8-bit Non-Color PNG before packing",
                 binding.image
             );
@@ -538,7 +544,8 @@ impl Export {
                 );
             }
         }
-        result
+        // Export reads and converts the document on the CPU: no device is opened.
+        result.map_err(failure::scene)
     }
     fn run_inner(&self) -> Result<Value> {
         let extension = self.out.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -547,7 +554,7 @@ impl Export {
             "export --out requires .glb or .gltf"
         );
         let bytes = std::fs::read(&self.scene)?;
-        let mut document: Value = serde_json::from_slice(v2::diagnostics::without_bom(&bytes))?;
+        let mut document = v2::diagnostics::read_document(&bytes)?;
         vork_std::expand_scene(&mut document, self.scene.parent().unwrap_or(Path::new(".")))?;
         let mut scene = Scene::from_json_for_export(
             &serde_json::to_vec(&document)?,
@@ -615,10 +622,10 @@ impl Export {
                 false,
             );
         }
-        if self.root.is_none() && !scene.render.compositor.is_empty() {
+        if self.root.is_none() && !scene.compositor().is_empty() {
             w.issue(
                 "compositor",
-                "render.compositor",
+                "composition.compositor",
                 "image compositing",
                 "omitted",
                 "export without the compositor or acknowledge compositor",
@@ -723,6 +730,7 @@ impl Export {
                 animation::Sample::Numeric(v) if v.len() == 1 => Input::Number(v[0]),
                 animation::Sample::Numeric(v) => Input::Vector(v.clone()),
                 animation::Sample::Bool(v) => Input::Bool(*v),
+                animation::Sample::Style(_) => unreachable!("CSS/SVG channels do not bind material inputs"),
                 animation::Sample::String(_) => bail!("export does not admit animated enum inputs"),
             };
             scene
@@ -750,7 +758,7 @@ impl Export {
                 &nodes[i].node,
                 nodes[i].parent.map_or(Mat4::IDENTITY, |p| worlds[p]),
             )?;
-            worlds[i] = targets.aim(i, world, &worlds, &nodes[i].node)?;
+            worlds[i] = targets.aim(i, world, &worlds, &nodes[i].node, |_| false)?;
         }
         let mut selected: Vec<_> = (0..nodes.len())
             .filter(|&i| {
@@ -825,6 +833,10 @@ impl Export {
             } else {
                 n.name.clone()
             };
+            if payload.contains(&i) && n.audio.is_some() {
+                w.issue("audio", &address, "node sound", "omitted; glTF sound export is not built yet",
+                    "export a picture-only subtree or acknowledge audio", false);
+            }
             let parent = nodes[i].parent.and_then(|p| map.get(&p).copied());
             let local = if parent.is_some() {
                 worlds[nodes[i].parent.unwrap()].inverse() * worlds[i]
@@ -872,6 +884,14 @@ impl Export {
             };
             match kind {
                 NodeKind::Node {} => {}
+                // A 2D canvas's text has no glTF counterpart.
+                NodeKind::Text { .. } => {
+                    w.issue("canvas_text", &address, "2D text", "omitted; glTF has no 2D text", "export a 3D scene", false);
+                }
+                // A 2D canvas's path has no glTF counterpart.
+                NodeKind::Path { .. } => {
+                    w.issue("canvas_path", &address, "2D path", "omitted; glTF has no 2D path", "export a 3D scene", false);
+                }
                 NodeKind::Mesh {
                     geometry,
                     materials,
@@ -1476,7 +1496,7 @@ impl Export {
                         &current[i].node,
                         current[i].parent.map_or(Mat4::IDENTITY, |p| world[p]),
                     )?;
-                    world[i] = targets.aim(i, m, &world, &current[i].node)?;
+                    world[i] = targets.aim(i, m, &world, &current[i].node, |_| false)?;
                 }
                 let t = clip_time;
                 ensure!(

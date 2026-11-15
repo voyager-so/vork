@@ -28,7 +28,7 @@ float2 shadow_sheet_sample(RayDesc ray,float distance,uint object,uint primitive
 // Committed closest-boundary walks already own their hit; only unordered
 // candidate walks need half-open triangle edge ownership.
 // Path NEE deliberately continues to use connection_candidate_transmittance.
-public float3 shadow_candidate_transmittance<P:IProgram,G:IHitGeometry,let Initial:bool=false,let CandidateWalk:bool=true>(G g,RaytracingAccelerationStructure scene,StructuredBuffer<uint> words,RayIntersection hit,float3x4 inverse,RayDesc ray,float distance,float2 pixel,uint sample_index) {
+public float3 shadow_candidate_transmittance<P:IProgram,G:IHitGeometry,let Initial:bool=false,let CandidateWalk:bool=true,V:IVariant=Unspecialized>(G g,RaytracingAccelerationStructure scene,StructuredBuffer<uint> words,RayIntersection hit,float3x4 inverse,RayDesc ray,float distance,float2 pixel,uint sample_index) {
     let beyond=distance>ray.TMax;
     if (CandidateWalk && !Initial && !beyond && !connection_owns_hit<G>(g,hit,inverse,ray.Direction)) {return float3(1.);}
     let opacity=candidate_coverage<P,G>(g,words,hit,inverse,ray.Direction,pixel);
@@ -43,12 +43,12 @@ public float3 shadow_candidate_transmittance<P:IProgram,G:IHitGeometry,let Initi
     if (h.s.is_hair) {return beyond ? float3(1.) : float3(1.-opacity);}
     if (c.geometry_thin_walled) {
         if (beyond) {return float3(1.);}
-        return (1.-opacity)+opacity*transport_shadow_transmittance(c,-ray.Direction,h.s.geometric,h.face,shadow_sheet_sample(ray,distance,hit.instance_custom_data,hit.primitive_index,sample_index))*h.s.weight;
+        return (1.-opacity)+opacity*transport_shadow_transmittance<V>(c,-ray.Direction,h.s.geometric,h.face,shadow_sheet_sample(ray,distance,hit.instance_custom_data,hit.primitive_index,sample_index))*h.s.weight;
     }
     if (c.transmission_weight<=0.) {return beyond ? float3(1.) : float3(1.-opacity);}
     // Both sides use the exterior angle: this reciprocal approximation does
     // not apply total internal reflection to an intentionally unbent ray.
-    var transmission=beyond ? float3(1.) : transport_shadow_transmittance(c,-ray.Direction,h.s.geometric,h.face,shadow_sheet_sample(ray,distance,hit.instance_custom_data,hit.primitive_index,sample_index))*h.s.weight;
+    var transmission=beyond ? float3(1.) : transport_shadow_transmittance<V>(c,-ray.Direction,h.s.geometric,h.face,shadow_sheet_sample(ray,distance,hit.instance_custom_data,hit.primitive_index,sample_index))*h.s.weight;
     if (c.transmission_depth>0. && any(c.transmission_color<float3(1.))) {
         // A receiver initially inside this solid has one owner independent of
         // endpoint rounding: the nearest outward boundary found by occupancy.
@@ -88,7 +88,7 @@ import implicit_scene;
 #ifdef VORK_FIELD_OUTLINE
 [noinline]
 #endif
-public float3 field_shadow_transmittance<P:IProgram,G:IHitGeometry>(G g,StructuredBuffer<uint> words,RayDesc ray,uint groups,bool all_casters,uint sample_index) {
+public float3 field_shadow_transmittance<P:IProgram,G:IHitGeometry,V:IVariant=Unspecialized>(G g,StructuredBuffer<uint> words,RayDesc ray,uint groups,bool all_casters,uint sample_index) {
     let fields=ray_fields(words);var result=float3(1.);
     for(uint i=0u;i<fields.y;i++) {
         let at=fields.x+i*3u;let object=g.word(at+1u);let descriptor=g.word(at+2u);
@@ -101,9 +101,9 @@ public float3 field_shadow_transmittance<P:IProgram,G:IHitGeometry>(G g,Structur
             let h=field_surface<Unspecialized,P>(object,root,ray.Direction,float2(0.),Lobe(0u,0.));
             let c=h.s.closure;let opacity=h.s.discarded ? 0. : c.geometry_opacity*objects[object].opacity.x;
             var transmission=float3(0.);
-            if(c.geometry_thin_walled) transmission=transport_shadow_transmittance(c,-ray.Direction,h.s.geometric,h.face,shadow_sheet_sample(ray,root.t,object,descriptor,sample_index))*h.s.weight;
+            if(c.geometry_thin_walled) transmission=transport_shadow_transmittance<V>(c,-ray.Direction,h.s.geometric,h.face,shadow_sheet_sample(ray,root.t,object,descriptor,sample_index))*h.s.weight;
             else if(c.transmission_weight>0.) {
-                transmission=transport_shadow_transmittance(c,-ray.Direction,h.s.geometric,h.face,shadow_sheet_sample(ray,root.t,object,descriptor,sample_index))*h.s.weight;
+                transmission=transport_shadow_transmittance<V>(c,-ray.Direction,h.s.geometric,h.face,shadow_sheet_sample(ray,root.t,object,descriptor,sample_index))*h.s.weight;
                 if(c.transmission_depth>0. && any(c.transmission_color<float3(1.))) {
                     let direction=h.entering ? ray.Direction : -ray.Direction;
                     let start=ray.Origin+ray.Direction*root.t;
@@ -140,7 +140,7 @@ bool shadow_bounds_hold<G:IHitGeometry>(G g,uint solid,uint bounds,float3 origin
 // Discover domains through placement-refitted bounds, then resolve all their
 // nearest boundaries in ONE shared-AS traversal. Distant solids cost no linear
 // discovery scan; overlapping/unbounded domains never repeat the shared walk.
-public float3 shadow_contained_transmittance<P:IProgram,G:IHitGeometry>(G g,RaytracingAccelerationStructure scene,StructuredBuffer<uint> words,RayDesc ray,bool all_casters,uint groups,float2 pixel,uint sample_index) {
+public float3 shadow_contained_transmittance<P:IProgram,G:IHitGeometry,V:IVariant=Unspecialized>(G g,RaytracingAccelerationStructure scene,StructuredBuffer<uint> words,RayDesc ray,bool all_casters,uint groups,float2 pixel,uint sample_index) {
 #ifdef VORK_NO_SHADOW_CONTAINMENT
     return float3(1.);
 #else
@@ -201,7 +201,7 @@ public float3 shadow_contained_transmittance<P:IProgram,G:IHitGeometry>(G g,Rayt
     var result=float3(1.);
     for(uint slot=0u;slot<count;slot++) {
         if(nearest[slot]==REG_FP32_MAX) {continue;}
-        result*=shadow_candidate_transmittance<P,G,true>(g,scene,words,hits[slot],inverses[slot],ray,nearest[slot],pixel,sample_index);
+        result*=shadow_candidate_transmittance<P,G,true,true,V>(g,scene,words,hits[slot],inverses[slot],ray,nearest[slot],pixel,sample_index);
         if(!any(result>float3(0.))) {return float3(0.);}
     }
     return result;

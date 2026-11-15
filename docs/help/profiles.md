@@ -10,16 +10,12 @@ std/path    slowest     interiors, glass, caustics  finite depth/budget, 64 samp
 Preview means std/previs; use the names above with --profile.
 Resolution does not change the per-pixel sample budget.
 
-Design policy: [profiles as execution strategies](../design/profile-strategies.md),
-including the real-time rule for new primitives and preparation before playback.
-A real-time profile is future work.
 std/previs: fast iteration on framing, materials and direct lighting. It omits
 indirect lighting; raster surfaces use central-emitter hard shadows. Broad-light
 highlights can narrow or change brightness; ray-camera effects can remain grainy.
 Judge the finished lighting with final or path.
 In std/previs, scalar std/openpbr geometry_opacity and alpha_cutoff use each
-material's raster coverage, retaining direct lighting and visible emission. Fractional
-coverage is sampled and can look grainy at the preview sample budget. Bindings
+material's raster coverage, retaining direct lighting and visible emission. Sampled coverage can make colour and outline-driving depth, normals and AOVs noisy at low sample counts. Bindings
 or animation of either input, and opacity combined with transmission, retain
 whole-view path transport until qualified. Other effects can also require path
 transport. The sample budget and denoise setting stay unchanged.
@@ -51,7 +47,7 @@ Without a fast GPU denoiser, draft and final announce it and use 16 and 32 unden
 See vork help limits for lighting approximations and scene-size limits.
 <!-- all -->
 PROFILE FILE REFERENCE
-A profile file is {"version":1,"level":1,"settings":{"seed":0,"denoise":false}}.
+Profile files contain version (1), level and settings; fields below.
 Levels: 0 = std/draft, 1 = std/final, 2 = std/path, 3 = std/previs.
 Custom level-2 profiles without settings.samples use 64, independent of denoise.
 Adaptive path sampling stops converged pixels early; AOVs and catchers use the full budget.

@@ -143,8 +143,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn link_word_boundaries_on_gpu() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let mut words = vec![0u32];
         let mut cases = Vec::new();
         for count in [0usize, 1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 130, 65537, 1048577] {

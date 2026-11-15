@@ -227,9 +227,9 @@ mod tests {
                 assert_eq!(settings.approximate_field_boundaries,level!=2);
                 let mut scene=Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera"}]}"#).unwrap();
                 scene.apply_settings(settings.clone(),"renamed").unwrap();
-                let capture:ImageRender=serde_json::from_value(serde_json::json!({"resolution":[16,16]})).unwrap();
-                assert_eq!(capture.resolve(&scene.render).settings.bounded_secondary_compilation,level==0);
-                assert_eq!(capture.resolve(&scene.render).settings.approximate_field_boundaries,level!=2);
+                let capture:Image=serde_json::from_value(serde_json::json!({"render":{"resolution":[16,16]}})).unwrap();
+                assert_eq!(capture.resolved_render(&scene.render).unwrap().settings.bounded_secondary_compilation,level==0);
+                assert_eq!(capture.resolved_render(&scene.render).unwrap().settings.approximate_field_boundaries,level!=2);
                 let mut fallback=settings;
                 fallback.without_fast_denoiser(level,true);
                 assert_eq!(fallback.bounded_secondary_compilation,level==0);
@@ -268,8 +268,8 @@ mod tests {
         assert_eq!(settings.samples, constants::PREVIS_SAMPLES);
         let mut scene=Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera"}]}"#).unwrap();
         scene.apply_settings(settings.clone(), "renamed-previs").unwrap();
-        let capture:ImageRender=serde_json::from_value(serde_json::json!({"resolution":[16,16]})).unwrap();
-        assert_eq!(capture.resolve(&scene.render).settings, settings);
+        let capture:Image=serde_json::from_value(serde_json::json!({"render":{"resolution":[16,16]}})).unwrap();
+        assert_eq!(capture.resolved_render(&scene.render).unwrap().settings, settings);
         let overrides=CallOverrides::resolve([("denoise".into(),serde_json::json!(true))]).unwrap();
         assert!(Profile::load("std/previs").unwrap().resolve(&overrides.settings).unwrap().integrator.denoiser().is_some());
     }
@@ -291,8 +291,8 @@ mod tests {
         assert_eq!(clean.samples,default.samples);
         let mut scene=Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera"}]}"#).unwrap();
         scene.apply_settings(default.clone(), "renamed-final").unwrap();
-        let capture:ImageRender=serde_json::from_value(serde_json::json!({"resolution":[16,16]})).unwrap();
-        assert_eq!(capture.resolve(&scene.render).settings, default);
+        let capture:Image=serde_json::from_value(serde_json::json!({"render":{"resolution":[16,16]}})).unwrap();
+        assert_eq!(capture.resolved_render(&scene.render).unwrap().settings, default);
     }
 
     #[test]

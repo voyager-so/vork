@@ -9,6 +9,7 @@ import probe_visibility_policy;
 import vork_constants;
 import vork_prelude;
 import openpbr_core;
+import dielectric_interface;
 import frame;
 import closure;
 import material_layout;
@@ -16,6 +17,13 @@ import material;
 import stream;
 import bsdf;
 import emitter;
+import light_tree;
+// Shared scene-global slot, declared only by lighting consumers. Geometry-only
+// programs use their own compact buffer ABI and do not read this tree.
+#ifndef VORK_ANALYTIC_TREE_REGISTER
+#define VORK_ANALYTIC_TREE_REGISTER t5
+#endif
+[[vk::binding(10,0)]] StructuredBuffer<LightTreeNode> analytic_light_nodes : register(VORK_ANALYTIC_TREE_REGISTER);
 import vork_sampling;
 import reflection_environment;
 import reflection_bsdf;
@@ -45,15 +53,15 @@ interface IShadows : IProbeVisibility {
 }
 
 // sample_index selects one exposure-wide sample; the sentinel integrates a shared slot's quadrature.
-struct LightSite { MaterialUv m; bool camera_clusters; bool secondary; float3 facet; uint2 pixel; float3 position_error; uint sample_index; float4 shadow_offset; };
+struct LightSite { MaterialUv m; bool camera_clusters; bool secondary; float3 facet; uint2 pixel; float3 position_error; uint sample_index; float4 shadow_offset; bool exact_sources; };
 
 // Analytic-source lighting shared by primary and secondary surfaces. The
 // receiver owns its covered-sample quadrature and visibility; every source
 // direction retains its exact BSDF response through that visibility query.
 struct AnalyticRadiance {
     int selected_source=-1;float source_probability=1.;
-    uint lobes;bool exposed;bool indirect_only;bool capture_endpoint;bool glossy_ambient;bool sampled_sources;
-    __init(uint lobes,bool exposed,bool indirect_only=false,bool capture_endpoint=false,bool glossy_ambient=true,bool sampled_sources=false) {this.selected_source=-1;this.source_probability=1.;this.lobes=lobes;this.exposed=exposed;this.indirect_only=indirect_only;this.capture_endpoint=capture_endpoint;this.glossy_ambient=glossy_ambient;this.sampled_sources=sampled_sources;}
+    uint lobes;bool exposed;bool indirect_only;bool capture_endpoint;bool glossy_ambient;bool exact_sources;
+    __init(uint lobes,bool exposed,bool indirect_only=false,bool capture_endpoint=false,bool glossy_ambient=true,bool exact_sources=false) {this.selected_source=-1;this.source_probability=1.;this.lobes=lobes;this.exposed=exposed;this.indirect_only=indirect_only;this.capture_endpoint=capture_endpoint;this.glossy_ambient=glossy_ambient;this.exact_sources=exact_sources;}
 };
 
 // One connection samples the complete emitter/visible-normal mixture. The
@@ -65,7 +73,7 @@ LightConnection surface_light_sample<V:IVariant>(LightValues record,uint identit
     // fixing visibility alone leaves four-sample direct-light grain on lit surfaces.
     if((frame.integrator.w&REG_INTEGRATOR_PREVIS_CENTER)!=0u) {return emitter_center_li<V>(record,identity,world,index);}
     if(hair || (mask&REG_RAY_SPECULAR)==0u || emitter_delta(record)
-        || (layers.base.specular_weight==0. && layers.base.base_metalness==0. && closure.coat_weight==0.)) {
+        || (layers.base.specular_weight==0. && dielectric_ior(layers.base)==1. && layers.base.thin_film_weight==0. && layers.base.base_metalness==0. && closure.coat_weight==0.)) {
         return emitter_sample_li<V>(record,identity,world,u,index);
     }
     let bsdf=reflection_bsdf(layers.base,closure,layers.scale,layers.throughput,1.,transport_metal_compensation(layers.base,view));
@@ -95,7 +103,12 @@ Response shade_terms_at<V:IVariant, S:IShadows>(Varying v, Surface s, LightSite 
 #endif
 Response analytic_radiance_at<V:IVariant, S:IShadows>(Varying v, Surface s, LightSite site, AnalyticRadiance policy, out float3 scattering, out float3 indirect_scattering,bool interior_transport=false,bool decode_table=true) {
     let exposure=select(policy.exposed,frame.radiance.w,1.);
-    s=transmission_interface<V>(s,site.facet,interior_transport);
+    s=transmission_interface<V>(s,site.facet);
+    // Interior continuation already transports the transmitting share of TIR.
+    // Scale reflected response explicitly; changing specular_weight changes IOR.
+    let exit_direction=refract(-s.view,s.closure.geometry_normal,1./dielectric_ior(s.closure));
+    let reflection_scale=interior_transport && !s.front_facing && !s.closure.geometry_thin_walled
+        && dot(exit_direction,exit_direction)==0. ? 1.-s.closure.transmission_weight : 1.;
     var l=layers<V>(s.closure,s.view);
     let original=s.closure;
     // Finish deterministic material reads before shadow queries. Only the scalar
@@ -115,7 +128,8 @@ Response analytic_radiance_at<V:IVariant, S:IShadows>(Varying v, Surface s, Ligh
     let thin=original.geometry_thin_walled && original.subsurface_weight>0.;
     let c=s.closure;
     let geometric=s.geometric;let view=s.view;
-    let response=specular_response<V>(l.base,view);
+    let specular=specular_response<V>(l.base,view);
+    let diffuse_albedo=diffuse_quadrature(l.base) ? specular.directional_albedo : float3(-1.);
     let facet=site.facet;
     var direct=float3(0.);
     var list_base=0u;
@@ -124,24 +138,50 @@ Response analytic_radiance_at<V:IVariant, S:IShadows>(Varying v, Surface s, Ligh
     // light list outside the camera frustum.
     // Directional-only variants have no spatially culled lights. Their complete
     // batch is already the exact cluster list, without a receiver lookup.
-    let clustered=policy.selected_source<0 && V.light_types>1u && site.camera_clusters && camera_cluster_base(v.world,frame,clusters,list_base);
+    // Source selection is a discrete outer proposal over the existing
+    // emitter/GGX directional MIS. Small sets retain the exact traversal.
+    let source_count=uint(frame_light_count(frame));
+    let tree_nodes=source_count==0u ? 0u : 2u*source_count-1u;
+    let sampled=(frame.integrator.w&REG_INTEGRATOR_PREVIS_CENTER)==0u && !policy.exact_sources && !site.exact_sources && policy.selected_source<0
+        && source_count>REG_ANALYTIC_LIGHT_SAMPLES && analytic_light_nodes[0].links.w==source_count;
+    let clustered=!sampled && policy.selected_source<0 && V.light_types>1u && site.camera_clusters && camera_cluster_base(v.world,frame,clusters,list_base);
     // Cluster lists are counted and sorted by light kind at construction.
     let count=uint(frame_light_count(frame));
-    let visible_count=policy.indirect_only ? 0u : clustered ? cluster_lights[list_base] : count;
+    var covered_normalization=float3(1.);var covered_taps=0u;
+    if(sampled && !policy.indirect_only) {covered_taps=S.integration_count(site.sample_index,covered_normalization);}
+    let visible_count=policy.indirect_only ? 0u : sampled ? covered_taps*REG_ANALYTIC_LIGHT_SAMPLES : clustered ? cluster_lights[list_base] : count;
     var next=0u;
-    if(policy.sampled_sources && visible_count>0u) {
-        let key=uint2(asuint(v.world.x)^asuint(v.world.z),asuint(v.world.y));
-        let index=site.sample_index==0xffffffffu ? uint(frame.temporal.x) : site.sample_index;
-        let u=sample_2d(key,index,max(S.sample_count(),1u),REG_SAMPLING_STREAM_MEDIUM_LIGHT).x;
-        next=min(uint(u*float(visible_count)),visible_count-1u);
-    }
-    let light_weight=policy.selected_source>=0 ? 1./policy.source_probability : policy.sampled_sources ? float(visible_count) : 1.;
+    Sample2DSequence source_sequence;
     for (;;) {
     if (next>=visible_count) { break; }
+    let pick_index=next%REG_ANALYTIC_LIGHT_SAMPLES;
+    var covered_sample=site.sample_index;var covered_world=v.world;var covered_weight=float3(0.);
+    var light_weight=policy.selected_source>=0 ? 1./policy.source_probability : 1.;
     var i=policy.selected_source>=0 ? uint(policy.selected_source) : next;
-    if (clustered) {
-    i=cluster_lights[list_base+REG_CLUSTER_LIST_HEADER+next]; }
-    next=policy.sampled_sources || policy.selected_source>=0 ? visible_count : next+1u;
+    if(sampled) {
+        covered_weight=S.integration_sample(next/REG_ANALYTIC_LIGHT_SAMPLES,covered_sample,covered_world)/covered_normalization;
+        next++;
+        if(all(covered_weight==float3(0.))) {continue;}
+        let source_seed=pixel_hash(asuint(frame.display.x));
+        let source_key=site.pixel^uint2(source_seed,pixel_hash(source_seed));
+        // Each covered tap owns contiguous source picks. Advance before any
+        // per-light rejection so rejected connections keep their RNG identity.
+        if(pick_index==0u) {
+            source_sequence=sample_2d_sequence(source_key,covered_sample*REG_ANALYTIC_LIGHT_SAMPLES,
+                S.sample_count()*REG_ANALYTIC_LIGHT_SAMPLES,REG_SAMPLING_STREAM_ANALYTIC_SOURCE);
+        }
+        var u=sample_2d_next(source_sequence);
+        // Complete the source rotation with the remaining hash bits. A 16-bit
+        // rotation alone cannot reach every leaf in larger balanced trees.
+        let rotation_bits=screen_ray_hash(source_key,0u,REG_SAMPLING_STREAM_ANALYTIC_SOURCE);
+        u.x=frac(u.x+(float(rotation_bits>>16u)+.5)*(1./4294967296.));
+        let pick=light_tree_pick(analytic_light_nodes,tree_nodes,covered_world,u);
+        // Rejected links stay zero; never redraw or condition this probability.
+        i=pick.identity;light_weight=1./(float(REG_ANALYTIC_LIGHT_SAMPLES)*pick.probability);
+    } else {
+        if(clustered) {i=cluster_lights[list_base+REG_CLUSTER_LIST_HEADER+next];}
+        next=policy.selected_source>=0 ? visible_count : next+1u;
+    }
     if (i>=count) { break; }
     let record=specialized_light<V>(lights[i]);
     var contribution_mask=REG_RAY_DIFFUSE|REG_RAY_SPECULAR;
@@ -155,11 +195,16 @@ Response analytic_radiance_at<V:IVariant, S:IShadows>(Varying v, Surface s, Ligh
     if (all(record.radiance.rgb==float3(0.))) { continue; }
     // Integrate response and visibility together, including each covered
     // camera sample's origin and front-to-back transmission weight.
-    float3 normalization;let taps=S.integration_count(site.sample_index,normalization);
+    var normalization=covered_normalization;var taps=1u;
+    if(!sampled) {taps=S.integration_count(site.sample_index,normalization);}
     for(uint tap=0u;tap<taps;tap++) {
-        var source_sample=site.sample_index;var source_world=v.world;
-        let sample_weight=S.integration_sample(tap,source_sample,source_world)/normalization;
+        var source_sample=sampled ? covered_sample : site.sample_index;var source_world=sampled ? covered_world : v.world;
+        var sample_weight=covered_weight;
+        if(!sampled) {sample_weight=S.integration_sample(tap,source_sample,source_world)/normalization;}
         if(all(sample_weight==float3(0.))) {continue;}
+        // Source selection estimates the existing per-covered-sample sum.
+        // Keep its conditional emitter coordinates, including repeated picks:
+        // changing this quadrature would move another sampling dimension.
         let source_u=sample_2d(site.pixel,source_sample,S.sample_count(),REG_SAMPLING_STREAM_SECONDARY_EMITTER);
         let rotation=float2(float(pixel_hash(i)&65535u),float(pixel_hash(i^REG_SAMPLE_HASH_MIX)&65535u))/65536.;
         let u=frac(source_u+rotation);
@@ -175,9 +220,9 @@ Response analytic_radiance_at<V:IVariant, S:IShadows>(Varying v, Surface s, Ligh
             let behind=fibre_neighbours(i,v.world,record.position.xyz,v.object,v.curve_strand);
             response+=select((contribution_mask&REG_RAY_SPECULAR)!=0u,strand_neighbours(s.hair0,s.hair1,s.strand,view,axis,behind),float3(0.));
 #endif
-        } else {response=layered_direct<V>(l,c,direct_brdf(l.base,view,axis,contribution_mask),view,axis,contribution_mask);}
+        } else {response=layered_direct<V>(l,c,direct_brdf(l.base,view,axis,contribution_mask,diffuse_albedo,reflection_scale),view,axis,contribution_mask);}
         var scattered=float3(0.);
-        if (sw>0.) {scattered=direct_brdf(sl.base,view,axis,contribution_mask&REG_RAY_DIFFUSE);}
+        if (sw>0.) {scattered=direct_brdf(sl.base,view,axis,contribution_mask&REG_RAY_DIFFUSE,diffuse_albedo,reflection_scale);}
         if (any(response!=float3(0.)) || any(scattered!=float3(0.))) {
             var shadow_world=source_world+select(s.is_hair || dot(geometric,axis)<=0.,float3(0.),surface_shadow_offset(site.shadow_offset,site.facet,geometric,axis));var shadow_normal=geometric;
             if(s.is_hair) {
@@ -202,7 +247,7 @@ Response analytic_radiance_at<V:IVariant, S:IShadows>(Varying v, Surface s, Ligh
     }
     if (spatial) {scattering*=s.closure.subsurface_color/max(original.subsurface_color,float3(1e-20));}
     scattering*=l.throughput*l.scale;
-    var o=surface_radiance_at<V,S>(v,s,l,response,material_visibility,policy,site.position_error,indirect_scattering,site.sample_index,site.secondary);
+    var o=surface_radiance_at<V,S>(v,s,l,specular,material_visibility,policy,site.position_error,indirect_scattering,site.sample_index,site.secondary,reflection_scale);
     if (spatial) {let ratio=s.closure.subsurface_color/max(original.subsurface_color,float3(1e-20));indirect_scattering*=ratio;o.missing_scattering*=ratio;}
     scattering=scattering*exposure+indirect_scattering;
     o.color+=direct;o.direct=direct;o.radiance.direct=direct;
@@ -212,7 +257,7 @@ Response analytic_radiance_at<V:IVariant, S:IShadows>(Varying v, Surface s, Ligh
 Response surface_terms_at<V:IVariant,S:IShadows>(Varying v, Surface s, Layers l, SpecularResponse specular, MaterialUv m, out float3 scattering) {
     return surface_radiance_at<V,S>(v,s,l,specular,material_occlusion<V>(v,m),AnalyticRadiance(REG_RAY_DIFFUSE|REG_RAY_SPECULAR,true),surface_position_error(v.object,v.world),scattering);
 }
-Response surface_radiance_at<V:IVariant,S:IShadows>(Varying v, Surface s, Layers l, SpecularResponse specular, float material_visibility, AnalyticRadiance policy, float3 position_error, out float3 scattering,uint quadrature_sample=0xffffffffu,bool secondary=false) {
+Response surface_radiance_at<V:IVariant,S:IShadows>(Varying v, Surface s, Layers l, SpecularResponse specular, float material_visibility, AnalyticRadiance policy, float3 position_error, out float3 scattering,uint quadrature_sample=0xffffffffu,bool secondary=false,float reflection_scale=1.) {
     let exposure=select(policy.exposed,frame.radiance.w,1.);
     let c=s.closure;
     let geometric=s.geometric;let n=c.geometry_normal;let view=s.view;
@@ -226,18 +271,19 @@ Response surface_radiance_at<V:IVariant,S:IShadows>(Varying v, Surface s, Layers
     // Dielectrics reflect the world too; metals have no diffuse lobe.
     let nv=max(dot(n,view),.0001);
     let moments=brdf_moments(float2(nv,roughness));
-    var reflected=specular_reflectance(specular,moments,internal_reflection_quadrature<V>(c));
+    var reflected=reflection_scale*specular_reflectance(specular,moments,internal_reflection_quadrature<V>(c));
     // A cosine hemisphere integrates the same diffuse response used by direct
     // and path lighting. Reserve dielectric directional albedo only: the metal
     // mixture (and its compensation) belongs to glossy reflection, not to the
     // remaining dielectric substrate.
-    var diffuse=direct_diffuse(l.base,view)*REG_PI;
+    let diffuse_albedo=diffuse_quadrature(l.base) ? specular.directional_albedo : float3(-1.);
+    var diffuse=direct_diffuse(l.base,view,diffuse_albedo,reflection_scale)*REG_PI;
     let linked=light_receives(frame.environment_links.x,frame.environment_links.y,objects[v.object].metadata.x);
     let world_diffuse=linked && (frame.environment_links.x&policy.lobes&REG_RAY_DIFFUSE)!=0u;
     let glossy_enabled=policy.glossy_ambient && (policy.lobes&REG_RAY_SPECULAR)!=0u && (secondary || frame.projection.z!=REG_REFLECTIONS_OFF);
     let world_specular=linked && (frame.environment_links.x&REG_RAY_SPECULAR)!=0u && glossy_enabled;
     let world_response=select(world_diffuse,diffuse,float3(0.));
-    let back_diffuse=thin_diffuse(l.base,view)*REG_PI;
+    let back_diffuse=thin_diffuse(l.base,view,diffuse_albedo,reflection_scale)*REG_PI;
     let back_response=select(world_diffuse,back_diffuse,float3(0.));
     let world_reflected=select(world_specular && !policy.indirect_only,reflected,float3(0.));
     let indirect_reflected=select(glossy_enabled && !policy.indirect_only,reflected,float3(0.));
@@ -245,7 +291,7 @@ Response surface_radiance_at<V:IVariant,S:IShadows>(Varying v, Surface s, Layers
     // Diffusion consumes irradiance before substrate colour, just as the
     // direct-light scattering closure does; do not divide by possibly black RGB.
     var scattering_closure=l.base;scattering_closure.base_color=float3(1.);scattering_closure.subsurface_weight=0.;
-    let scattering_consumer=direct_diffuse(scattering_closure,view)*REG_PI*l.throughput*l.scale*material_visibility;
+    let scattering_consumer=direct_diffuse(scattering_closure,view,diffuse_albedo,reflection_scale)*REG_PI*l.throughput*l.scale*material_visibility;
     var irradiance=policy.indirect_only ? float3(0.) : frame.radiance.xyz;
     var ambient=(world_response+back_response+world_reflected)*irradiance;
     var back_ambient=back_response*irradiance;
@@ -304,7 +350,7 @@ Response surface_radiance_at<V:IVariant,S:IShadows>(Varying v, Surface s, Layers
         }
     }
 #endif
-    if (reflection_quadrature<V>(c) && glossy_enabled && !policy.indirect_only) {
+    if (reflection_quadrature<V>(c) && glossy_enabled && !policy.indirect_only && receiver_reflection_active(frame,world_specular)) {
         var integrated=float3(0.);
         let samples=reflection_quadrature_samples<V>(l.base);
         for (uint j=0u;j<quadrature_rotations(quadrature_sample);j++) {
@@ -312,7 +358,7 @@ Response surface_radiance_at<V:IVariant,S:IShadows>(Varying v, Surface s, Layers
             for (uint i=0u;i<samples;i++) {
                 float3 direction;
                 let weight=specular_quadrature_sample(l.base,view,specular_quadrature_point(i,rotation,samples),direction,specular.metal_compensation);
-                integrated+=weight*receiver_reflection(v.world,n,view,direction,policy.capture_endpoint ? 1. : 0.,frame,env_specular,env_sampler,policy.capture_endpoint,world_specular);
+                integrated+=reflection_scale*weight*receiver_reflection(v.world,n,view,direction,policy.capture_endpoint ? 1. : 0.,frame,env_specular,env_sampler,policy.capture_endpoint,world_specular);
             }
         }
         let original_world=receiver_reflection(v.world,n,view,reflect(-view,n),policy.capture_endpoint ? 1. : roughness,frame,env_specular,env_sampler,policy.capture_endpoint,world_specular);
@@ -336,6 +382,20 @@ Response surface_radiance_at<V:IVariant,S:IShadows>(Varying v, Surface s, Layers
             }
 #endif
             coat_ambient=select(received,coat_reflected*world,float3(0.));
+            if(V.has_coat_anisotropy && c.coat_roughness_anisotropy>0. && glossy_enabled && !policy.indirect_only) {
+                let coat=transport_coat_closure(c);
+                var integrated=float3(0.);let samples=reflection_quadrature_samples<V>(coat);
+                for(uint j=0u;j<quadrature_rotations(quadrature_sample);j++) {
+                    let rotation=quadrature_rotation(j,quadrature_sample,S.sample_count());
+                    for(uint i=0u;i<samples;i++) {
+                        float3 direction;
+                        let weight=specular_quadrature_sample(coat,view,specular_quadrature_point(i,rotation,samples),direction,float3(0.));
+                        integrated+=weight*receiver_reflection(v.world,cn,view,direction,policy.capture_endpoint ? 1. : 0.,frame,env_specular,env_sampler,policy.capture_endpoint,world_specular);
+                    }
+                }
+                coat_ambient=l.throughput*c.coat_weight*integrated/float(samples*quadrature_rotations(quadrature_sample));
+                coat_reflected=l.throughput*c.coat_weight*coat_directional_albedo<V>(c,view);
+            }
         }
         let fuzz=c.fuzz_weight*c.fuzz_color*l.fuzz_albedo;
         var world_irradiance=frame.radiance.xyz;
@@ -375,7 +435,7 @@ Response surface_radiance_at<V:IVariant,S:IShadows>(Varying v, Surface s, Layers
 #endif
     scattering=select(diffuse_received,scattering_consumer*irradiance*exposure,float3(0.));
     var emissive=policy.indirect_only ? float3(0.) : surface_emission(c,l);
-    Response r;r.reflection=reflection_bsdf(l.base,c,l.scale,l.throughput,material_visibility,specular.metal_compensation);reflection_bsdf_set_environment(r.reflection,reflection_environment*material_visibility*exposure);r.radiance=RadianceTerms(float3(0.),emissive*exposure,(ambient-reflection_environment*material_visibility)*exposure,reflection_environment*material_visibility*exposure);
+    Response r;r.reflection=reflection_bsdf(l.base,c,l.scale*reflection_scale,l.throughput,material_visibility,specular.metal_compensation);reflection_bsdf_set_environment(r.reflection,reflection_environment*material_visibility*exposure);r.radiance=RadianceTerms(float3(0.),emissive*exposure,(ambient-reflection_environment*material_visibility)*exposure,reflection_environment*material_visibility*exposure);
     // Front-hemisphere GI can replace only its own ambient estimate. The
     // sheet's opposite environment/probe response remains represented.
     r.baseline=ReplaceableBaselines(r.radiance.diffuse_indirect-back_ambient*exposure,r.radiance.glossy_indirect);
@@ -396,6 +456,9 @@ Response lit_terms<V:IVariant, S:IShadows, P:IProgram,let decode_table:bool=true
     let lit=surface_response<V>(P.apply_lit(v,s,k,SurfaceLighting(r.color,s.closure.geometry_opacity,r.direct)));
     var o=r;
     if (P.lit_reflects) {
+        // The nonlinear hook has consumed its complete input. Its returned
+        // physical closure can use the ordinary unbiased source estimator.
+        site.exact_sources=false;
         float3 scattering;float3 indirect_scattering;
         o=shade_terms_at<V,S>(v,lit,site,scattering,indirect_scattering,false,decode_table);
     } else {
@@ -427,6 +490,7 @@ float3 diffusion_radius(Closure c) {
 // `d` gathers the lobes' diffusion: light, ambient and albedo weighted by each
 // lobe, the radius averaged over their subsurface weight; a lit result is final.
 Response surface_radiance<V:IVariant,S:IShadows,P:IProgram,let decode_table:bool=true>(Varying v, bool entering, Coordinates k, Surface first, LightSite site, out Diffusion d,bool interior_transport=false) {
+    site.exact_sources=P.lit && P.lit_material(v);
     Response r=(Response)0;d=(Diffusion)0;
     var best=0.;var radius=float3(0.);var total=0.;
     // One lighting call site, including the first lobe. Table materials have a
@@ -471,6 +535,7 @@ Response surface_radiance<V:IVariant,S:IShadows,P:IProgram,let decode_table:bool
 }
 // A ray hit's lit stage sees every lobe before replacing its chosen surface.
 Surface lit_surface<V:IVariant,S:IShadows, P:IProgram>(Varying v, bool entering, Coordinates k, Surface picked, LightSite site) {
+    site.exact_sources=true;
     var first=picked;
     if (P.lobes) {first=surface_at<V,P>(v,entering,picked.view,k,Lobe(0u,0.));}
     first.closure.emission_luminance=0.;
@@ -494,4 +559,4 @@ Surface lit_surface<V:IVariant,S:IShadows, P:IProgram>(Varying v, bool entering,
 }
 // A lighting site: its own footprint, its sample (~0: the exposure sample), whether it lights a
 // secondary (ray) hit, and optional conservative camera clusters for reconstructed camera slots.
-LightSite hit_site(Varying v, Coordinates k, float3 face, uint2 seed, uint sample_index=0xffffffffu, bool secondary=false, bool camera_clusters=false) {return LightSite(material_uv(v,k.uv_dx,k.uv_dy,k.uv1_dx,k.uv1_dy,k.material_filter),camera_clusters,secondary,face,seed,surface_position_error(v.object,v.world),sample_index,k.shadow_offset);}
+LightSite hit_site(Varying v, Coordinates k, float3 face, uint2 seed, uint sample_index=0xffffffffu, bool secondary=false, bool camera_clusters=false) {return LightSite(material_uv(v,k.uv_dx,k.uv_dy,k.uv1_dx,k.uv1_dy,k.material_filter),camera_clusters,secondary,face,seed,surface_position_error(v.object,v.world),sample_index,k.shadow_offset,false);}

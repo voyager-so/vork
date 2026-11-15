@@ -1,0 +1,68 @@
+{
+  "nodes": [
+    {
+      "id": "fx-extrude-text",
+      "type": "richtext",
+      "x": 140,
+      "y": 180,
+      "rotation": 0,
+      "scale": 1,
+      "width": 1000,
+      "height": 220,
+      "htmlContent": "<p style=\"font-family: Inter; font-size: 96px; font-weight: 700; color: #ffd166\">DEPTH</p>",
+      "effects": [
+        {
+          "type": "extrude",
+          "id": "effect-extrude-fixture-1",
+          "depthPx": 16,
+          "angleDeg": 45,
+          "color": "#7a4419"
+        }
+      ]
+    },
+    {
+      "id": "fx-extrude-text-up",
+      "type": "richtext",
+      "x": 140,
+      "y": 460,
+      "rotation": 0,
+      "scale": 1,
+      "width": 1000,
+      "height": 180,
+      "htmlContent": "<p style=\"font-family: Fraunces; font-size: 64px; color: #8ecae6\">extruded</p>",
+      "effects": [
+        {
+          "type": "extrude",
+          "id": "effect-extrude-fixture-2",
+          "depthPx": 10,
+          "angleDeg": 135,
+          "color": "#1b3a4b"
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "effects-structured-extrude",
+      "width": 1280,
+      "height": 800,
+      "nodeIds": ["fx-extrude-text", "fx-extrude-text-up"],
+      "fills": [
+        {
+          "id": "fill-0",
+          "paint": {
+            "type": "solid",
+            "color": "#22262f"
+          }
+        }
+      ]
+    }
+  ],
+  "config": {
+    "renderPageClipping": true
+  },
+  "variables": [],
+  "canvasRootNodeIds": [],
+  "layoutMode": "vertical"
+}

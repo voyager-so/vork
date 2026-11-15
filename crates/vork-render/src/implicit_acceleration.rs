@@ -57,7 +57,7 @@ impl Acceleration {
     if(lane==0u) {blocks[group.x+counts.x*(group.y+counts.y*group.z)]=atomicLoad(&signs);}
 }
 "#);
-        let module=r.device.create_shader_module(wgpu::ShaderModuleDescriptor {label:Some("implicit occupied blocks"),source:wgpu::ShaderSource::Wgsl(code.into())});
+        let module=crate::timing::shader_module(&r.device,wgpu::ShaderModuleDescriptor {label:Some("implicit occupied blocks"),source:wgpu::ShaderSource::Wgsl(code.into())});
         let entries:Vec<_>=(0..=spans.len()).map(|i|pipelines::buffer_entry(i as u32,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:i<spans.len()})).collect();
         let layout=r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:Some("implicit occupied blocks"),entries:&entries});
         let pl=r.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {label:Some("implicit occupied blocks"),bind_group_layouts:&[Some(&layout)],immediate_size:0});
@@ -75,7 +75,7 @@ impl Acceleration {
     }}
 }}
 "#,invalid=vork_slang::registry::IMPLICIT_INVALID);
-        let module=r.device.create_shader_module(wgpu::ShaderModuleDescriptor {label:Some("implicit validation publication"),source:wgpu::ShaderSource::Wgsl(source.into())});
+        let module=crate::timing::shader_module(&r.device,wgpu::ShaderModuleDescriptor {label:Some("implicit validation publication"),source:wgpu::ShaderSource::Wgsl(source.into())});
         let diagnostics_layout=r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:Some("implicit validation publication"),entries:&[
             pipelines::buffer_entry(0,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:true}),
             pipelines::buffer_entry(1,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:false}),

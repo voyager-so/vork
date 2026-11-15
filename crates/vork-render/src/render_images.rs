@@ -48,7 +48,7 @@ mod subtree_tests {
     }
 }
 
-pub(crate) const PUBLICATION_LAYOUT: [wgpu::BindGroupLayoutEntry; 2] = [
+pub(crate) const PUBLICATION_LAYOUT: [wgpu::BindGroupLayoutEntry; 3] = [
     wgpu::BindGroupLayoutEntry {
         binding: 0,
         visibility: wgpu::ShaderStages::COMPUTE,
@@ -69,9 +69,20 @@ pub(crate) const PUBLICATION_LAYOUT: [wgpu::BindGroupLayoutEntry; 2] = [
         },
         count: None,
     },
+    wgpu::BindGroupLayoutEntry {
+        binding: 2,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    },
 ];
 
 pub(crate) struct InstalledImageRender {
+    pub name: String,
     pub camera: usize,
     pub settings: v2::Render,
     pub exposure_samples: u32,
@@ -133,13 +144,13 @@ pub(crate) fn plan(
         .iter()
         .map(|name| {
             let source = input.images[name].render.as_ref().unwrap();
-            let settings = source.resolve(&input.render);
+            let settings = input.images[name].resolved_render(&input.render).expect("a rendered image");
             ensure!(
                 settings
                     .resolution
                     .iter()
                     .all(|n| *n <= r.device.limits().max_texture_dimension_2d),
-                "{}", crate::gpu_memory::limit_message(format_args!("render image {name}"), format_args!("{}x{} pixels",settings.resolution[0],settings.resolution[1]), format_args!("max_texture_dimension_2d={} pixels per axis",r.device.limits().max_texture_dimension_2d), "reduce image.render.resolution")
+                crate::gpu_memory::device_limit(format_args!("render image {name}"), format_args!("{}x{} pixels",settings.resolution[0],settings.resolution[1]), format_args!("max_texture_dimension_2d={} pixels per axis",r.device.limits().max_texture_dimension_2d), "reduce image.render.resolution")
             );
             let (camera, exposure_samples, visibility_samples) = camera_sampling(&s.nodes, &settings, s.camera)?;
             let Subset {
@@ -179,6 +190,7 @@ pub(crate) fn plan(
             let mips=materials::MipChain::new(&r.device,&texture,None,&mip_pipelines[2],mip_sampler);
             let level_zero=texture.create_view(&wgpu::TextureViewDescriptor {mip_level_count:Some(1),..Default::default()});
             Ok(InstalledImageRender {
+                name: name.clone(),
                 time_dependent,
                 camera,
                 settings, exposure_samples, visibility_samples,
@@ -332,7 +344,8 @@ impl CaptureView {
             // The shared stateless volume has its own exact input tracker. Retain
             // its revision, including updates made while this capture did not run.
             inputs.extend_from_slice(bytemuck::cast_slice(&lighting_revisions));
-            inputs.extend_from_slice(&s.environment.sample_key(&frame.sample_request)?);
+            let media=s.environment.media_request(&s.animation,&frame.sample_request)?.unwrap_or_else(||frame.sample_request.clone());
+            inputs.extend_from_slice(&s.environment.sample_key(&frame.sample_request,&media)?);
             // Captures share the current parent sample's pose (independent capture
             // shutters are rejected). Include every immutable footage selection:
             // secondary hits, shadows and upstream captures can observe it too.
@@ -340,9 +353,13 @@ impl CaptureView {
             // another slot's overwrite cannot force replay of identical inputs.
             for source in s.footage.values().filter(|source|source.per_sample) {
                 let request=frame.sample_request.exact()?;
-                let base=source.time.as_ref().map(|t|vork_time::exact::Germ::point(t.exact())).unwrap_or_else(||request.clone());
-                let clock=s.animation.image_time_exact(&frame.animation_values,&request,&source.name,base)?;
-                inputs.extend_from_slice(&(source.frame_index(&clock,s.render.fps)? as u64).to_le_bytes());
+                let clock=if source.canvas.is_some() {
+                    source.canvas_instant(s,&frame.animation_values,&request)?
+                } else {
+                    let base=source.time.as_ref().map(|t|vork_time::exact::Germ::point(t.exact())).unwrap_or_else(||request.clone());
+                    Some(s.animation.image_time_exact(&frame.animation_values,&request,&source.name,base)?)
+                };
+                inputs.extend(source.sample_key(clock.as_ref(),s.render.fps)?);
             }
             // Native raster shading has no time input. Programs, media, compositors
             // and animated path seeds do; keep the actual uniforms unchanged.
@@ -376,7 +393,7 @@ impl CaptureView {
                     &mut frame.changes, values, sample as u32);
             }
         }
-        self.view.post.compositor_inputs.upload(s, base.scene[0], &mut frame.changes);
+        self.view.post.compositor_inputs.upload(s, base.scene[0], &mut frame.changes)?;
         frame.changes.upload(
             &self.uniforms,
             0,

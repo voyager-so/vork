@@ -1,5 +1,6 @@
 import vork_constants;
 import openpbr_core;
+import dielectric_interface;
 import closure;
 import variant;
 import frame;
@@ -20,15 +21,14 @@ float3 transport_metal_compensation(Closure c,float3 view) {
 // Lighting consumes values only; texture and material-record reads stay outside the light loop.
 // Specular reflectance from Fresnel moments m = (∫(1-f)g, ∫f·g, ∫μ(1-μ)^6·g), f=(1-μ)^5,
 // μ = v·h: split-sum LUT entries for environments and finite emitters.
-// Dielectric: Schlick, F0 from specular_ior, with the complete response weighted and tinted by
-// specular_color. Metal (OpenPBR 1.1.1 §metal): specular_weight × F82-tint Fresnel
+// Dielectric: Schlick, F0 from the modulated IOR, tinted by specular_color. Metal (OpenPBR 1.1.1 §metal): specular_weight × F82-tint Fresnel
 // (Kutz et al. 2021) with F0 = base_weight·base_color and F82 tint = specular_color:
 // F(μ) = Schlick(F0,μ) − b·μ(1−μ)^6, b = Schlick(F0,μ̄)(1−tint)/(μ̄(1−μ̄)^6), μ̄ = 1/7.
 // Material-only Fresnel terms are prepared once, outside the emitter loop.
 float3 substrate_color(Closure c) {return c.base_weight*substrate_albedo(c.base_color,c.subsurface_color,c.subsurface_weight,c.subsurface_scatter_anisotropy,c.geometry_thin_walled);}
 struct SpecularResponse { float3 dielectric; float3 tint; float3 metal; float3 correction; float weight; float metalness; float3 directional_albedo; float3 metal_compensation; };
 bool internal_reflection_quadrature<V:IVariant>(Closure c) {
-    return V.has_solid_transmission && c.transmission_weight>0. && c.specular_weight>0. && c.specular_ior<1.;
+    return V.has_solid_transmission && c.transmission_weight>0. && dielectric_ior(c)<1.;
 }
 bool authored_reflection_quadrature<V:IVariant>(Closure c) {
     return V.has_anisotropy && c.specular_roughness_anisotropy>0.
@@ -45,7 +45,7 @@ uint reflection_quadrature_samples<V:IVariant>(Closure c) {
     return authored_reflection_quadrature<V>(c) ? REG_SURFACE_QUADRATURE_SAMPLES : 1u;
 }
 SpecularResponse specular_response<V:IVariant>(Closure c, float3 view) {
-    let ior=c.specular_ior;
+    let ior=dielectric_ior(c);
     let f0=float3(fresnel(1.,ior));
     var response=SpecularResponse(f0,c.specular_color,float3(0.),float3(0.),c.specular_weight,0.,float3(-1.),float3(0.));
     if (ior<1. && dot(refract(-view,c.geometry_normal,1./ior),refract(-view,c.geometry_normal,1./ior))==0.) {
@@ -68,7 +68,7 @@ float3 specular_reflectance(SpecularResponse r,float3 m,bool directional_dielect
     // A matched dielectric interface has no reflection at any angle. Schlick's
     // unit grazing term applies only when the interface has nonzero contrast.
     let grazing=any(r.dielectric!=float3(0.)) ? m.y : 0.;
-    let dielectric=directional_dielectric ? r.directional_albedo : r.weight*(r.dielectric*m.x+float3(grazing))*r.tint;
+    let dielectric=directional_dielectric ? r.directional_albedo : (r.dielectric*m.x+float3(grazing))*r.tint;
     if (r.metalness<=0.) { return dielectric; }
     let metal=(1.+r.metal_compensation)*r.weight*max(r.metal*m.x+float3(m.y)-r.correction*m.z,float3(0.));
     return lerp(dielectric,metal,r.metalness);
@@ -76,25 +76,28 @@ float3 specular_reflectance(SpecularResponse r,float3 m,bool directional_dielect
 // Exact std/oracle GGX and Lambert response for zero-size emitters. The moment
 // response above is used only by approximate LTC/environment integrations.
 // View-dependent substrate response, shared by every direction at a vertex.
-float3 direct_diffuse(Closure c, float3 view, float3 directional_albedo=float3(-1.)) {
+bool diffuse_quadrature(Closure c) {
+    return c.specular_roughness_anisotropy>0. || c.thin_film_weight>0. || (c.geometry_thin_walled && c.transmission_weight>0.);
+}
+float3 direct_diffuse(Closure c, float3 view, float3 directional_albedo=float3(-1.),float reflection_scale=1.) {
     var diffuse=float3(0.);
     if (c.base_weight>0. && c.base_metalness<1. && c.transmission_weight<1.) {
         var albedo=directional_albedo;
         if (any(albedo<float3(0.))) {
-            albedo=c.specular_roughness_anisotropy>0. || c.thin_film_weight>0. || (c.geometry_thin_walled && c.transmission_weight>0.)
+            albedo=diffuse_quadrature(c)
                 ? surface_directional_albedo(c,view)
-                : c.specular_weight*c.specular_color*dielectric_albedo(max(dot(c.geometry_normal,view),.0001),c.specular_roughness,c.specular_ior);
+                : c.specular_color*dielectric_albedo(max(dot(c.geometry_normal,view),.0001),c.specular_roughness,dielectric_ior(c));
         }
-        diffuse=diffuse_brdf(substrate_color(c),1.,c.base_metalness,c.transmission_weight,albedo);
+        diffuse=diffuse_brdf(substrate_color(c),1.,c.base_metalness,c.transmission_weight,reflection_scale*albedo);
     }
     return diffuse;
 }
-float3 thin_diffuse(Closure c,float3 view,float3 directional_albedo=float3(-1.)) {
+float3 thin_diffuse(Closure c,float3 view,float3 directional_albedo=float3(-1.),float reflection_scale=1.) {
     if (!c.geometry_thin_walled || c.subsurface_weight<=0.) {return float3(0.);}
     var sheet=c;
     sheet.base_color=substrate_albedo(c.base_color,c.subsurface_color,c.subsurface_weight,c.subsurface_scatter_anisotropy,true,true);
     sheet.subsurface_weight=0.;
-    return direct_diffuse(sheet,view,directional_albedo);
+    return direct_diffuse(sheet,view,directional_albedo,reflection_scale);
 }
 float thin_diffuse_probability(Closure c) {
     let substrate=(1.-c.base_metalness)*(1.-c.transmission_weight);
@@ -102,8 +105,7 @@ float thin_diffuse_probability(Closure c) {
     let transmitted=c.geometry_thin_walled ? c.base_weight*dot(c.subsurface_color,REG_LUMINANCE)*c.subsurface_weight*.5*(1.+c.subsurface_scatter_anisotropy)*substrate : 0.;
     return transmitted/max(reflected+transmitted,1e-20);
 }
-float3 direct_brdf_prepared(Closure c, float3 view, float3 light, uint mask, float3 diffuse, float3 metal_compensation) {
-    if (c.base_weight==0. && c.specular_weight==0.) {return float3(0.);}
+float3 direct_brdf_prepared(Closure c, float3 view, float3 light, uint mask, float3 diffuse, float3 metal_compensation,float reflection_scale=1.) {
     let n=c.geometry_normal;
     let nl=max(dot(n,light),0.);let nv=max(dot(n,view),.0001);
     if (nl<=0.) {return float3(0.);}
@@ -119,7 +121,7 @@ float3 direct_brdf_prepared(Closure c, float3 view, float3 light, uint mask, flo
             ? f*microfacet_distribution(c,h)*microfacet_visibility(c,view,light)
             : ggx_reflection(f,nv,nl,nh,c.specular_roughness);
     }
-    return (select((mask&REG_RAY_DIFFUSE)!=0u,diffuse,float3(0.))+select((mask&REG_RAY_SPECULAR)!=0u,specular,float3(0.)))*nl;
+    return (select((mask&REG_RAY_DIFFUSE)!=0u,diffuse,float3(0.))+select((mask&REG_RAY_SPECULAR)!=0u,reflection_scale*specular,float3(0.)))*nl;
 }
 float2 specular_quadrature_point(uint i, float2 rotation, uint samples) {
     return frac(rotation+float2((float(i)+.5)/float(samples),float(reversebits(i)>>8u)*(1./16777216.)));
@@ -127,19 +129,18 @@ float2 specular_quadrature_point(uint i, float2 rotation, uint samples) {
 
 // OpenPBR's view-dependent substrate attenuation. Keep isotropic/no-film LUTs
 // for the original closure; integrate new responses once before raster lights.
-float3 direct_brdf(Closure c, float3 view, float3 light, uint mask, float3 directional_albedo=float3(-1.)) {
+float3 direct_brdf(Closure c, float3 view, float3 light, uint mask, float3 directional_albedo=float3(-1.),float reflection_scale=1.) {
     if (dot(c.geometry_normal,light)<0.) {
-        return (mask&REG_RAY_DIFFUSE)!=0u ? thin_diffuse(c,view,directional_albedo)*(-dot(c.geometry_normal,light)) : float3(0.);
+        return (mask&REG_RAY_DIFFUSE)!=0u ? thin_diffuse(c,view,directional_albedo,reflection_scale)*(-dot(c.geometry_normal,light)) : float3(0.);
     }
-    if (c.base_weight==0. && c.specular_weight==0.) {return float3(0.);}
-    return direct_brdf_prepared(c,view,light,mask,(mask&REG_RAY_DIFFUSE)!=0u ? direct_diffuse(c,view,directional_albedo) : float3(0.),(mask&REG_RAY_SPECULAR)!=0u ? transport_metal_compensation(c,view) : float3(0.));
+    return direct_brdf_prepared(c,view,light,mask,(mask&REG_RAY_DIFFUSE)!=0u ? direct_diffuse(c,view,directional_albedo,reflection_scale) : float3(0.),(mask&REG_RAY_SPECULAR)!=0u ? transport_metal_compensation(c,view) : float3(0.),reflection_scale);
 }
 
 float3 interface_reflection<V:IVariant>(Closure c,float3 view) {
     let cosine=max(dot(c.geometry_normal,view),0.);
-    if (V.has_film && c.thin_film_weight>0. && c.thin_film_thickness>0. && c.specular_ior==1. && c.specular_roughness>0.) {
+    if (V.has_film && c.thin_film_weight>0. && c.thin_film_thickness>0. && dielectric_ior(c)==1. && c.specular_roughness>0.) {
         return surface_directional_albedo(c,view,c.geometry_thin_walled);
     }
-    let f=film_reflection(c,cosine,float3(fresnel(cosine,c.specular_ior)));
+    let f=film_reflection(c,cosine,float3(fresnel(cosine,dielectric_ior(c))));
     return c.geometry_thin_walled ? 2.*f/(1.+f) : f;
 }

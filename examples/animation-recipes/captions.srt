@@ -1,0 +1,12 @@
+1
+00:00:00,500 --> 00:00:01,500
+Every cue has an exact start.
+
+2
+00:00:01,500 --> 00:00:02,700
+Adjacent cues switch together.
+Two lines stay two lines.
+
+3
+00:00:03,000 --> 00:00:04,000
+Gaps clear the caption.

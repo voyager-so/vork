@@ -20,6 +20,7 @@ end of the VS buffer table.
 #[allow(deprecated)]
 mod adapter;
 mod command;
+mod compile_admission;
 mod completion;
 mod conv;
 mod device;
@@ -479,8 +480,9 @@ impl Queue {
             let blit = init.blitCommandEncoder().unwrap();
             blit.updateFence(&acceleration_structure_fence);
             blit.endEncoding();
-            completion.track(&init);
-            init.commit();
+            // The queue's first buffer: nothing is pending, so there is no budget to wait for and no earlier
+            // failure to report.
+            let _ = completion.commit(&init);
         });
         Self {
             shared: Arc::new(QueueShared {
@@ -519,6 +521,8 @@ pub struct Device {
     shared: Arc<AdapterShared>,
     features: wgt::Features,
     counters: Arc<wgt::HalCounters>,
+    /// Pipelines this device has recorded in a binary archive: archive misses that compiled.
+    archive_additions: core::sync::atomic::AtomicUsize,
 }
 
 pub struct Surface {
@@ -567,6 +571,9 @@ impl crate::Queue for Queue {
     ) -> Result<(), crate::DeviceError> {
         signal_fence.completion.get_or_insert_with(|| Arc::clone(&self.shared.completion));
         signal_fence.maintain()?;
+        // Every buffer goes through the queue's one commit, which keeps its budget of pending command buffers
+        // (`crate::MAX_PENDING_NATIVE_BUFFERS`). The first failure it reports is this submission's.
+        let mut room = Ok(());
         autoreleasepool(|_| {
             let extra = command_buffers.is_empty().then(|| {
                 let raw = self.shared.raw.commandBufferWithUnretainedReferences().unwrap();
@@ -579,25 +586,28 @@ impl crate::Queue for Queue {
             }
             let mut serial = 0;
             for cmd in command_buffers {
-                serial = self.shared.completion.track(&cmd.raw);
-                cmd.raw.commit();
+                let (committed, kept) = self.shared.completion.commit(&cmd.raw);
+                serial = committed;
+                room = core::mem::replace(&mut room, Ok(())).and(kept);
                 let previous = self.shared.command_buffer_created_not_submitted
                     .fetch_sub(1, atomic::Ordering::AcqRel);
                 debug_assert!(previous > 0);
             }
             if let Some(raw) = extra {
-                serial = self.shared.completion.track(&raw);
-                raw.commit();
+                let (committed, kept) = self.shared.completion.commit(&raw);
+                serial = committed;
+                room = core::mem::replace(&mut room, Ok(())).and(kept);
             }
             signal_fence.pending_signals.push((signal_value, serial));
         });
-        Ok(())
+        room
     }
     unsafe fn present(
         &self,
         _surface: &Surface,
         texture: SurfaceTexture,
     ) -> Result<(), crate::SurfaceError> {
+        let mut room = Ok(());
         autoreleasepool(|_| {
             // We do not bother adjusting `command_buffer_created_not_submitted`
             // because we immediately commit this buffer.
@@ -609,15 +619,15 @@ impl crate::Queue for Queue {
                 command_buffer.presentDrawable(&texture.drawable);
             }
 
-            self.shared.completion.track(&command_buffer);
-            command_buffer.commit();
+            // The queue's one commit, like every other native buffer: it counts against the pending budget.
+            room = self.shared.completion.commit(&command_buffer).1;
 
             if texture.present_with_transaction {
                 command_buffer.waitUntilScheduled();
                 texture.drawable.present();
             }
         });
-        Ok(())
+        Ok(room?)
     }
 
     unsafe fn get_timestamp_period(&self) -> f32 {
@@ -881,6 +891,8 @@ pub struct PassthroughShader {
     pub library: Option<Retained<ProtocolObject<dyn MTLLibrary>>>,
     // Flexible argument tables compile only once the pipeline layout is known.
     pub source: Option<String>,
+    /// Bytes of the source or library this module was created from: the compile admission's cost signal.
+    pub source_bytes: u64,
     pub num_workgroups: (u32, u32, u32),
 }
 
@@ -1150,6 +1162,38 @@ pub struct PipelineCache {
     /// The lock also serializes additions and serialization. Shared with the
     /// process registry so an exit that skips destructors can still remove them.
     files: Arc<Mutex<Vec<std::path::PathBuf>>>,
+    /// Additions that found a serialization in progress. Creating a pipeline never
+    /// waits for one (it holds `files` for 0.02 to 0.1 s per megabyte): whoever
+    /// next holds `files`, the next serialization included, records these first.
+    deferred: Mutex<Vec<DeferredAddition>>,
+}
+
+/// Records one compiled pipeline in a binary archive. Recording is a compiler
+/// request (the driver compiles again unless it still holds the binary), so it
+/// is postponed work of the compile admission.
+struct DeferredAddition(compile_admission::Deferred);
+// The pipeline descriptor it holds is used by one thread at a time, under `files`.
+unsafe impl Send for DeferredAddition {}
+impl fmt::Debug for DeferredAddition {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("DeferredAddition")
+    }
+}
+
+impl PipelineCache {
+    /// Record the additions that were deferred, each as its own admitted
+    /// compiler request with its pipeline's estimate and the same retry
+    /// (`Admission::record`).
+    ///
+    /// The caller holds `files` and must not hold a permit of `admission`.
+    /// Waiting for admission here cannot deadlock, because an admitted
+    /// compilation never waits for `files` (it tries the lock and defers), so
+    /// everything in flight finishes. A pipeline the archive refuses here is
+    /// only missing from the cache; it was created.
+    fn record_deferred(&self, admission: &compile_admission::Admission) {
+        let deferred = core::mem::take(&mut *self.deferred.lock());
+        admission.record(deferred.into_iter().map(|addition| addition.0));
+    }
 }
 
 impl Drop for PipelineCache {

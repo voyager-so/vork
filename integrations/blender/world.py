@@ -152,9 +152,9 @@ class WorldImport:
 
 def medium(socket):
     """Keep world fog independent of its surface illumination, including bakes."""
-    if not socket.is_linked:
+    from .volume import empty_volume, homogeneous
+    if empty_volume(socket):
         return {}
-    from .volume import homogeneous
     try:
         source = homogeneous(socket)
     except ValueError as error:

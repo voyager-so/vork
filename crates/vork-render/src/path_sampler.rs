@@ -261,8 +261,9 @@ fn light_point_is_independent_of_light_pick() {
 
 /// The compiled shader draws exactly the reference's bits.
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn shader_matches_cpu_reference() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else { return Ok(()); };
+    let r = crate::test_renderer()?;
     let source = r#"
 import path_sampler;
 [[vk::binding(0,0)]] RWStructuredBuffer<float4> output;

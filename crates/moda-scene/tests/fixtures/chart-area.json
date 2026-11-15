@@ -1,0 +1,226 @@
+{
+  "nodes": [
+    {
+      "id": "gn-chart",
+      "type": "generated",
+      "x": 200,
+      "y": 140,
+      "width": 880,
+      "height": 520,
+      "rotation": 0,
+      "scale": 1,
+      "generatedKind": "chart",
+      "renderMode": "native-children",
+      "metadata": {
+        "name": "Area Chart"
+      },
+      "generatedSource": {
+        "kind": "chart",
+        "chartVersion": 1,
+        "spec": {
+          "type": "area",
+          "x": 0,
+          "y": 0,
+          "width": 880,
+          "height": 520,
+          "mode": "stacked",
+          "config": {
+            "fontFamily": "Inter",
+            "fontSize": 12,
+            "labelColor": "#666666",
+            "titleColor": "#1a1a1a",
+            "subtitleColor": "#666666",
+            "titleSize": 16,
+            "titleWeight": 600,
+            "titleAlign": "left",
+            "subtitleSize": 12,
+            "palette": [
+              "#3b82f6",
+              "#ef4444",
+              "#22c55e",
+              "#f59e0b"
+            ],
+            "background": "transparent",
+            "showGrid": true,
+            "gridColor": "#e5e5e5",
+            "gridStyle": "solid",
+            "gridWidth": 1,
+            "showXAxis": true,
+            "showYAxis": true,
+            "axisColor": "#cccccc",
+            "axisWidth": 1,
+            "showXLabels": true,
+            "showYLabels": true,
+            "yTickCount": 5,
+            "yFormat": "auto",
+            "yScale": "linear",
+            "barRadius": 0,
+            "barGap": 0.2,
+            "barGroupGap": 0.1,
+            "showLabels": false,
+            "labelPosition": "top",
+            "labelFormat": "auto",
+            "valueFormat": "auto",
+            "valueDensity": "auto",
+            "valueLabelColor": "#666666",
+            "valueLabelSize": 11,
+            "showLegend": "auto",
+            "legendPosition": "bottom",
+            "legendAlign": "center",
+            "legendGap": 8,
+            "legendMarker": "square",
+            "legendMarkerSize": 12,
+            "legendColor": "#666666",
+            "strokeWidth": 2,
+            "strokeStyle": "solid",
+            "curve": "linear",
+            "strokeCap": "round",
+            "strokeJoin": "round",
+            "showPoints": false,
+            "pointSize": 8,
+            "pointShape": "circle",
+            "pointFill": "",
+            "pointStroke": "",
+            "pointStrokeWidth": 0,
+            "fillOpacity": 0.45,
+            "baseline": 0,
+            "pointOpacity": 0.7,
+            "minPointSize": 8,
+            "maxPointSize": 40,
+            "xTickCount": 5,
+            "innerRadius": 0,
+            "startAngle": -90,
+            "direction": "cw",
+            "padAngle": 0,
+            "explode": [],
+            "explodeDistance": 10,
+            "explodeAll": false,
+            "centerLabel": "",
+            "centerSublabel": "",
+            "centerColor": "#1a1a1a",
+            "centerLabelColor": "#1a1a1a",
+            "centerSublabelColor": "#666666",
+            "centerSize": 24,
+            "pieLabelPosition": "outside",
+            "pieLabelFormat": "percent",
+            "minLabelAngle": 10,
+            "padding": 16,
+            "cornerRadius": 0,
+            "title": "Stacked deployments"
+          }
+        },
+        "data": {
+          "columns": [
+            "category",
+            "series",
+            "value"
+          ],
+          "rows": [
+            {
+              "category": "Jan",
+              "series": "Cloud",
+              "value": 20
+            },
+            {
+              "category": "Jan",
+              "series": "Edge",
+              "value": 14
+            },
+            {
+              "category": "Feb",
+              "series": "Cloud",
+              "value": 34
+            },
+            {
+              "category": "Feb",
+              "series": "Edge",
+              "value": 18
+            },
+            {
+              "category": "Mar",
+              "series": "Cloud",
+              "value": 28
+            },
+            {
+              "category": "Mar",
+              "series": "Edge",
+              "value": 26
+            },
+            {
+              "category": "Apr",
+              "series": "Cloud",
+              "value": 46
+            },
+            {
+              "category": "Apr",
+              "series": "Edge",
+              "value": 30
+            },
+            {
+              "category": "May",
+              "series": "Cloud",
+              "value": 40
+            },
+            {
+              "category": "May",
+              "series": "Edge",
+              "value": 38
+            },
+            {
+              "category": "Jun",
+              "series": "Cloud",
+              "value": 58
+            },
+            {
+              "category": "Jun",
+              "series": "Edge",
+              "value": 44
+            }
+          ],
+          "series": [
+            "Cloud",
+            "Edge"
+          ],
+          "categories": [
+            "Jan",
+            "Feb",
+            "Mar",
+            "Apr",
+            "May",
+            "Jun"
+          ],
+          "valueRange": [
+            0,
+            58
+          ]
+        }
+      }
+    }
+  ],
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "generated-chart-area",
+      "width": 1280,
+      "height": 800,
+      "nodeIds": [
+        "gn-chart"
+      ],
+      "fills": [
+        {
+          "id": "fill-0",
+          "paint": {
+            "type": "solid",
+            "color": "#ffffff"
+          }
+        }
+      ]
+    }
+  ],
+  "config": {
+    "renderPageClipping": true
+  },
+  "variables": [],
+  "canvasRootNodeIds": [],
+  "layoutMode": "vertical"
+}

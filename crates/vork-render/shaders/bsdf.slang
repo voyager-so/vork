@@ -4,6 +4,7 @@ import openpbr_core;
 import frame;
 import closure;
 import dielectric_interface;
+import vork_prelude;
 import variant;
 __exported import bsdf_response;
 // LTC atlas coordinates for live coat and sheen response.
@@ -35,6 +36,11 @@ float2 quadrature_rotation(uint j,uint sample,uint count) {
 // open_pbr_surface.mtlx): fuzz over coat over the base substrate. Evaluated once per
 // shaded sample; zero-weight layers leave `base` as the material's own closure.
 struct Layers { Closure base; float3 scale; float3 transmittance; float throughput; float coat_f0; float coat_fresnel; float fuzz_albedo; float3x3 fuzz_basis; float3x3 fuzz_matrix; bool coat_albedo; };
+float coat_directional_albedo<V:IVariant=Unspecialized>(Closure c,float3 view) {
+    if(!V.has_coat_anisotropy || c.coat_roughness_anisotropy==0.) return dielectric_albedo(max(dot(c.geometry_coat_normal,view),.0001),c.coat_roughness,c.coat_ior);
+    let coat=transport_coat_closure(c);
+    return surface_directional_albedo(coat,view,false).x;
+}
 // The coat and fuzz layers are compiled in only for variants whose materials have them
 // (V.layered); dielectric variants compile without the F82 metal path (V.metal).
 Layers layers<V:IVariant>(Closure c, float3 view, float coat_albedo=-1.) {
@@ -92,7 +98,11 @@ float3 layer_direct<V:IVariant>(Layers l, Closure c, float3 view, float3 light, 
         let n=c.geometry_coat_normal;let h=normalize(view+light);
         let nl=max(dot(n,light),0.);let nv=max(dot(n,view),.0001);
         if (nl>0.) {
-            result+=l.throughput*coat_brdf(c.coat_weight,c.coat_roughness,c.coat_ior,nv,nl,max(dot(n,h),0.),max(dot(view,h),0.))*nl;
+            if(V.has_coat_anisotropy && c.coat_roughness_anisotropy>0.) {
+                let coat=transport_coat_closure(c);
+                result+=l.throughput*c.coat_weight*fresnel(max(dot(view,h),0.),c.coat_ior)
+                    *microfacet_distribution(coat,h)*microfacet_visibility(coat,view,light)*nl;
+            } else result+=l.throughput*coat_brdf(c.coat_weight,c.coat_roughness,c.coat_ior,nv,nl,max(dot(n,h),0.),max(dot(view,h),0.))*nl;
         }
     }
     if (V.has_fuzz && c.fuzz_weight>0. && (mask&REG_RAY_DIFFUSE)!=0u) {
@@ -114,7 +124,7 @@ float3 layered(Layers l, float3 base, float3 layer) {
 struct BsdfSample { float3 direction; float3 weight; float pdf; uint event; };
 bool transport_tir(Closure c, float3 view) {
     if (c.geometry_thin_walled) {return false;}
-    let d=refract(-view,c.geometry_normal,1./c.specular_ior);
+    let d=refract(-view,c.geometry_normal,1./dielectric_ior(c));
     return dot(d,d)==0.;
 }
 // The three base probabilities are conditional on not selecting the coat.
@@ -128,8 +138,8 @@ float3 transport_probabilities(Closure c, float3 view, out float coat_probabilit
     let transmission=max(c.transmission_weight*(1.-c.base_metalness),0.);
     // Fresnel-weight transmitting surfaces without removing rough-interface
     // support across the macro-normal critical angle (microfacets may transmit).
-    var f=fresnel(max(dot(c.geometry_normal,view),0.),c.specular_ior);
-    if (c.thin_film_weight>0.) {f=dot(film_dielectric(max(dot(c.geometry_normal,view),0.),c.specular_ior,c.thin_film_ior,c.thin_film_thickness),REG_LUMINANCE)*c.thin_film_weight+f*(1.-c.thin_film_weight);}
+    var f=fresnel(max(dot(c.geometry_normal,view),0.),dielectric_ior(c));
+    if (c.thin_film_weight>0.) {f=dot(film_dielectric(max(dot(c.geometry_normal,view),0.),dielectric_ior(c),c.thin_film_ior,c.thin_film_thickness),REG_LUMINANCE)*c.thin_film_weight+f*(1.-c.thin_film_weight);}
     var reflected=f;
     if (c.geometry_thin_walled) {reflected=lerp(f,sheet_reflectance(f),c.transmission_weight);f=sheet_reflectance(f);}
     if (c.specular_roughness>0.) {f=clamp(f,.05,.95);}
@@ -140,7 +150,7 @@ float3 transport_probabilities(Closure c, float3 view, out float coat_probabilit
     // below is separate from this reflection-energy estimate.
     let dielectric=reflected*max(dot(c.specular_color,REG_LUMINANCE),0.);
     let coat=c.coat_weight>0. ? c.coat_weight*fresnel(max(dot(c.geometry_coat_normal,view),0.),c.coat_ior) : 0.;
-    let reflection=max(c.specular_weight*lerp(dielectric,1.,c.base_metalness),0.)+select(tir,transmission,0.);
+    let reflection=max(lerp(dielectric,c.specular_weight,c.base_metalness),0.)+select(tir,transmission,0.);
     let refractive=select(tir,0.,transmission*(1.-f));
     let total=diffuse+reflection+refractive;
     coat_probability=coat/max(total+coat,1e-20);
@@ -172,9 +182,9 @@ float3 transport_valid_interface_normal(float3 normal,float3 geometric,float3 vi
 Closure transport_interface_closure(Closure c, TransportPreparation prepared) {
     c.geometry_normal=prepared.interface_normal;return c;
 }
-TransportPreparation transport_prepare(Closure c, float3 view, bool coat_albedo, float3 smooth_normal, float3 geometric) {
+TransportPreparation transport_prepare<V:IVariant=Unspecialized>(Closure c, float3 view, bool coat_albedo, float3 smooth_normal, float3 geometric) {
     // Directional coat reflectance is view-local, just like the diffuse budget.
-    let coat=coat_albedo ? (c.coat_weight>0. ? c.coat_weight*dielectric_albedo(max(dot(c.geometry_coat_normal,view),.0001),c.coat_roughness,c.coat_ior) : 0.) : -1.;
+    let coat=coat_albedo ? (V.has_coat && c.coat_weight>0. ? c.coat_weight*coat_directional_albedo<V>(c,view) : 0.) : -1.;
     var base_c=c;base_c.geometry_normal=transport_valid_interface_normal(c.geometry_normal,geometric,view);
     float coat_probability;let probabilities=transport_probabilities(base_c,view,coat_probability);
     let deviation=abs(dot(smooth_normal,c.geometry_normal));
@@ -182,9 +192,9 @@ TransportPreparation transport_prepare(Closure c, float3 view, bool coat_albedo,
     let bump_alpha_squared=clamp((1.-deviation*deviation)/max(8.*deviation*deviation,1e-20),0.,1.);
     return TransportPreparation(probabilities,coat_probability,direct_diffuse(base_c,view),coat,transport_metal_compensation(base_c,view),smooth_normal,bump_alpha_squared,base_c.geometry_normal);
 }
-TransportPreparation transport_prepare(Closure c, float3 view, bool coat_albedo=false) {
+TransportPreparation transport_prepare<V:IVariant=Unspecialized>(Closure c, float3 view, bool coat_albedo=false) {
     // Closure-only queries have no separate face: retain the authored interface.
-    return transport_prepare(c,view,coat_albedo,c.geometry_normal,c.geometry_normal);
+    return transport_prepare<V>(c,view,coat_albedo,c.geometry_normal,c.geometry_normal);
 }
 // Bump shadowing changes the diffuse response, not its cosine proposal/PDF.
 // Use the original smooth normal, independently of the coat's authored normal.
@@ -204,28 +214,32 @@ bool transport_shared_interface(Closure c) {
     return transport_rough_transmission(c) && c.transmission_weight>0. && c.base_metalness<1.;
 }
 float transport_interface_reflection(Closure c,float3 view,float3 h) {
-    var f=fresnel(max(dot(view,h),0.),c.specular_ior);
-    if (c.thin_film_weight>0.) {f=lerp(f,dot(film_dielectric(max(dot(view,h),0.),c.specular_ior,c.thin_film_ior,c.thin_film_thickness),REG_LUMINANCE),c.thin_film_weight);}
+    var f=fresnel(max(dot(view,h),0.),dielectric_ior(c));
+    if (c.thin_film_weight>0.) {f=lerp(f,dot(film_dielectric(max(dot(view,h),0.),dielectric_ior(c),c.thin_film_ior,c.thin_film_thickness),REG_LUMINANCE),c.thin_film_weight);}
     if (c.geometry_thin_walled) {f=sheet_reflectance(f);}
-    let reflection=max(c.specular_weight*lerp(f*max(dot(c.specular_color,REG_LUMINANCE),0.),1.,c.base_metalness),0.);
+    let reflection=max(lerp(f*max(dot(c.specular_color,REG_LUMINANCE),0.),c.specular_weight,c.base_metalness),0.);
     let transmission=max(c.transmission_weight*(1.-c.base_metalness)*(1.-f),0.);
     return reflection+transmission>0. ? reflection/(reflection+transmission) : 0.;
 }
 float transport_transmission_probability(Closure c,float3 view,float3 direction,float3 probabilities) {
     if (!transport_shared_interface(c)) {return probabilities.z;}
-    var h=normalize(select(c.geometry_thin_walled,view-direction,view+c.specular_ior*direction));
+    var h=normalize(select(c.geometry_thin_walled,view-direction,view+dielectric_ior(c)*direction));
     if (dot(c.geometry_normal,h)<0.) {h=-h;}
     return (1.-probabilities.x)*(1.-transport_interface_reflection(c,view,h));
 }
 // Joint event/direction density. Path visibility and light contribution are
 // event-specific, so MIS must compare the selected event's density rather
 // than the sum of overlapping diffuse and glossy sampling distributions.
-// The coat has its own normal and isotropic GGX distribution. Reuse the
+// The coat has its own normal, tangent and GGX distribution. Reuse the
 // visible-normal machinery with a reflection-only closure, independent of base.
 Closure transport_coat_closure(Closure c) {
-    c.geometry_normal=c.geometry_coat_normal;c.specular_roughness=c.coat_roughness;
-    c.specular_roughness_anisotropy=0.;
-    return c;
+    // Initialize an independent reflection-only interface. No substrate optics
+    // (thin sheet, transmission, film, metal or weighted IOR) belong to the coat.
+    Closure coat={};
+    coat.geometry_normal=c.geometry_coat_normal;coat.geometry_tangent=c.geometry_coat_tangent;
+    coat.specular_roughness=c.coat_roughness;coat.specular_roughness_anisotropy=c.coat_roughness_anisotropy;
+    coat.specular_weight=1.;coat.specular_color=float3(1.);coat.specular_ior=c.coat_ior;
+    return coat;
 }
 float transport_pdf_mask(Closure c, float3 view, float3 direction, uint mask, TransportPreparation prepared) {
     let base=transport_interface_closure(c,prepared);let n=base.geometry_normal;let nl=dot(n,direction);let p=prepared.probabilities;
@@ -249,18 +263,18 @@ float transport_pdf(Closure c, float3 view, float3 direction) {
 }
 // Smooth and equal-IOR transmission retain the zero-density convention.
 bool transport_rough_transmission(Closure c) {
-    return c.specular_roughness>0. && c.specular_ior!=1.;
+    return c.specular_roughness>0. && dielectric_ior(c)!=1.;
 }
 struct TransmissionResponse {float3 value;float pdf;};
 TransmissionResponse transport_transmission(Closure c, float3 view, float3 direction, Layers l) {
     TransmissionResponse result={};
     if (!transport_rough_transmission(c)) {return result;}
     let n=c.geometry_normal;
-    var h=normalize(select(c.geometry_thin_walled,view-direction,view+c.specular_ior*direction));
+    var h=normalize(select(c.geometry_thin_walled,view-direction,view+dielectric_ior(c)*direction));
     if (dot(n,h)<0.) {h=-h;}
     var f=0.;
-    if (c.geometry_thin_walled) {f=ggx_sheet_transmission(dot(n,view),dot(n,direction),dot(n,h),dot(view,h),c.specular_roughness,c.specular_ior,result.pdf);}
-    else {f=ggx_transmission(dot(n,view),dot(n,direction),dot(n,h),dot(view,h),dot(direction,h),c.specular_roughness,c.specular_ior,result.pdf);}
+    if (c.geometry_thin_walled) {f=ggx_sheet_transmission(dot(n,view),dot(n,direction),dot(n,h),dot(view,h),c.specular_roughness,dielectric_ior(c),result.pdf);}
+    else {f=ggx_transmission(dot(n,view),dot(n,direction),dot(n,h),dot(view,h),dot(direction,h),c.specular_roughness,dielectric_ior(c),result.pdf);}
     var transmission_scale=float3(1.);
     if (c.specular_roughness_anisotropy>0.) {
         let a=specular_alpha(c.specular_roughness);
@@ -270,8 +284,8 @@ TransmissionResponse transport_transmission(Closure c, float3 view, float3 direc
         f*=ratio*microfacet_visibility(c,view,direction)/max(smith_visibility(max(dot(n,view),.0001),abs(dot(n,direction)),a,1e-20),1e-30);
     }
     if (c.thin_film_weight>0.) {
-        let base_f=fresnel(abs(dot(view,h)),c.specular_ior);
-        var film_f=lerp(float3(base_f),film_dielectric(abs(dot(view,h)),c.specular_ior,c.thin_film_ior,c.thin_film_thickness),c.thin_film_weight);
+        let base_f=fresnel(abs(dot(view,h)),dielectric_ior(c));
+        var film_f=lerp(float3(base_f),film_dielectric(abs(dot(view,h)),dielectric_ior(c),c.thin_film_ior,c.thin_film_thickness),c.thin_film_weight);
         var original_f=base_f;
         if (c.geometry_thin_walled) {film_f=2.*film_f/(1.+film_f);original_f=sheet_reflectance(base_f);}
         transmission_scale=(1.-film_f)/max(1.-original_f,1e-20);
@@ -279,7 +293,7 @@ TransmissionResponse transport_transmission(Closure c, float3 view, float3 direc
     if (result.pdf>0.) {
         result.pdf*=transport_visible_scale(c,view)*abs(dot(view,h))/dot(n,h);
     }
-    let tint=transmission_scale*transmission_interface_tint(c.transmission_color,c.transmission_depth,c.geometry_thin_walled);
+    let tint=transmission_scale*surface_transmission_tint(c);
     let base=l.throughput*tint*c.transmission_weight*(1.-c.base_metalness)*f*abs(dot(n,direction));
     result.value=l.coat_albedo ? l.scale*base : compose_coat(base,float3(0.),c.coat_weight,dot(c.geometry_coat_normal,view),dot(c.geometry_coat_normal,direction),c.coat_ior);
     return result;
@@ -313,28 +327,28 @@ float3 transport_eval(Closure c, float3 view, float3 direction) {
 float3 transport_delta_transmittance(Closure c,float3 view,TransportPreparation prepared) {
     let base=transport_interface_closure(c,prepared);
     let n=prepared.interface_normal;
-    var interface_fresnel=fresnel(max(dot(n,view),0.),base.specular_ior);
+    var interface_fresnel=fresnel(max(dot(n,view),0.),dielectric_ior(base));
     if (base.geometry_thin_walled) {interface_fresnel=sheet_reflectance(interface_fresnel);}
     var transmitted=float3(1.-interface_fresnel);
     if (c.thin_film_weight>0. && c.thin_film_thickness>0.) {
-        var film_f=film_dielectric(max(dot(n,view),0.),base.specular_ior,c.thin_film_ior,c.thin_film_thickness);
+        var film_f=film_dielectric(max(dot(n,view),0.),dielectric_ior(base),c.thin_film_ior,c.thin_film_thickness);
         if (base.geometry_thin_walled) {film_f=2.*film_f/(1.+film_f);}
         transmitted=lerp(transmitted,1.-film_f,c.thin_film_weight);
         // Equal exterior/substrate IOR is a direction delta even when the
         // reflecting film is rough. Reserve its integrated reflected energy.
-        if (base.specular_ior==1. && base.specular_roughness>0.) {transmitted=1.-surface_directional_albedo(base,view,base.geometry_thin_walled);}
+        if (dielectric_ior(base)==1. && base.specular_roughness>0.) {transmitted=1.-surface_directional_albedo(base,view,base.geometry_thin_walled);}
     }
     let l=layers<Unspecialized>(c,view,prepared.coat_albedo);
-    return transmission_interface_tint(base.transmission_color,base.transmission_depth,base.geometry_thin_walled)
+    return surface_transmission_tint(base)
         *base.transmission_weight*(1.-base.base_metalness)*transmitted*l.scale*l.throughput;
 }
 // Final's straight light connection transports the directional transmission
 // integral, not the null-event mass. A rough sheet has no null delta, but its
 // GGX BTDF still carries light. Keep path NEE on transport_null_transmittance:
 // it has a competing sampled continuation and must not count this approximation.
-float3 transport_shadow_transmittance(Closure c,float3 view,float3 smooth_normal,float3 geometric,float2 uv) {
+float3 transport_shadow_transmittance<V:IVariant=Unspecialized>(Closure c,float3 view,float3 smooth_normal,float3 geometric,float2 uv) {
     if(c.transmission_weight<=0. || c.base_metalness>=1.) return float3(0.);
-    let prepared=transport_prepare(c,view,true,smooth_normal,geometric);
+    let prepared=transport_prepare<V>(c,view,true,smooth_normal,geometric);
     if(!c.geometry_thin_walled || !transport_rough_transmission(c))
         return transport_delta_transmittance(c,view,prepared);
     let base=transport_interface_closure(c,prepared);
@@ -352,20 +366,25 @@ float3 transport_shadow_transmittance(Closure c,float3 view,float3 smooth_normal
 // This predicate consumes relative interface IOR, after optical preparation.
 // Absorbing solids need an ordered segment/occupancy connection, not an
 // all-candidate product of interface weights.
-bool transport_null_boundary(Closure c,float incident_ior) {
+bool transport_null_interface(Closure c) {
     if(c.transmission_weight<=0.) return false;
     if(c.geometry_thin_walled) return !transport_rough_transmission(c);
-    return incident_ior==1. && c.specular_ior==1. && (c.transmission_depth<=0. || all(c.transmission_color==float3(1.)));
+    return dielectric_ior(c)==1. && (c.transmission_depth<=0. || all(c.transmission_color==float3(1.)));
+}
+bool transport_null_boundary(Closure c,float incident_ior) {
+    // A straight shadow connection does not carry an ordered interior set.
+    return transport_null_interface(c) && (c.geometry_thin_walled || incident_ior==1.);
 }
 // A null event preserves the preceding scattering vertex and its source MIS.
 // It cannot also own a new finite-source endpoint at this interface.
 bool transport_null_event(Closure c,float incident_ior,BsdfSample sample) {
     return transport_null_boundary(c,incident_ior) && sample.event==REG_RAY_TRANSMISSION && sample.pdf==0.;
 }
-float3 transport_null_transmittance(Closure c,float3 view,float incident_ior,float3 smooth_normal,float3 geometric) {
-    c=dielectric_interface(c,incident_ior,c.specular_ior);
-    if(!transport_null_boundary(c,incident_ior)) return float3(0.);
-    return transport_delta_transmittance(c,view,transport_prepare(c,view,true,smooth_normal,geometric));
+float3 transport_null_transmittance<V:IVariant=Unspecialized>(Closure c,float3 view,DielectricSegment incident,float3 smooth_normal,float3 geometric) {
+    let transmitted=dielectric_material_ior(c,incident,vork_path_wavelength);
+    c=dielectric_interface(c,incident.ior,c.specular_ior,transmitted/incident.ior);
+    if(!transport_null_boundary(c,incident.ior)) return float3(0.);
+    return transport_delta_transmittance(c,view,transport_prepare<V>(c,view,true,smooth_normal,geometric));
 }
 
 BsdfSample transport_sample(Closure c, float3 view, float3 random, TransportPreparation prepared) {
@@ -399,7 +418,7 @@ BsdfSample transport_sample(Closure c, float3 view, float3 random, TransportPrep
             if ((random.z-p.x)/(1.-p.x)<reflection) {
                 result.direction=reflect(-view,h);result.event=REG_RAY_SPECULAR;
             } else {
-                result.direction=select(base.geometry_thin_walled,-reflect(-view,h),refract(-view,h,1./base.specular_ior));
+                result.direction=select(base.geometry_thin_walled,-reflect(-view,h),refract(-view,h,1./dielectric_ior(base)));
                 result.event=REG_RAY_TRANSMISSION;
                 if (dot(result.direction,result.direction)==0. || dot(n,result.direction)>=0.) {return BsdfSample();}
             }
@@ -407,7 +426,7 @@ BsdfSample transport_sample(Closure c, float3 view, float3 random, TransportPrep
             let h=transport_visible_normal(base,view,random.xy);
             result.direction=reflect(-view,h);result.event=REG_RAY_SPECULAR;
         } else if (p.z>0.) {
-            let eta=1./base.specular_ior;
+            let eta=1./dielectric_ior(base);
             if (transport_rough_transmission(base)) {
                 let h=transport_visible_normal(base,view,random.xy);
                 if (dot(view,h)<=0.) {return result;}

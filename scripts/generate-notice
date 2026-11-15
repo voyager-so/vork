@@ -41,7 +41,9 @@ def generate():
         files = sorted((f for f in root.rglob('*') if f.is_file() and
                         f.name.lower().startswith(('license', 'licence', 'copying', 'copyright'))), key=posix_order)
         extra = ROOT / 'dist/licenses/crates' / p['name']
-        if extra.exists():
+        # A supplement names the locked version it stands in for; another locked version of the same crate
+        # that ships its own licence keeps it.
+        if extra.exists() and not (files and supplements[p['name']]['version'] != p['version']):
             if supplements[p['name']]['version'] != p['version']:
                 raise SystemExit(f"Review supplemental licence after dependency update: {p['name']} {p['version']}")
             files += sorted(extra.glob('*'), key=posix_order)

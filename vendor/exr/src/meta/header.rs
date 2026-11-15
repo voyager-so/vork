@@ -1011,12 +1011,16 @@ impl Header {
             SOFTWARE: Text = &self.own_attributes.software_name
         );
 
-        let other = self
+        // vork: custom attributes are written in name order. A hash map's order differs from one process (and
+        // one map) to the next, and the bytes of a file must not.
+        let mut other: Vec<_> = self
             .own_attributes
             .other
             .iter()
             .chain(self.shared_attributes.other.iter())
-            .map(|(name, val)| (name.as_slice(), val.clone())); // TODO no clone
+            .map(|(name, val)| (name.as_slice(), val.clone())) // TODO no clone
+            .collect();
+        other.sort_by(|a, b| a.0.cmp(b.0));
 
         req_core_attrs.chain(opt_core_attrs).chain(opt_attr).chain(other)
     }

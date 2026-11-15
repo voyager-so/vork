@@ -1,21 +1,21 @@
 # Python SDK
 
-Requires Python 3.11+. Install with `python -m pip install vork`, or from a
-source checkout with `python -m pip install ./packages/python`.
+Requires Python 3.11+. Install the SDK from PyPI:
 
-This package contains only the Python SDK: no native dependencies and no `vork`
-console command. Importing types and writing scenes work without the renderer.
-For `std()` and `render()`, install the renderer separately:
+```sh
+pip install vork
+```
 
-- npm: `npm install -g @voyager-so/vork` (keep optional dependencies enabled).
-- GitHub release: https://github.com/voyager-so/vork/releases — download and
-  extract the archive for your platform.
+The SDK contains no renderer. For `std()` and `render()`, install it separately:
 
-Put the directory containing `vork` on PATH, or set `VORK_BIN` to its full path.
-For a project-local npm installation, add `node_modules/.bin` to PATH.
-Use the SDK and renderer from the same release. Release archives also include
-this package under `python/`. The package version is generated from the Cargo
-workspace by `scripts/sync-version` and checked in CI.
+```sh
+npm install -g @voyager-so/vork
+```
+
+Keep npm's optional dependencies enabled and use matching SDK and renderer versions.
+Or use the [curl installer or platform archive](https://github.com/voyager-so/vork#install).
+The renderer must be on PATH, or set `VORK_BIN` to the vork executable.
+Types and scene writing work without the renderer.
 
 `from vork import Scene, std, write_scene`
 exposes the scene type, the shared CLI engines and scene writing:
@@ -36,8 +36,7 @@ scene; inline buffers of 4 KiB or more (std shapes, bulky mesh data) go to one
 `PATH.buffers.UUID.bin` sidecar. The input is not modified.
 
 `std(function, argument)` or `std(function, **options)` invokes `vork std` using JSON.
-Set `VORK_BIN` to choose the executable. Maths, tracks and settings are plain
-Python and scene data.
+Set `VORK_BIN` to choose the executable. Maths, tracks and settings are plain Python and scene data.
 
 `render('shot.json', 'still.png', at=0, profile='std/previs')` runs `vork render` with render-time
 options (`at`, `profile`, `set`, `channels`); the scene file is unchanged.
@@ -64,7 +63,9 @@ written into each render metadata sidecar. Check this array before accepting a r
 Each summary contains `frames`, `coverage` (mean alpha), `clipped`, `near_black`, `mean`, and
 `worst_clipped`/`worst_near_black` (`share`, absolute `frame`). EXR and control-only
 outputs have no entry. Statistics weight display RGB by alpha; empty coverage gives
-null metrics and worst-frame entries. Clip averages exclude empty frames. Values
+null metrics and worst-frame entries. Clip averages exclude empty frames. `clipped` is a display
+channel at 99% or more, where a view ran out of range; a canvas with no world, view or
+compositor shows authored colours as they are and gives null `clipped` and `worst_clipped`. Values
 retain full precision from the output metadata.
 
 Surface programs author emitted light once with OpenPBR `emission_color` and

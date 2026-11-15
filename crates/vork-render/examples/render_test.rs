@@ -21,7 +21,7 @@ fn run() -> Result<()> {
     let mut shot = Shot::default();
     while let Some(flag) = args.next() {
         match flag.as_str() {
-            "--out" => shot.out.push(args.next().context("output")?.into()),
+            "--out" => shot.out.push(args.next().context("output")?.parse().map_err(anyhow::Error::msg)?),
             "--profile" => shot.profile = Some(vork_scene::Profile::load(&args.next().context("profile")?)?),
             "--techniques" => {
                 let mut techniques = serde_json::from_slice::<serde_json::Map<String,serde_json::Value>>(&std::fs::read(args.next().context("techniques")?)?)?;

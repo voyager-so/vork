@@ -54,10 +54,9 @@ Source-available and free during the research preview.
 After [installing vork](#install), create a working project:
 
 ```sh
-vork init my-shot
-cd my-shot
+vork init my-shot && cd my-shot
+vork skills add
 vork render scene.json --out render.png
-vork help
 ```
 
 Open `render.png`, change a colour or camera position in `scene.json`, and render
@@ -181,8 +180,8 @@ initial impulse and limited secondary spray.
 
 ## No suitable GPU? Use the cloud
 
-Rendering requires Apple Silicon or an NVIDIA GPU with Vulkan ray queries.
-Scene authoring and `vork help` work without a GPU. On your own NVIDIA Linux
+Rendering requires Apple Silicon or an NVIDIA or AMD GPU with Vulkan ray
+queries. Scene authoring and `vork help` work without a GPU. On your own NVIDIA Linux
 machine, you can use the [Docker runtime](docs/REMOTE-GPU.md).
 Or render on Voyager's cloud GPUs with [vork cloud](https://voyager.so/vork/cloud).
 
@@ -194,6 +193,7 @@ Use `vork help` for the starting scene and concepts, `vork help TOPIC --all`
 for topic fields, and `vork help field PATH` for an exact field reference.
 
 Use the [prompt above](#paste-this-to-your-agent) to start.
+The [vork agent skill](skills/vork/SKILL.md) provides agent authoring guidance.
 
 Python and TypeScript can author ordinary scene JSON through the SDKs. You can
 also write JSON directly. For example, save this as `scene.json`:
@@ -224,7 +224,7 @@ Final approximates indirect lighting and can darken interiors, including glossy
 bounces. More samples do not restore omitted transport; try path and inspect.
 Draft and final use 4 and 8 samples with bundled OIDN denoising by default; use `--set denoise=false` to turn it
 off. `--set samples=N` overrides the profile budget (1..4096); more samples means cleaner and slower.
-Without a fast GPU denoiser (NVIDIA or Apple GPU), draft and final say so and use 16 and 32 samples undenoised;
+Without a fast GPU denoiser (NVIDIA, AMD with ROCm, or Apple GPU), draft and final say so and use 16 and 32 samples undenoised;
 `--set denoise=true` runs the slow CPU denoiser anyway.
 For a particular field, ask `vork help field node.target`. Help topics include
 exact fields with `--all`. Images, video and control passes come from the same
@@ -423,9 +423,9 @@ Binary packages are available from [GitHub Releases](https://github.com/voyager-
 for Linux, Windows and Mac. Keep the entire install folder together: Slang, OIDN,
 libraries, examples, SDKs and licence texts are runtime companions to the binary.
 
-- **Linux:** x64, glibc 2.35+ and libstdc++ with `GLIBCXX_3.4.30` (Ubuntu 22.04+), a recent NVIDIA GPU and its hardware-ray-tracing Vulkan driver.
+- **Linux:** x64, glibc 2.35+ and libstdc++ with `GLIBCXX_3.4.30` (Ubuntu 22.04+), a recent NVIDIA GPU and its hardware-ray-tracing Vulkan driver, or an AMD GPU on a Vulkan driver that exposes ray queries (Mesa RADV).
 - **Windows:** x64 Windows 10/11, a recent NVIDIA GPU and its hardware-ray-tracing Vulkan driver.
-- **Mac:** Apple Silicon with Metal, macOS 26 for the bundled Slang toolchain. Older macOS versions are unqualified. Intel Macs are unsupported. H.264 uses system VideoToolbox.
+- **Mac:** Apple Silicon with Metal, macOS 15 or newer. Intel Macs are unsupported. H.264 uses system VideoToolbox.
 
 For TypeScript authoring, install **Node 22.18+** (with npm) from
 [nodejs.org](https://nodejs.org/en/download). For Python authoring, install
@@ -439,7 +439,8 @@ also need `xz-utils` to unpack Node's `.tar.xz` download.
 
 ### Linux
 
-Install the NVIDIA driver for your GPU first. On Ubuntu 22.04+:
+Install the NVIDIA driver for your GPU first, or for AMD the Mesa RADV driver
+(plus the ROCm runtime for GPU denoising). On Ubuntu 22.04+:
 
 ```sh
 sudo apt-get update
@@ -463,8 +464,9 @@ A custom `PREFIX` leaves startup files alone unless you also set `VORK_MODIFY_PA
 which adds `PREFIX/bin` using the same shell startup files as the default install.
 For example: `PREFIX="$HOME/tools/vork" VORK_MODIFY_PATH=1 sh install.sh`.
 `VORK_NO_MODIFY_PATH=1` always prevents PATH edits, including when opt-in is set. Linux MP4 needs ffmpeg even when NVENC encodes frames, because ffmpeg
-muxes the stream. Native NVENC is attempted on NVIDIA; otherwise encoding uses a
-readback fallback. Older GPUs and software Vulkan adapters are unsupported.
+muxes the stream. Native NVENC is attempted on NVIDIA; if it cannot start, FFmpeg NVENC
+encodes after readback, and software libx264 is used when neither is available, with the
+reason reported. Other Linux adapters encode MP4 with libx264 at its quality target. Older GPUs and software Vulkan adapters are unsupported.
 A100, H100, H200, B200 and B300 lack the required hardware ray tracing; recency
 alone does not make an NVIDIA GPU suitable. Containers also need working NVIDIA
 Vulkan driver discovery; passing through a GPU alone may not be sufficient.
@@ -474,8 +476,8 @@ in a headless container. See [Vulkan driver discovery](docs/REMOTE-GPU.md#vulkan
 
 ### Mac
 
-The bundled Slang compiler requires macOS 26. Older macOS versions have not been
-qualified; a successful `vork --version` alone does not test Slang.
+Use Apple Silicon with macOS 15 or newer. A successful `vork --version` alone
+does not test the bundled Slang compiler; run `vork setup` before rendering.
 
 In Terminal:
 
@@ -540,7 +542,8 @@ The separately downloadable `install.sh` downloads the release from GitHub; to i
 have without downloading again, use these steps.
 
 Download your platform's `.tar.gz` and `SHA256SUMS` from the release page into a
-new empty folder. In that folder, verify and install the entire archive:
+new empty folder. (The release also has the same tree as a smaller `.tar.xz`, which `install.sh`
+downloads when it finds `xz` or a tar that reads xz; these steps use the `.tar.gz`.) In that folder, verify and install the entire archive:
 
 ```sh
 set -- vork-*.tar.gz
@@ -585,7 +588,9 @@ Keep npm's optional dependencies enabled: they carry the platform runtime.
 
 ### pip
 
-Coming soon. Use the installers above for the Python SDK in the meantime.
+`pip install vork` installs the Python SDK from PyPI. Install the renderer separately
+with `npm install -g @voyager-so/vork` or the platform installer above.
+Use matching SDK and renderer versions.
 
 ### First render and SDKs
 
@@ -623,8 +628,16 @@ vork render model.json --profile std/final --out model.png
 Adjust the camera and light for your model's scale. glTF files can refer to
 textures and buffers beside them; keep those files together.
 
-Setup warms the `vork init` starter at the default `std/final` profile on your GPU, with a
-ten-minute limit. Use `vork setup --skip-warmup` to check tools only; add `--verbose` for raw encoder probe diagnostics. You can
+Setup builds the prebuilt path engine (the same few pipelines for every scene) and warms the
+`vork init` starter at the default `std/final` profile on your GPU, with a ten-minute limit.
+Without setup, a cold path render compiles its scene kernel before the picture, then exits;
+it does not build the shared engine afterward. On an NVIDIA L4, path-glass and path-many-lights
+at `std/path` took about 50–60 s to picture and exit, and about 1 s on immediate repeat at authored
+resolution. Repeats reuse the saved scene kernel.
+With a warm engine, supported scenes draw with it while their own kernel compiles in a detached
+background process; delivery and exit do not wait for it. Scenes the engine cannot draw
+(authored programs or a participating medium, say) compile their own kernel before the first frame.
+Use `vork setup --skip-warmup` to check tools only; add `--verbose` for raw encoder probe diagnostics. You can
 interrupt setup safely: completed cache entries survive and remaining pipelines
 compile when needed. Run setup again to continue, or use `vork setup --all` for
 the exhaustive catalogue without the time limit. Device cache blobs are never
@@ -649,8 +662,8 @@ python -m pip install "$HOME/.local/lib/vork/python"
 npm install "$HOME/.local/lib/vork/sdk"
 ```
 
-The SDKs install from your vork folder, not from npm or PyPI. The npm package named
-`vork` is unrelated, and the PyPI package only points back here.
+You can also install the SDKs from registries: `pip install vork` for Python or
+`npm install @voyager-so/vork` for TypeScript. The npm package named `vork` is unrelated.
 
 On Windows (PowerShell):
 
@@ -678,6 +691,8 @@ automatically. First-use compilation can take several minutes. vork's pipeline
 cache is disabled to avoid a lavapipe crash; portable shader artifacts and Mesa's
 own shader disk cache can still speed later runs.
 See [build instructions](docs/BUILD.md#opt-in-cpu-rendering) for platform details.
+
+Contributors: [@Bortlesboat](https://github.com/Bortlesboat) (Windows installation wording) and [@lunar-me](https://github.com/lunar-me) (GPU requirement wording).
 
 ## Licence
 

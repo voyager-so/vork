@@ -2,4 +2,9 @@
 # paste is used only by pulp's SIMD proc macros (via our vendored exr).
 # RUSTSEC-2024-0436 reports maintenance status, not a known vulnerability.
 # Keep until pulp replaces paste; no vulnerability/severity class is exempted.
-ignore = ["RUSTSEC-2024-0436"]
+# rustybuzz (RUSTSEC-2026-0206) and ttf-parser (RUSTSEC-2026-0192) are unmaintained-only notices with no
+# patched release. Moda's text core (moda-text) shapes with rustybuzz 0.20 and draws SVG glyphs with resvg
+# 0.47, as Moda does; ttf-parser arrives through rustybuzz, usvg and cosmic-text 0.19's fontdb (cosmic-text
+# 0.19 is the newest release). Replacing them means rewriting Moda's shaping on harfrust/skrifa, which the
+# port does not do. Revisit when Moda moves off rustybuzz or cosmic-text/usvg drop ttf-parser.
+ignore = ["RUSTSEC-2024-0436", "RUSTSEC-2026-0206", "RUSTSEC-2026-0192"]

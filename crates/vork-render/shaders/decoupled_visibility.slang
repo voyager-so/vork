@@ -14,13 +14,21 @@ import decoupled_fragments;
 import transparent_opacity;
 import implicit_scene;
 import camera_ray;
+#ifdef VORK_SOFTWARE_RASTER
+import software_surface;
+#endif
 
 VisibilityOutput visible(Visibility v,uint primitive,bool front,bool single) {
     var depth=v.position.z;
     if(field_descriptor(v.object)!=0xffffffffu) {
         let hit=camera_field(v.object,v.sample,v.position,front,v.mirrored);
         depth=field_depth(v.object,hit);primitive=0xffffffffu;
-    } else if(single && front==(v.mirrored!=0u)) discard;
+    } else {
+        if(single && front==(v.mirrored!=0u)) discard;
+#ifdef VORK_SOFTWARE_RASTER
+        depth=software_visibility_surface(v.object,primitive,v.position,v.sample).position.z;
+#endif
+    }
     var position=v.position;position.z=depth;
     opaque_depth(v.sample,position);
     return VisibilityOutput(visibility_key(v.object,primitive),depth);
@@ -121,8 +129,17 @@ TransparentDepth transparent_fragments_fs(Varying v, uint primitive : SV_Primiti
         }
         return TransparentDepth(depth);
     }
+#ifdef VORK_SOFTWARE_RASTER
+    v=software_visibility_surface(v.object,primitive,v.position,v.sample);depth=v.position.z;
+#endif
     let list=FragmentLayout(fragments[2],fragments[3],fragments[4]);
+#ifdef VORK_SOFTWARE_RASTER
+    // Storage writes require explicit rejection; late depth testing alone
+    // cannot undo a fragment-list insertion.
+    if(true) {
+#else
     if(frame.field_geometry.z!=0u) {
+#endif
         let stored=fragments[list.depth(v.sample,uint2(v.position.xy),max(frame.sampling.w,1u))];
         if(stored!=0u && depth>asfloat(~stored)) discard;
     }

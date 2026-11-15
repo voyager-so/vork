@@ -56,7 +56,9 @@ written into each render metadata sidecar. Check this array before accepting a r
 Each summary contains `frames`, `coverage` (mean alpha), `clipped`, `near_black`, `mean`, and
 `worst_clipped`/`worst_near_black` (`share`, absolute `frame`). EXR and control-only
 outputs have no entry. Statistics weight display RGB by alpha; empty coverage gives
-null metrics and worst-frame entries. Clip averages exclude empty frames. Values
+null metrics and worst-frame entries. Clip averages exclude empty frames. `clipped` is a display
+channel at 99% or more, where a view ran out of range; a canvas with no world, view or
+compositor shows authored colours as they are and gives null `clipped` and `worst_clipped`. Values
 retain full precision from the output metadata.
 
 Surface programs author emitted light once with OpenPBR `emission_color` and

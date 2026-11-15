@@ -6,6 +6,7 @@
 import vork_constants;
 import closure;
 import openpbr_core;
+import dielectric_interface;
 struct SubsurfaceSlab { float3 reflection; float3 transmission; };
 float2 slab_channel(float albedo,float radius,float thickness) {
     let a=clamp(albedo,0.,1.);
@@ -38,7 +39,7 @@ bool thickness_active(Closure c) {
 // Diffuse throughput shared by raster light integration and path next events.
 float3 subsurface_transmission(Closure c,float3 normal,float3 view,float3 incident,float thickness) {
     let ni=max(-dot(normal,incident),0.);let nv=max(dot(normal,view),0.);
-    let entry=1.-fresnel(ni,c.specular_ior);let exit=1.-fresnel(nv,c.specular_ior);
+    let entry=1.-fresnel(ni,dielectric_ior(c));let exit=1.-fresnel(nv,dielectric_ior(c));
     return subsurface_slab(c,thickness).transmission*(entry*exit*c.base_weight*c.subsurface_weight*(1.-c.base_metalness)*(1.-c.transmission_weight));
 }
 // Query only outward crossings of the receiver's own mesh. Do not let another

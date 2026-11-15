@@ -40,7 +40,11 @@ MaterialUv material_uv(Varying v, float2 dx0, float2 dy0, float2 dx1, float2 dy1
     material_attributes[7]=v.attr7;
 #endif
 #if VORK_ATTRIBUTES > 8
+#ifdef VORK_STAGE_SCALARS
+    [unroll] for(uint i=8u;i<VORK_ATTRIBUTES;i++) material_attributes[i]=attribute_extra(v,i-8u);
+#else
     [unroll] for(uint i=8u;i<VORK_ATTRIBUTES;i++) material_attributes[i]=v.attr_extra[i-8u];
+#endif
 #endif
     material_instance_attributes(objects[v.object].reserved);
     let uv1=select(abs(v.TANGENT.w)>=2.,float2(0.),v.TEXCOORD_1);

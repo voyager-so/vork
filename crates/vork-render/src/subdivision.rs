@@ -99,7 +99,7 @@ pub(crate) fn prepare(
     // on a split position/attribute buffer.
     crate::gpu_memory::storage_binding(&limits, "subdivision positions", vertices * 12, "reduce subdivision level or source mesh size")?;
     ensure!(indices_count*4 <= limits.max_buffer_size,
-        "{}", crate::gpu_memory::limit_message("subdivision triangle indices", format_args!("{} bytes",indices_count*4), format_args!("max_buffer_size={} bytes",limits.max_buffer_size), "reduce subdivision level or source mesh size"));
+        crate::gpu_memory::device_limit("subdivision triangle indices", format_args!("{} bytes",indices_count*4), format_args!("max_buffer_size={} bytes",limits.max_buffer_size), "reduce subdivision level or source mesh size"));
     let path = r.disk_cache.path("subdivision", 2, key.finalize());
     if let Some(bytes) = disk_cache::read(&path) {
         if let Ok(mut baked) = serde_json::from_slice::<Baked>(&bytes) {
@@ -232,19 +232,8 @@ impl CpuDeform {
         morphs: Vec<[f32; 3]>,
         joints: usize,
     ) -> Result<Self> {
-        for influence in &mut influences {
-            let sum: f32 = influence.WEIGHTS_0.iter().sum();
-            ensure!(
-                sum.is_finite()
-                    && sum > 0.
-                    && influence.WEIGHTS_0.iter().all(|w| w.is_finite() && *w >= 0.)
-                    && influence.JOINTS_0.iter().all(|j| (*j as usize) < joints),
-                "invalid subdivision skin weights"
-            );
-            for weight in &mut influence.WEIGHTS_0 {
-                *weight /= sum;
-            }
-        }
+        crate::deformation::normalize(&mut influences, refinement.positions.len(), 1, joints)
+            .map_err(|_| anyhow::anyhow!("invalid subdivision skin weights"))?;
         Ok(Self {
             base: Vec::new(),
             refinement,
@@ -264,29 +253,8 @@ impl CpuDeform {
         matrices: &[Mat4],
         weights: &[f32],
     ) -> (Vec<[f32; 3]>, Vec<[f32; 3]>) {
-        let count = self.refinement.positions.len();
-        let cage: Vec<_> = self
-            .refinement
-            .positions
-            .iter()
-            .enumerate()
-            .map(|(i, p)| {
-                let mut p = Vec3::from(*p);
-                for (target, &weight) in weights.iter().enumerate() {
-                    if weight != 0. {
-                        p += Vec3::from(self.morphs[target * count + i]) * weight;
-                    }
-                }
-                let inf = &self.influences[i];
-                let mut out = Vec3::ZERO;
-                for (&joint, &weight) in inf.JOINTS_0.iter().zip(&inf.WEIGHTS_0) {
-                    if weight != 0. {
-                        out += matrices[joint as usize].transform_point3(p) * weight;
-                    }
-                }
-                out.to_array()
-            })
-            .collect();
+        let cage = crate::deformation::positions(&self.refinement.positions,
+            &self.influences, 1, &self.morphs, matrices, weights);
         self.refinement.evaluate(&cage)
     }
 }
@@ -337,9 +305,10 @@ pub(crate) fn frame_resources(
 mod tests {
     use super::*;
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     #[cfg(vork_private_tests)] // Uses private subdivision scenes.
     fn subdivision_fixture_frames_preserve_repeated_requests() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         for (name,source) in [
             ("skin",include_str!("../../../examples/subdivision-skin.json")), // export-example-private: cfg(vork_private_tests) fixture
             ("morph",include_str!("../../../examples/subdivision-deform.json")), // export-example-private: cfg(vork_private_tests) fixture

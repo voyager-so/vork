@@ -1,10 +1,13 @@
 ERRORS: exit codes: 0 success; 2 usage; 3 invalid scene or program;
-4 device, GPU memory, encoder or setup; 5 filesystem IO.
+4 device, GPU memory, encoder or setup, and any other error not known to be the scene's
+(5 when that error is filesystem IO).
 A stdout consumer closing its pipe early exits successfully. Other stdout write failures
 are filesystem IO errors.
-A frame the renderer refuses (non-finite radiance, say) stops a video. A PNG or EXR
-sequence skips it and renders the rest of the range, then exits non-zero naming the
-refused frames, without meta.json.
+A frame the renderer refuses (non-finite radiance, say) stops the render, a video or a
+sequence alike: frames already written stay, without meta.json. A 2D canvas writing a
+PNG or EXR sequence skips a frame whose view or compositor result is not finite and
+renders the rest of the range, then exits non-zero naming the refused frames, without
+meta.json.
 
 If setup cannot open a GPU on Linux, it checks Vulkan ICD driver files and names
 libraries that cannot load or expose Vulkan entry points. A GPU visible in

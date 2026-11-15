@@ -25,22 +25,22 @@ import surface_lighting;
 import subsurface_transport;
 import probes;
 // probes::update_entries: the scene globals (frame.slang) occupy bindings 0-9.
-[[vk::binding(10,0)]] RaytracingAccelerationStructure ray_scene : register(t5);
-[[vk::binding(11,0)]] StructuredBuffer<uint> ray_alpha : register(t6);
+[[vk::binding(11,0)]] RaytracingAccelerationStructure ray_scene : register(t6);
+[[vk::binding(12,0)]] StructuredBuffer<uint> ray_alpha : register(t7);
 // Per probe and batch ray: radiance/distance, then validity (x: near a
 // coverage-accepted boundary). Optional emitter radiance and direction follow.
 // Validity has its own record: darkness and zero-distance hits are not sentinels.
-[[vk::binding(12,0)]] RWStructuredBuffer<float4> traced : register(u7);
+[[vk::binding(13,0)]] RWStructuredBuffer<float4> traced : register(u8);
 // Per probe: REG_PROBE_VEC4S record sums, then the depth-moment texel sums.
-[[vk::binding(13,0)]] RWStructuredBuffer<float4> sums : register(u8);
-[[vk::binding(14,0)]] RWStructuredBuffer<float4> probe_output : register(u9);
-[[vk::binding(15,0)]] RWStructuredBuffer<float2> visibility_output : register(u10);
+[[vk::binding(14,0)]] RWStructuredBuffer<float4> sums : register(u9);
+[[vk::binding(15,0)]] RWStructuredBuffer<float4> probe_output : register(u10);
+[[vk::binding(16,0)]] RWStructuredBuffer<float2> visibility_output : register(u11);
 // x: this batch's first ray; y: rays per batch; z: gathered slots per probe
 // (all records and moments on bounce zero, just records on later bounces).
 // w: later lighting generation; invalid preceding support cannot transport light.
 struct ProbeBatch {uint4 rays;};
-[[vk::binding(16,0)]] ConstantBuffer<ProbeBatch> batch : register(b11);
-[[vk::binding(17,0)]] StructuredBuffer<float> probe_emitter_weights : register(t12);
+[[vk::binding(17,0)]] ConstantBuffer<ProbeBatch> batch : register(b12);
+[[vk::binding(18,0)]] StructuredBuffer<float> probe_emitter_weights : register(t13);
 #ifdef VORK_METAL
 [[vk::binding(0,3)]] ParameterBlock<RayHitBuffersTable> ray_hit_buffers : register(VORK_HIT_REGISTER);
 #else
@@ -64,13 +64,13 @@ export TraceHit native_geometric_trace(float3 origin,float3 direction,float mini
 #endif
 
 // Capture hits use the shared correlated source/BSDF visibility estimator.
-struct ProbeShadows<P:IProgram> : IShadows {
+struct ProbeShadows<V:IVariant,P:IProgram> : IShadows {
     static const bool probe_rays=true;
     static bool probe_visible(float3 world,float3 normal,float3 position_error,float3 probe) {return probe_connection_visible<P,ProbeGeometry>(ProbeGeometry(ray_alpha,ray_hit_buffers),ray_scene,ray_alpha,world,normal,position_error,probe);}
     static uint integration_count(uint index,out float3 normalization) {let count=index==0xffffffffu ? sample_count() : 1u;normalization=float3(float(count));return count;}
     static float3 integration_sample(uint tap,inout uint index,inout float3 world) {if(index==0xffffffffu) {index=tap;}return float3(1.);}
     static uint sample_count() {return probe_sample_count();}
-    static float3 visibility_direction(float3 world,float3 normal,LightValues record,uint light,float3 direction,float distance,float3 position_error,uint index,uint count,bool fibre=false) {return hit_shadow_direction<P,ProbeGeometry>(ProbeGeometry(ray_alpha,ray_hit_buffers),ray_scene,ray_alpha,light,world,normal,position_error,direction,distance,index,count,true);}
+    static float3 visibility_direction(float3 world,float3 normal,LightValues record,uint light,float3 direction,float distance,float3 position_error,uint index,uint count,bool fibre=false) {return hit_shadow_direction<P,ProbeGeometry,V>(ProbeGeometry(ray_alpha,ray_hit_buffers),ray_scene,ray_alpha,light,world,normal,position_error,direction,distance,index,count,true);}
     static const bool subsurface=true;
     static float thickness(uint object,float3 world,float3 direction) {return subsurface_exit(ray_scene,object,world,direction);}
 };
@@ -128,7 +128,7 @@ float3 probe_source<P:IProgram>(uint probe,uint ray,float3 from,out float3 direc
     let pdf=probe_emitter_pdf<P>(selected.instance,selected.primitive,selected.object,selected.barycentrics,inverse,from);
     if(pdf<=0.) {return float3(0.);}
     let intersection=RayIntersection(selected.instance,selected.object,selected.primitive,selected.barycentrics);
-    if(!candidate_accepts<P,ProbeGeometry>(ProbeGeometry(ray_alpha,ray_hit_buffers),ray_alpha,intersection,inverse,direction,float2(0.))) {return float3(0.);}
+    if(!candidate_accepts<P,ProbeGeometry>(ProbeGeometry(ray_alpha,ray_hit_buffers),ray_alpha,intersection,dot(geometry.face,-direction)>0.,inverse,direction,float2(0.))) {return float3(0.);}
     let source=hit_surface<Unspecialized,P,ProbeGeometry>(ProbeGeometry(ray_alpha,ray_hit_buffers),selected.instance,selected.primitive,selected.object,inverse,selected.barycentrics,direction,float2(0.));
     if(source.s.discarded) {return float3(0.);}
     let emitted=emitter_mesh_radiance<Unspecialized,P>(source);
@@ -158,9 +158,12 @@ ProbeSurfaceHit probe_surface_hit<P:IProgram,let directional:bool>(RayDesc desc,
         let cull=side==0u ? RAY_FLAG_CULL_BACK_FACING_TRIANGLES : RAY_FLAG_CULL_FRONT_FACING_TRIANGLES;
         query.TraceRayInline(ray_scene,RAY_FLAG_FORCE_NON_OPAQUE|cull,directional ? REG_RAY_SPECULAR : REG_RAY_GI_OCCLUDER,desc);
         while(query.Proceed()) {
+            // Double-sided instance flags disable hardware culling. These two
+            // searches still own disjoint geometric sides for boundary ordering.
+            if(query.CandidateTriangleFrontFace()!=(side==0u)) continue;
             let hit=RayIntersection(query.CandidateInstanceIndex(),query.CandidateInstanceID(),query.CandidatePrimitiveIndex(),query.CandidateTriangleBarycentrics());
             let accepts=directional
-                ? reflection_candidate_accepts<P,ProbeGeometry>(ProbeGeometry(ray_alpha,ray_hit_buffers),ray_alpha,hit,query.CandidateWorldToObject3x4(),desc.Direction,float2(0.),uint2(probe_identity(probe),0u),probe_sample_index(ray),probe_sample_count())
+                ? reflection_candidate_accepts<P,ProbeGeometry>(ProbeGeometry(ray_alpha,ray_hit_buffers),ray_alpha,hit,query.CandidateTriangleFrontFace(),query.CandidateWorldToObject3x4(),desc.Direction,float2(0.),uint2(probe_identity(probe),0u),probe_sample_index(ray),probe_sample_count())
                 : candidate_coverage<P,ProbeGeometry>(ProbeGeometry(ray_alpha,ray_hit_buffers),ray_alpha,hit,query.CandidateWorldToObject3x4(),desc.Direction,float2(0.))>=1.;
             if(!accepts) {continue;}
             near_boundary=near_boundary || query.CandidateTriangleRayT()<=origin_error+length(surface_position_error(hit.instance_custom_data,probe_position_index(probe)));
@@ -207,7 +210,7 @@ void probe_trace<V:IVariant,P:IProgram>(uint3 group,uint thread) {
             let h=hit_surface<V,P,ProbeGeometry>(ProbeGeometry(ray_alpha,ray_hit_buffers),hit.instance_index,hit.primitive_index,hit.instance_custom_data,nearest.inverse,hit.barycentrics,direction,float2(0.),Lobe(select(P.lobes,LOBE_PICK,0u),u));
             float3 emission;
             var radiance=float3(0.);
-            radiance=finalized_hit_radiance<V,ProbeShadows<P>,P>(h,uint2(probe_identity(probe),0u),probe_sample_index(ray),REG_RAY_DIFFUSE,emission,indirect_only,true);
+            radiance=finalized_hit_radiance<V,ProbeShadows<V,P>,P>(h,uint2(probe_identity(probe),0u),probe_sample_index(ray),REG_RAY_DIFFUSE,emission,indirect_only,true);
             if(!indirect_only && probe_grid().visibility_policy.w!=0u) {
                 let pdf=probe_emitter_pdf<P>(hit.instance_index,hit.primitive_index,hit.instance_custom_data,hit.barycentrics,nearest.inverse,position);
                 radiance-=emission*(1.-probe_mis(1./(4.*REG_PI),pdf));
@@ -324,7 +327,7 @@ float4 probe_directional_capture<V:IVariant,P:IProgram>(uint probe,uint ray,floa
     if(ray_alpha[hit.instance_index*REG_RAY_SLOT_WORDS+2u]!=REG_RAY_NO_ALPHA) {
     let u=select(P.lobes,float(screen_ray_hash(uint2(probe_identity(probe),probe_sample_index(ray)),0u,REG_SAMPLING_STREAM_RAY_GI_LOBE))*REG_RADICAL_INVERSE_SCALE,0.);
     let h=hit_surface<V,P,ProbeGeometry>(ProbeGeometry(ray_alpha,ray_hit_buffers),hit.instance_index,hit.primitive_index,hit.instance_custom_data,nearest.inverse,hit.barycentrics,direction,float2(0.),Lobe(select(P.lobes,LOBE_PICK,0u),u));
-    float3 emission;radiance=finalized_hit_radiance<V,ProbeShadows<P>,P>(h,uint2(probe_identity(probe),0u),probe_sample_index(ray),REG_RAY_DIFFUSE|REG_RAY_SPECULAR,emission,false,true);
+    float3 emission;radiance=finalized_hit_radiance<V,ProbeShadows<V,P>,P>(h,uint2(probe_identity(probe),0u),probe_sample_index(ray),REG_RAY_DIFFUSE|REG_RAY_SPECULAR,emission,false,true);
     }
     return float4(radiance,distance);
 }

@@ -21,14 +21,28 @@ fn program_input_help() {
         let declarations = source.split_once("struct Inputs {").unwrap().1.split_once("};").unwrap().0;
         for field in inputs.fields {
             // Read initializers from the bundled source rather than duplicating defaults.
-            let initializer = declarations.lines().find_map(|line| {
+            let declaration = declarations.lines().find_map(|line| {
                 let (declaration, value) = line.split_once('=')?;
                 (declaration.split_whitespace().last()? == field.name)
-                    .then(|| value.split_once(';').expect("bundled input initializer").0.trim())
-            }).unwrap_or("zero (unbound resource)");
+                    .then(|| (value.split_once(';').expect("bundled input initializer").0.trim(), line))
+            });
+            let initializer = declaration.map_or("zero (unbound resource)", |(value, _)| value);
+            if let (vork_slang::Type::Float, Some(range)) = (&field.ty, &field.range) {
+                let value = initializer.parse::<f64>().expect("numeric initializer");
+                let valid = (value > range.min || (range.min_closed && value == range.min))
+                    && (value < range.max || (range.max_closed && value == range.max));
+                if !valid {
+                    // Contextual defaults are internal sentinels, not authorable values.
+                    let meaning = declaration.unwrap().1.split_once("// Unbound:")
+                        .expect("out-of-range initializer needs an Unbound help sentence").1.trim();
+                    assert!(!meaning.is_empty());
+                    writeln!(text, "{program}.{}: {meaning}", field.name).unwrap();
+                    continue;
+                }
+            }
             let default = if initializer == "zero (unbound resource)" {
                 if vork_scene::libraries::LIBRARIES.iter().flat_map(|library| library.images)
-                    .any(|(name, input, _)| *name == program && *input == field.name) {
+                    .any(|data| data.program == program && data.input == field.name) {
                     "bundled image".to_owned()
                 } else { "unbound".to_owned() }
             } else if field.enumeration.is_some() {

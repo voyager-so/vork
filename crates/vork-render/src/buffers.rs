@@ -173,6 +173,39 @@ pub(crate) struct AttributeData {
     pub(crate) width: usize,
 }
 impl AttributeData {
+    pub(crate) fn file(buffer: &::vork_scene::v2::Buffer, base: &Path) -> Result<(std::fs::File, u64)> {
+        let path = base.join(
+            buffer
+                .file
+                .as_ref()
+                .context("buffer requires data or file")?,
+        );
+        let file = crate::source_file(&path)
+            .with_context(|| format!("open buffer {}", path.display()))?;
+        let available = file
+            .metadata()?
+            .len()
+            .checked_sub(buffer.offset)
+            .context("buffer offset exceeds file")?;
+        let stride = buffer.element_type.width()
+            .checked_mul(std::mem::size_of::<u32>())
+            .context("buffer stride overflow")?;
+        let length = if let Some(count) = buffer.len() {
+            u64::try_from(count)?
+                .checked_mul(stride as u64)
+                .context("buffer size overflow")?
+        } else {
+            ensure!(
+                available % stride as u64 == 0,
+                "buffer file has a partial element"
+            );
+            available
+        };
+        ensure!(length <= available, "buffer file is too short");
+        ensure!(length > 0, "buffer is empty");
+        Ok((file, length))
+    }
+
     pub(crate) fn decode(buffer: &::vork_scene::v2::Buffer, base: &Path) -> Result<Self> {
         use ::vork_scene::v2::BufferType;
         ensure!(buffer.grid.is_none(), "grid buffers cannot be used as numeric attributes");
@@ -212,35 +245,9 @@ impl AttributeData {
         } else if buffer.dims.is_some() && buffer.file.is_none() {
             vec![0; buffer.len().context("dense grid size overflow")?.checked_mul(width).context("dense grid size overflow")?]
         } else {
-            let path = base.join(
-                buffer
-                    .file
-                    .as_ref()
-                    .context("buffer requires data or file")?,
-            );
+            let path = base.join(buffer.file.as_ref().context("buffer requires a file")?);
             use std::io::{Read, Seek, SeekFrom};
-            let mut file = std::fs::File::open(&path)
-                .with_context(|| format!("open buffer {}", path.display()))?;
-            let available = file
-                .metadata()?
-                .len()
-                .checked_sub(buffer.offset)
-                .context("buffer offset exceeds file")?;
-            let stride = width
-                .checked_mul(std::mem::size_of::<u32>())
-                .context("buffer stride overflow")?;
-            let length = if let Some(count) = buffer.len() {
-                u64::try_from(count)?
-                    .checked_mul(stride as u64)
-                    .context("buffer size overflow")?
-            } else {
-                ensure!(
-                    available % stride as u64 == 0,
-                    "buffer file has a partial element"
-                );
-                available
-            };
-            ensure!(length <= available, "buffer file is too short");
+            let (mut file, length) = Self::file(buffer, base)?;
             let mut bytes = vec![0; usize::try_from(length)?];
             file.seek(SeekFrom::Start(buffer.offset))?;
             file.read_exact(&mut bytes)
@@ -302,20 +309,28 @@ impl SceneBuffers {
     pub(crate) fn decode(scene: &::vork_scene::v2::Scene, base: &Path) -> Result<Self> {
         let mut data = std::collections::BTreeMap::new();
         let mut grids = std::collections::BTreeMap::new();
+        let mut errors = Vec::new();
         for (name, buffer) in &scene.buffers {
+            let result = (|| -> Result<()> {
             if buffer.dims.is_some() && buffer.is_volume_grid() {
                 grids.insert(name.clone(), crate::vdb::Grid { words: Vec::new(), bounds: (Vec3::splat(-1.), Vec3::ONE) });
             }
             if buffer.grid.is_some() {
                 grids.insert(name.clone(), crate::vdb::Grid::load(buffer, base)
                     .with_context(|| format!("buffer {name}"))?);
-                continue;
+                return Ok(());
             }
             data.insert(
                 name.clone(),
                 AttributeData::decode(buffer, base).with_context(|| format!("buffer {name}"))?,
             );
+            Ok(())
+            })();
+            if let Err(error) = result {
+                errors.push(format!("{error:#}; restore the buffer/grid file or correct its data, offset and count"));
+            }
         }
+        ensure!(errors.is_empty(), "{}", errors.join("\n"));
         for (name, geometry) in &scene.geometry {
             if !crate::computed_geometry::dynamic(scene, geometry) {
                 if let Some(ids) = &geometry.ids {
@@ -1365,7 +1380,7 @@ impl ProgramBuffers {
                 identity.update(bytemuck::cast_slice(&data.words));
                 initial_identity.insert(name.clone(), identity.finalize());
             }
-            ensure!(data.width <= limit, "{}", crate::gpu_memory::limit_message(format_args!("compute buffer {name} element"), format_args!("{} words",data.width), format_args!("{limit} words"), "reduce the compute element width"));
+            ensure!(data.width <= limit, crate::gpu_memory::device_limit(format_args!("compute buffer {name} element"), format_args!("{} words",data.width), format_args!("{limit} words"), "reduce the compute element width"));
             let mut spans = Vec::new();
             let mut first = 0;
             while first < data.count() {

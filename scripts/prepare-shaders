@@ -28,7 +28,10 @@ if (root / 'scenes').is_dir():
         'examples/jitter-aa.json', # export-example-private: guarded by private scenes directory
         'examples/sampled-shadows.json', # export-example-private: guarded by private scenes directory
         'scenes/path-cornell.json',
+        'scenes/release/environment-image.json',
+        'scenes/release/environment-unlit.json',
         'scenes/hair/chiang-color.json',
+        'scenes/release/coated-thin-gltf.json',
     )]
 if a.output.exists():
     p.error('output already exists')

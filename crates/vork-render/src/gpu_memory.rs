@@ -6,14 +6,16 @@ use std::{
 };
 
 /// Shared diagnostic for resource and dispatch admission against a known device limit.
-pub(crate) use vork_encode::gpu_memory::limit_message;
+pub(crate) use vork_encode::gpu_memory::device_limit;
+/// A refusal naming a feature or capacity this device lacks: a device failure wherever it surfaces.
+pub(crate) use vork_encode::DeviceLimit;
 
 /// Check the complete binding, with recovery advice specific to its allocation.
 /// Allocation capacity alone does not imply that a buffer can be bound whole.
 pub(crate) fn storage_binding(limits: &wgpu::Limits, label: &str, bytes: u64, remedy: &str) -> Result<()> {
     anyhow::ensure!(
         bytes <= limits.max_storage_buffer_binding_size && bytes <= limits.max_buffer_size,
-        "{}", limit_message(label, format_args!("{bytes} bytes in one storage binding"),
+        device_limit(label, format_args!("{bytes} bytes in one storage binding"),
             format_args!("max_storage_buffer_binding_size={} bytes, max_buffer_size={} bytes", limits.max_storage_buffer_binding_size, limits.max_buffer_size), remedy)
     );
     Ok(())
@@ -60,7 +62,7 @@ pub(crate) fn frame_bindings<const N: usize>(
     } else {
         remedies.join(", or ")
     };
-    anyhow::bail!("{}", limit_message(label,
+    anyhow::bail!(device_limit(label,
         format_args!("{needed} bytes at {width}x{height} with {samples} samples"),
         format_args!("max_storage_buffer_binding_size={} bytes, max_buffer_size={} bytes (camera budget ceiling at this extent={fewer} samples)", limits.max_storage_buffer_binding_size, limits.max_buffer_size),
         &advice))
@@ -82,6 +84,8 @@ pub(crate) fn wait(device: &wgpu::Device, queue: &wgpu::Queue, errors: &Errors, 
             Ok(_) => return errors.check(),
             Err(wgpu::PollError::Timeout) => {
                 crate::command_finish::Segments::flush(queue);
+                #[cfg(test)]
+                WAIT_HEARTBEATS.with(|count| count.set(count.get() + 1));
                 errors.check()?;
             }
             Err(error) => {
@@ -91,6 +95,15 @@ pub(crate) fn wait(device: &wgpu::Device, queue: &wgpu::Queue, errors: &Errors, 
         }
     }
 }
+
+// Timeout heartbeats submitted by `wait` on this thread, so submission-count
+// tests can tell them from the submissions their subject owes.
+#[cfg(test)]
+thread_local! {
+    static WAIT_HEARTBEATS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+#[cfg(test)]
+pub(crate) fn wait_heartbeat_count() -> usize { WAIT_HEARTBEATS.with(|count| count.get()) }
 
 thread_local! {
     static CREATING: RefCell<Option<Request>> = const { RefCell::new(None) };
@@ -447,7 +460,7 @@ mod tests {
                 for (line, text) in source.lines().enumerate() {
                     if !variants.iter().any(|phrase| text.contains(phrase)) { continue; }
                     assert!(path.file_name().is_some_and(|name| name == "gpu_memory.rs") && text.trim() == canonical,
-                        "{}:{}: device-limit refusal must use gpu_memory::limit_message", path.display(), line+1);
+                        "{}:{}: device-limit refusal must use gpu_memory::device_limit", path.display(), line+1);
                     helper_count += 1;
                 }
             }
@@ -567,10 +580,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn lost_device_initialized_buffers_report_instead_of_panicking() -> Result<()> {
-        let Some(renderer) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let renderer = crate::test_renderer()?;
         renderer.device.destroy();
         // wgpu reports a destroyed device's loss from the next poll.
         let _ = renderer.device.poll(wgpu::PollType::Poll);
@@ -581,10 +593,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn device_validation_uses_the_normal_error_boundary() -> Result<()> {
-        let Some(renderer) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let renderer = crate::test_renderer()?;
         let size = renderer.device.limits().max_buffer_size + 1;
         let _buffer = buffer(
             &renderer.device,

@@ -107,7 +107,7 @@ pub fn evaluate(argument: &str) -> Result<String> {
     } else {
         [0.; 3]
     };
-    Ok(serde_json::json!({"materials":{i.name.clone():{"program":"std/sky","inputs":{"sun_elevation":i.sun_elevation,"sun_rotation":i.sun_rotation,"altitude":i.altitude,"air_density":i.air_density,"aerosol_density":i.aerosol_density,"ozone_density":i.ozone_density}}},"nodes":[{"type":"light","name":i.name,"shape":"environment","material":i.name},{"type":"light","name":format!("{}_sun",i.name),"shape":"sun","rotation":Quat::from_rotation_arc(Vec3::NEG_Z,-direction).to_array(),"angle":i.sun_size,"color":color,"energy":intensity}]}).to_string())
+    Ok(serde_json::to_string(&serde_json::json!({"materials":{i.name.clone():{"program":"std/sky","inputs":{"sun_elevation":i.sun_elevation,"sun_rotation":i.sun_rotation,"altitude":i.altitude,"air_density":i.air_density,"aerosol_density":i.aerosol_density,"ozone_density":i.ozone_density}}},"nodes":[{"type":"light","name":i.name,"shape":"environment","material":i.name},{"type":"light","name":format!("{}_sun",i.name),"shape":"sun","rotation":Quat::from_rotation_arc(Vec3::NEG_Z,-direction).to_array(),"angle":i.sun_size,"color":color,"energy":intensity}]}))?)
 }
 
 #[cfg(test)]

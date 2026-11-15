@@ -42,17 +42,17 @@ pub(crate) fn gi_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
         ..pipelines::texture_entry(binding, wgpu::TextureSampleType::Float { filterable: false }, false)
     };
     let mut entries = pipelines::global_entries();
-    entries.extend([texture(10), texture(11), storage_entry(12,wgpu::TextureFormat::Rgba32Float), storage_entry(13,wgpu::TextureFormat::Rgba32Float)]);
-    entries.extend(layout_entries(14, compute));
-    entries.push(storage_entry(16,wgpu::TextureFormat::Rgba32Float));
-    entries.push(pipelines::buffer_entry(17,compute,wgpu::BufferBindingType::Uniform));
-    entries.push(pipelines::buffer_entry(18,compute,wgpu::BufferBindingType::Storage {read_only:true}));
-    entries.push(texture(19));
+    entries.extend([texture(11), texture(12), storage_entry(13,wgpu::TextureFormat::Rgba32Float), storage_entry(14,wgpu::TextureFormat::Rgba32Float)]);
+    entries.extend(layout_entries(15, compute));
+    entries.push(storage_entry(17,wgpu::TextureFormat::Rgba32Float));
+    entries.push(pipelines::buffer_entry(18,compute,wgpu::BufferBindingType::Uniform));
+    entries.push(pipelines::buffer_entry(19,compute,wgpu::BufferBindingType::Storage {read_only:true}));
+    entries.push(texture(20));
     entries.push(wgpu::BindGroupLayoutEntry {
         visibility: compute,
-        ..pipelines::texture_entry(21, wgpu::TextureSampleType::Uint, false)
+        ..pipelines::texture_entry(22, wgpu::TextureSampleType::Uint, false)
     });
-    entries.push(pipelines::buffer_entry(20,compute,wgpu::BufferBindingType::Storage {read_only:true}));
+    entries.push(pipelines::buffer_entry(21,compute,wgpu::BufferBindingType::Storage {read_only:true}));
     for e in &mut entries {
         e.visibility = compute;
     }
@@ -106,9 +106,9 @@ pub(crate) fn reflections_hits_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
         ..pipelines::texture_entry(binding, wgpu::TextureSampleType::Float { filterable: false }, false)
     };
     let mut entries = pipelines::global_entries();
-    entries.extend([texture(10), texture(11), texture(12), texture(13)]);
+    entries.extend([texture(11), texture(12), texture(13), texture(14)]);
     entries.push(wgpu::BindGroupLayoutEntry {
-        binding: 14,
+        binding: 15,
         visibility: compute,
         ty: wgpu::BindingType::StorageTexture {
             access: wgpu::StorageTextureAccess::WriteOnly,
@@ -117,13 +117,13 @@ pub(crate) fn reflections_hits_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
         },
         count: None,
     });
-    entries.extend(layout_entries(15, compute));
-    entries.push(pipelines::buffer_entry(17, compute, wgpu::BufferBindingType::Storage {read_only:true}));
+    entries.extend(layout_entries(16, compute));
     entries.push(pipelines::buffer_entry(18, compute, wgpu::BufferBindingType::Storage {read_only:true}));
     entries.push(pipelines::buffer_entry(19, compute, wgpu::BufferBindingType::Storage {read_only:true}));
-    entries.push(pipelines::buffer_entry(20,compute,wgpu::BufferBindingType::Uniform));
-    entries.push(pipelines::buffer_entry(21,compute,wgpu::BufferBindingType::Storage {read_only:false}));
-    entries.push(pipelines::buffer_entry(22,compute,wgpu::BufferBindingType::Storage {read_only:true}));
+    entries.push(pipelines::buffer_entry(20, compute, wgpu::BufferBindingType::Storage {read_only:true}));
+    entries.push(pipelines::buffer_entry(21,compute,wgpu::BufferBindingType::Uniform));
+    entries.push(pipelines::buffer_entry(22,compute,wgpu::BufferBindingType::Storage {read_only:false}));
+    entries.push(pipelines::buffer_entry(23,compute,wgpu::BufferBindingType::Storage {read_only:true}));
     for e in &mut entries {
         e.visibility = compute;
     }
@@ -175,6 +175,11 @@ fn hit_record(
     displaced: Option<(usize, u64)>,
 ) -> [u32; constants::RAY_HIT_RECORD_WORDS] {
     let mut slot = |buffer| intern_buffer(buffers, buffer);
+    if let Some(splat)=&draw.splats {
+        let points=slot(HitBuffer::Static(draw.vertices.clone()));
+        let offsets=slot(HitBuffer::Static(splat.attribute_offsets.clone()));
+        return [points,0,splat.stride,offsets,0,points,0,splat.stride,1<<27,0,draw.primitive_start];
+    }
     let layout = draw.layout;
     let deformed = layout.deform;
     let (positions, base, stride) = if let Some((page, offset)) = displaced {
@@ -221,6 +226,8 @@ fn hit_record(
 pub(crate) enum HitBuffer {
     Static(wgpu::Buffer),
     Deformed(usize),
+    /// Interleaved previous/next pose, used only by software raster controls.
+    Previous(usize),
     DisplacedPage(usize),
     Attributes(usize),
 }
@@ -237,6 +244,7 @@ fn admit_static_hit_buffers(limits: &wgpu::Limits, buffers: &[HitBuffer]) -> Res
 /// Resolve installed hit records to the frame slot's evaluated geometry ranges.
 pub(crate) fn resolve_hit_buffers(buffers: &[HitBuffer], deforms: &[Option<EvaluatedGeometry>]) -> Vec<(wgpu::Buffer, u64, u64)> {
     buffers.iter().map(|b| match b {
+        HitBuffer::Previous(i) => {let b=&deforms[*i].as_ref().expect("evaluated history").previous_output;(b.buffer.clone(),b.offset,b.size)},
         HitBuffer::Attributes(i) => { let b=deforms[*i].as_ref().unwrap().attributes.as_ref().unwrap(); (b.clone(),0,b.size()) },
         HitBuffer::Static(buffer) => (buffer.clone(), 0, buffer.size()),
         HitBuffer::DisplacedPage(leader) => {
@@ -500,6 +508,27 @@ pub(crate) fn automatic_reflections_requested(scene: &Scene) -> bool {
         && surface_transport_required(scene)
 }
 
+/// What drawing `scene` needs from the device: what its own space needs, and what each of its parts needs (a
+/// world inside a canvas, a canvas pictured in a world, and theirs in turn), since every part is drawn on the
+/// document's one device. A canvas's own drawing traces nothing. A world is judged before its assets and
+/// programs are installed, so a technique it may resolve to counts as needed: installation then chooses among
+/// techniques this device provides and never asks for more.
+pub(crate) fn device_needs(scene: &Scene) -> Result<crate::DeviceNeeds> {
+    let mut needs = if scene.is_canvas() { crate::DeviceNeeds::default() } else {
+        crate::DeviceNeeds {
+            ray_queries: uses_rays(scene) || possible_transport_queries(scene) || automatic_refraction(scene)
+                || automatic_reflections_requested(scene) || automatic_indirect_requested(scene),
+        }
+    };
+    for part in scene.composition_parts() {
+        if needs == crate::DeviceNeeds::ALL { break; }
+        // A part's needs follow from its nodes and the document's settings, not from the size it is drawn at.
+        let part = scene.composition_scene(&part.name, scene.render.resolution).with_context(|| format!("node {:?}", part.name))?;
+        needs = needs.with(device_needs(&part)?);
+    }
+    Ok(needs)
+}
+
 /// Any ray technique: the install builds acceleration structures.
 pub(crate) fn uses_rays(scene: &Scene) -> bool {
     installed_rays(scene, ray_refraction(scene))
@@ -528,7 +557,7 @@ pub(crate) fn adapter_help() -> &'static str {
     } else if cfg!(target_os = "windows") {
         "No supported ray-tracing GPU. For slow CPU rendering, install a Vulkan loader and a recent Mesa lavapipe Vulkan driver (with its ICD manifest), then set VORK_GPU=cpu (or --gpu cpu). Windows CPU rendering has not been qualified."
     } else {
-        "No supported ray-tracing GPU. For slow CPU rendering, install recent Mesa Vulkan drivers (mesa-vulkan-drivers on Debian/Ubuntu; mesa-vulkan-drivers or vulkan-swrast elsewhere) and set VORK_GPU=cpu (or --gpu cpu)."
+        "No supported ray-tracing GPU (NVIDIA, or AMD on a Vulkan driver with ray queries such as Mesa RADV). For slow CPU rendering, install recent Mesa Vulkan drivers (mesa-vulkan-drivers on Debian/Ubuntu; mesa-vulkan-drivers or vulkan-swrast elsewhere) and set VORK_GPU=cpu (or --gpu cpu)."
     }
 }
 
@@ -551,12 +580,12 @@ pub(crate) fn require(r: &Renderer, scene: &Scene) -> Result<()> {
         .contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY);
     let adapter = format!("{} ({:?})", r.adapter_info.name, r.adapter_info.backend);
     if let Some(message) = missing(scene, supported, &adapter) {
-        bail!(message);
+        bail!(crate::gpu_memory::DeviceLimit(message));
     }
     ensure!(
         !traces_hit_surfaces(scene) || r.device.features().contains(HIT_BUFFER_FEATURES),
-        "{} reads hit geometry through storage buffer arrays ({HIT_BUFFER_FEATURES:?}); adapter {adapter} lacks them",
-        options(scene).join(", ")
+        crate::gpu_memory::DeviceLimit(format!("{} reads hit geometry through storage buffer arrays ({HIT_BUFFER_FEATURES:?}); adapter {adapter} lacks them",
+            options(scene).join(", ")))
     );
     Ok(())
 }
@@ -638,6 +667,8 @@ fn geometry<'a>(
 pub(crate) struct Rays {
     /// All installed BLAS geometry accepts opaque intersections directly.
     pub(crate) opaque: bool,
+    /// Per instance: authored double sidedness and path solid-exit eligibility.
+    triangle_sides: Vec<(bool,bool)>,
     /// Offset of the path emitter topology in the shared ray table.
     pub(crate) emitters: u32,
     pub(crate) probe_emitters: bool,
@@ -698,6 +729,7 @@ impl ComputeSnapshot {
                 ensure!(!node.dynamic && !draw.evaluated() && !crate::compute::places_instances(source,&node.node),
                     "compute trace requires immutable target geometry; object {public} can change or depends on compute; select a static collider with object_id");
                 ensure!(draw.implicit.is_none(),"compute trace does not yet support implicit target geometry");
+                ensure!(draw.splats.is_none(),"compute trace does not support Gaussian point targets; select a mesh collider with object_id");
                 // Match transport's installed mask, including its auxiliary
                 // opaque/solid categories, without evaluating a hit material.
                 let determinant=record.model.determinant();
@@ -719,7 +751,7 @@ impl ComputeSnapshot {
         } else {
             let instances:Vec<_>=rays.instances.iter().enumerate().map(|(slot,&(draw,object))|(object,!materials[draws[draw].material].transparent,true,rays.shadow_solids[slot],rays.blas[draw].as_ref().expect("static query BLAS").clone())).collect();
             let poses:Vec<_>=rays.instances.iter().zip(&rays.point_rows).map(|(&(draw,_),row)|row.map(|row|(rays.points[draw].as_ref().unwrap().rest_poses.clone(),row*8+4))).collect();
-            let placement=crate::gpu_tlas::Placement::with_points(r,&object_buffer,&instances,&rays.placement_pipeline,&poses)?;
+            let placement=crate::gpu_tlas::Placement::with_points(r,&object_buffer,&instances,&rays.placement_pipeline,&poses,&rays.triangle_sides)?;
             placement.encode(&mut encoder,&tlas, false);
         }
         crate::command_finish::Segments::submit(&r.queue,encoder);
@@ -773,7 +805,7 @@ fn point_shapes(r: &Renderer, draws: &[install::Draw]) -> Result<Vec<Option<Poin
 
 fn checked_placement_count(counts:impl IntoIterator<Item=u32>,limit:u32)->Result<u32> {
     let mut total=0u32;
-    for count in counts {total=total.checked_add(count).filter(|&n|n<=limit).with_context(|| crate::gpu_memory::limit_message("point placements in TLAS", format_args!("{} instances",u64::from(total)+u64::from(count)), format_args!("{limit} instances"), "reduce point pool size or instance count"))?;}
+    for count in counts {total=total.checked_add(count).filter(|&n|n<=limit).with_context(|| crate::gpu_memory::device_limit("point placements in TLAS", format_args!("{} instances",u64::from(total)+u64::from(count)), format_args!("{limit} instances"), "reduce point pool size or instance count"))?;}
     Ok(total)
 }
 
@@ -784,7 +816,7 @@ pub(crate) fn prepare_coverage(draws: &mut [install::Draw], materials: &[Materia
     let mut shared = std::collections::HashMap::new();
     for draw in draws {
         let material = &materials[draw.material];
-        if !material.surface_coverage && !material.transmissive {
+        if draw.splats.is_some() || (!material.surface_coverage && !material.transmissive) {
             draw.ray_corners = None;
             continue;
         }
@@ -813,7 +845,21 @@ pub(crate) fn draw_table(r: &Renderer, draws: &[install::Draw]) -> Result<(wgpu:
     let mut buffers = Vec::new();
     for (i, draw) in draws.iter().enumerate() {
         words[slot_words * i + 2] = words.len() as u32;
-        words.extend(hit_record(draw, &mut buffers, draw.evaluation_leader().or_else(||draw.computed.then_some(i)), displaced[i]));
+        let leader=draw.evaluation_leader().or_else(||draw.computed.then_some(i));
+        words.extend(hit_record(draw, &mut buffers, leader, displaced[i]));
+        if r.adapter_info.device_type==wgpu::DeviceType::Cpu {
+            // A software-only tail follows the ordinary hit record; existing
+            // readers use its explicit address and retain their unchanged ABI.
+            let (buffer,base,stride,next)=if let Some((page,offset))=displaced[i] {
+                (HitBuffer::Previous(page),(offset/4) as u32*2,20,10)
+            } else if let Some(leader)=leader {
+                (HitBuffer::Previous(leader),0,20,10)
+            } else {
+                (HitBuffer::Static(draw.vertices.clone()),(draw.vertex_offset/4) as u32,(draw.layout.vertex_stride()/4) as u32,0)
+            };
+            let buffer=intern_buffer(&mut buffers,buffer);
+            words.extend([buffer,base,stride,next]);
+        }
         if let Some(field) = &draw.implicit {
             words[slot_words * i + 1] = words.len() as u32;
             words.extend(field.dims);
@@ -846,6 +892,7 @@ pub(crate) fn draw_table(r: &Renderer, draws: &[install::Draw]) -> Result<(wgpu:
 fn alpha_table(
     r: &Renderer,
     draws: &[install::Draw],
+    materials: &[Material],
     instances: &[(usize, u32)],
     hits: bool,
     point_rows: &[Option<u32>],
@@ -928,7 +975,13 @@ fn alpha_table(
     words.extend_from_slice(emitters);
     let boundary_offset = words.len() as u32;
     if !boundary_ids.is_empty() {
-        words.extend(instances.iter().map(|&(_, object)| boundary_ids[object as usize]));
+        words.extend(instances.iter().map(|&(draw, object)| {
+            let boundary=boundary_ids[object as usize];
+            if boundary==NO_ALPHA && materials[draws[draw].material].preserve_solid_backfaces
+                && solid_owners.get(object as usize).is_some_and(|&owner|owner!=NO_ALPHA) {
+                constants::RAY_OPAQUE_SOLID_OWNER
+            } else {boundary}
+        }));
     }
     let object_boundary_offset=words.len() as u32;
     words.extend_from_slice(boundary_ids);
@@ -971,7 +1024,7 @@ fn alpha_table(
     ensure!(
         bytes <= u64::from(limits.max_storage_buffer_binding_size)
             && bytes <= limits.max_buffer_size,
-        "{}", crate::gpu_memory::limit_message("ray table", format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",limits.max_storage_buffer_binding_size,limits.max_buffer_size), "reduce geometry and light count or choose --profile std/draft for a lower sample budget")
+        crate::gpu_memory::device_limit("ray table", format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",limits.max_storage_buffer_binding_size,limits.max_buffer_size), "reduce geometry and light count or choose --profile std/draft for a lower sample budget")
     );
     let table = init(&r.device, "ray table", bytemuck::cast_slice(&words), wgpu::BufferUsages::STORAGE);
     if buffers.is_empty() {
@@ -1029,7 +1082,7 @@ impl Rays {
             let mut groups = std::collections::BTreeMap::new();
             for (slot,&(draw,object)) in instances.iter().enumerate() {
                 let source=&draws[draw];
-                if !eligible.contains(&(draw,object)) || source.evaluated() || source.ray_corners.is_some() || points[draw].is_some() {continue;}
+                if !eligible.contains(&(draw,object)) || source.evaluated() || source.ray_corners.is_some() || source.splats.is_some() || points[draw].is_some() {continue;}
                 let value=&objects[object as usize];
                 let mask=if collapsed(value.model) {0} else {value.metadata[1]};
                 let key=(value.model.to_cols_array().map(f32::to_bits),value.metadata[0],mask,!materials[source.material].transparent,materials[source.material].double_sided);
@@ -1064,6 +1117,7 @@ impl Rays {
         let mut primitive_needed=vec![false;draws.len()];
         for (slot,&(draw,_)) in instances.iter().enumerate() {primitive_needed[draw]|=!grouped_instances[slot];}
         let blas = draws.iter().enumerate().map(|(index,draw)| {
+            if let Some(shape)=&draw.splats {return Some(shape.blas.clone());}
             if let Some(shape)=&points[index] {return Some(shape.blas.clone());}
             if draw.evaluated() || !primitive_needed[index] {return None;}
             let key=vec![geometry_key(draw)];
@@ -1142,13 +1196,21 @@ impl Rays {
         // discovery, including clear and opaque material groups of that solid.
         let shadow_solids=ray_instances.iter().map(|&(_,object)|absorbing.contains(&solid_owners.get(object as usize).copied().unwrap_or(NO_ALPHA))).collect::<Vec<_>>();
         let mut shadow_bounds=crate::shadow_containment::Plan::new(r,solids,&absorbing,objects,draws,solid_owners)?;
-        let (alpha, emitters, boundaries, subsurface, occupancy_solids, film_filter, object_boundaries, implicit) = alpha_table(r, draws, &ray_instances, hits, &point_rows, &points, path, &mut hit_buffers, &topology, &crate::emitters::implicit_sources(draws,&ray_instances,materials), boundary_ids, subsurface_ids, solids, &shadow_solids, solid_owners, shadow_bounds.as_mut())?;
+        let (alpha, emitters, boundaries, subsurface, occupancy_solids, film_filter, object_boundaries, implicit) = alpha_table(r, draws, materials, &ray_instances, hits, &point_rows, &points, path, &mut hit_buffers, &topology, &crate::emitters::implicit_sources(draws,&ray_instances,materials), boundary_ids, subsurface_ids, solids, &shadow_solids, solid_owners, shadow_bounds.as_mut())?;
+        let triangle_sides=ray_instances.iter().map(|&(draw,object)| {
+            let material=&materials[draws[draw].material];
+            let solid_exit=boundary_ids.get(object as usize).is_some_and(|&id| id!=NO_ALPHA)
+                || (!boundary_ids.is_empty() && material.preserve_solid_backfaces
+                    && solid_owners.get(object as usize).is_some_and(|&id| id!=NO_ALPHA));
+            (material.double_sided,solid_exit)
+        }).collect();
         Ok(Self {
+            triangle_sides,
             shadow_solids,
             points,
             point_rows,
             shadow_bounds,
-            opaque: draws.iter().all(|draw| draw.ray_corners.is_none()),
+            opaque: draws.iter().all(|draw| draw.ray_corners.is_none() && draw.splats.is_none()),
             emitters,
             probe_emitters,
             emitter_weights:if path || probe_emitters || gi_emitters || medium_sources {crate::emitter_weights::Plan::new(r,emitters,topology[1])?} else {None},
@@ -1163,7 +1225,7 @@ impl Rays {
             grouped_instances:ray_grouped,
             instances:ray_instances,
             placement_pipeline: Default::default(),
-            alpha_tested: draws.iter().map(|d| d.ray_corners.is_some()).collect(),
+            alpha_tested: draws.iter().map(|d| d.ray_corners.is_some() || d.splats.is_some()).collect(),
             alpha,
             hit_buffers,
             implicit,
@@ -1180,6 +1242,8 @@ pub(crate) struct FrameRays {
     placement_revision: u64,
     /// Changed object bytes since this slot's last full hierarchy build.
     motion_bytes: u64,
+    /// Bound full hierarchy construction while shutter samples reuse this slot.
+    rebuilt_exposure: bool,
     #[cfg(test)]
     pub(crate) builds: u32,
     /// This slot's hit buffer array (Rays::hit_buffers with deformed ranges
@@ -1192,6 +1256,7 @@ impl Rays {
     pub(crate) fn dynamic_shadow_bounds(&self)->bool {self.shadow_bounds.as_ref().is_some_and(|p|p.dynamic())}
 }
 impl FrameRays {
+    pub(crate) fn begin_exposure(&mut self) { self.rebuilt_exposure = false; }
     pub(crate) fn prepare_shadow_bounds(&self,s:&InstalledScene,local:&[(Vec3,Vec3)],changes:&mut values::ChangeTracker) {
         if let (Some(plan),Some(slot))=(&s.rays.as_ref().unwrap().shadow_bounds,&self.shadow_bounds) {plan.upload(slot,local,changes);}
     }
@@ -1251,10 +1316,10 @@ impl FrameRays {
                     if let Some(g)=deforms[draw].as_ref().filter(|g|g.point_domain.is_some()) {(g.output.buffer.clone(),(g.output.offset/4) as u32+2+row*10)}
                     else {(deforms[draw].as_ref().and_then(|g|g.point_poses.as_ref()).unwrap_or(&installed.points[draw].as_ref().unwrap().rest_poses).clone(),row*8+4)}
                 })).collect();
-                crate::gpu_tlas::Placement::with_points(r,objects,&instances,&installed.placement_pipeline,&point_poses)
+                crate::gpu_tlas::Placement::with_points(r,objects,&instances,&installed.placement_pipeline,&point_poses,&installed.triangle_sides)
             }).transpose()?;
         let shadow_bounds=installed.shadow_bounds.as_ref().map(|plan|crate::shadow_containment::Slot::new(r,plan,objects)).transpose()?;
-        Ok(Some(Self { shadow_bounds, tlas, placement, placement_revision:0, motion_bytes:0, #[cfg(test)] builds:0, hit_buffers: Vec::new(), deformed, emitter_weights:installed.emitter_weights.as_ref().map(|p|crate::emitter_weights::Slot::new(p,d)) }))
+        Ok(Some(Self { shadow_bounds, tlas, placement, placement_revision:0, motion_bytes:0, rebuilt_exposure:false, #[cfg(test)] builds:0, hit_buffers: Vec::new(), deformed, emitter_weights:installed.emitter_weights.as_ref().map(|p|crate::emitter_weights::Slot::new(p,d)) }))
     }
 }
 
@@ -1298,13 +1363,15 @@ pub(crate) fn encode(encoder: &mut wgpu::CommandEncoder, s: &InstalledScene, f: 
     }
     // Uploads contain only changed records. Accumulate across refits so repeated
     // small changes cannot indefinitely retain the original tree topology.
-    // GPU publications have no CPU motion magnitudes: conservatively rebuild,
-    // without synchronizing to read back the million-instance placement buffer.
+    // GPU publications have no CPU motion magnitudes. Request a full rebuild,
+    // but amortize it across this exposure's shutter samples; later samples
+    // refit their bounds without changing their evaluation or sampling order.
     let changed_bytes = f.changes.uploads.iter()
         .filter(|(buffer, ..)| buffer == &f.objects)
         .map(|(_, _, _, bytes)| *bytes).sum::<u64>();
     let force_rebuild = rebuild_tlas(&mut rays.motion_bytes, changed_bytes,
-        f.objects.size(), first || deform_changed || placement_changed);
+        f.objects.size(), first || deform_changed || placement_changed, !rays.rebuilt_exposure);
+    rays.rebuilt_exposure |= force_rebuild;
     let entries: Vec<_> = rays
         .deformed
         .iter()
@@ -1335,9 +1402,13 @@ pub(crate) fn encode(encoder: &mut wgpu::CommandEncoder, s: &InstalledScene, f: 
     }
 }
 
-fn rebuild_tlas(motion_bytes: &mut u64, changed_bytes: u64, total_bytes: u64, spatial_publication: bool) -> bool {
+fn rebuild_tlas(motion_bytes: &mut u64, changed_bytes: u64, total_bytes: u64, spatial_publication: bool, allow_rebuild: bool) -> bool {
+    let threshold = total_bytes.div_ceil(4).max(1);
     *motion_bytes = motion_bytes.saturating_add(changed_bytes);
-    let rebuild = spatial_publication || *motion_bytes >= total_bytes.div_ceil(4).max(1);
+    // Remember GPU motion that arrives after this exposure's full build, so
+    // the next changed exposure cannot silently retain an old tree forever.
+    if spatial_publication { *motion_bytes = (*motion_bytes).max(threshold); }
+    let rebuild = allow_rebuild && *motion_bytes >= threshold;
     if rebuild { *motion_bytes = 0; }
     rebuild
 }
@@ -1402,8 +1473,9 @@ mod default_shadow_tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn sampled_alpha_scene_ignores_environment_shadow_defaults() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let mut scene:serde_json::Value=vork_scene::v2::with_test_settings(include_str!("../tests/fixtures/analytic.json"), include_str!("../tests/presets/analytic-7fefd52a.json"))?;
         scene["render"]["settings"]["shadow_method"]="ray".into();
         scene["render"]["settings"]["samples"]=2.into();
@@ -1475,13 +1547,49 @@ pub(crate) fn resolve_scene_providers(r:&Renderer, scene:&mut Scene, _base:&Path
         if facts.media || facts.hair {promote_transport_owner(scene);} else {promote_to_path(scene);}
     }
     ensure!(!requires_path || r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY | HIT_BUFFER_FEATURES),
-        "effect unavailable: participating media, physical hair and complete-camera transport need hardware ray queries");
+        crate::gpu_memory::DeviceLimit("effect unavailable: participating media, physical hair and complete-camera transport need hardware ray queries".into()));
     Ok(())
 }
 
 #[cfg(test)]
 mod transport_owner_tests {
     use super::*;
+
+    #[test]
+    fn a_device_is_opened_for_what_its_scene_draws() -> Result<()> {
+        // Path transport traces whatever it draws, so only what a document draws decides here.
+        let path = vork_scene::Profile::load("std/path")?.resolve(&Default::default())?;
+        let scene = |value: serde_json::Value| -> Result<Scene> {
+            let mut scene = Scene::from_json(&serde_json::to_vec(&value)?)?;
+            scene.render.settings = path.clone();
+            Ok(scene)
+        };
+        let shape = serde_json::json!({"name":"shape","type":"path","d":"M0 0H10V10Z","fill":"red"});
+        let world = |name: &str, children: serde_json::Value| serde_json::json!({"name":name,"composition":{"space":"3d"},"children":children});
+        // A canvas's own drawing traces nothing.
+        let canvas = scene(serde_json::json!({"version":2,"composition":{"space":"2d"},"render":{"resolution":[64,64]},"nodes":[shape]}))?;
+        assert_eq!(device_needs(&canvas)?, crate::DeviceNeeds::default());
+        // A world in the canvas is drawn on the canvas's device.
+        let with_world = scene(serde_json::json!({"version":2,"composition":{"space":"2d"},"render":{"resolution":[64,64]},"nodes":[
+            shape, world("shot", serde_json::json!([{"type":"camera","name":"cam"}]))]}))?;
+        assert_eq!(device_needs(&with_world)?, crate::DeviceNeeds::ALL);
+        // A 3D document is judged as before.
+        let three = scene(serde_json::json!({"version":2,"nodes":[{"type":"camera","name":"cam"}]}))?;
+        assert_eq!(device_needs(&three)?, crate::DeviceNeeds::ALL);
+        Ok(())
+    }
+
+    #[test]
+    fn adapter_admission_names_all_missing_features() -> Result<()> {
+        let renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        let error = require_adapter(&renderer.adapter_info, wgpu::Features::empty()).unwrap_err();
+        let message = format!("{error:#}");
+        for name in ["EXPERIMENTAL_RAY_QUERY", "BUFFER_BINDING_ARRAY", "STORAGE_RESOURCE_BINDING_ARRAY"] {
+            assert!(message.contains(name), "{message}");
+        }
+        assert!(message.contains(adapter_help()));
+        Ok(())
+    }
 
     #[test]
     fn scalar_table_alpha_does_not_promote_other_materials() -> Result<()> {
@@ -1499,8 +1607,9 @@ mod transport_owner_tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn previs_scalar_coverage_retains_emission_and_controls() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         for (background, overlapping, cutoff) in [(false,false,None),(true,false,None),(false,true,None),(false,false,Some(0.5)),(false,false,Some(0.2))] {
             let mut document:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/previs-scalar-alpha.json"))?;
             document["render"]["resolution"]=serde_json::json!([32,32]);

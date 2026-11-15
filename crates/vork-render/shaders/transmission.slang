@@ -118,13 +118,13 @@ float3 transmission_radiance<V:IVariant,O:ITransmission,P:IProgram>(Varying v,Su
         let interface_closure=transmission_interface<V>(s,facet).closure;
         let n=interface_closure.geometry_normal;
         let view=s.view;
-        let eta=c.specular_ior;
+        let eta=dielectric_ior(c);
         // A visible rear face is the current exit (an open mesh or a camera
         // already inside), not another entry followed by a coincident exit.
         let entering=c.geometry_thin_walled || s.front_facing;
         // Thin sheets have no interior. Solids intersect their raster mesh in local space,
         // using the same per-frame transform and deformed positions as the camera pass.
-        let into=refract(-view,n,1./interface_closure.specular_ior);
+        let into=refract(-view,n,1./dielectric_ior(interface_closure));
         let rear_tir=!entering && dot(into,into)==0.;
         let interface_fresnel=rear_tir ? float3(0.) : interface_reflection<V>(interface_closure,view);
         var chord=0.;var exit=v.world;var out_dir=entering ? -view : into;
@@ -148,7 +148,7 @@ float3 transmission_radiance<V:IVariant,O:ITransmission,P:IProgram>(Varying v,Su
                     exit_transmission=1.-interface_reflection<V>(exiting_closure(c,boundary.normal),-inside);
                     // Tint belongs only to a transmitted interface.
                     // Internal reflection and an absent exit do not cross one.
-                    exit_tint=transmission_interface_tint(c.transmission_color,c.transmission_depth,false);
+                    exit_tint=surface_transmission_tint(c);
                     escaped=true;break;
                 }
                 // Total internal reflection stays inside the mesh and continues to its
@@ -161,8 +161,8 @@ float3 transmission_radiance<V:IVariant,O:ITransmission,P:IProgram>(Varying v,Su
         let size=float2(O.size());
         // Beer-Lambert absorption over transmission_depth (metres; glTF attenuation distance).
         // OpenPBR transmission_depth 0 is a surface tint; otherwise Beer-Lambert over the path.
-        let entry_tint=rear_tir ? float3(1.) : transmission_interface_tint(c.transmission_color,c.transmission_depth,c.geometry_thin_walled);
-        let segment=DielectricSegment(c.transmission_color,c.transmission_depth,c.specular_ior);
+        let entry_tint=rear_tir ? float3(1.) : surface_transmission_tint(c);
+        let segment=DielectricSegment(c.transmission_color,c.transmission_depth,dielectric_ior(c),dielectric_ior(c));
         let attenuation=entry_tint*exit_tint*segment_attenuation(segment,chord);
         let roughness=c.specular_roughness;
         let world_allowed=light_receives(frame.environment_links.x,frame.environment_links.y,objects[v.object].metadata.x)

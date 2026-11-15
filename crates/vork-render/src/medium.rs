@@ -3,6 +3,15 @@ use super::*;
 use ::vork_scene::v2;
 use vork_slang::{Compiler, MediumProgram};
 
+/// Sampled transport cannot bound this scene's world medium: the scene's refusal, and the one
+/// refusal shader warm-up expects from a library scene.
+#[derive(Debug)]
+pub(crate) struct SampledRefusal(pub String);
+impl std::fmt::Display for SampledRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result { f.write_str(&self.0) }
+}
+impl std::error::Error for SampledRefusal {}
+
 #[derive(Clone, Default)]
 pub(crate) struct Native {
     /// Resource-free point dispatch over the same reflected programs/words.
@@ -16,7 +25,6 @@ pub(crate) struct Native {
     pub sampled_error: Option<String>,
     pub modules: Vec<(String, String)>,
     pub includes: Vec<PathBuf>,
-    pub identity: Vec<u8>,
     pub homogeneous: bool,
     pub time_dependent: bool,
     /// All installed medium instances prove zero scattering for every input pose.
@@ -25,6 +33,7 @@ pub(crate) struct Native {
     pub mesh_sources: bool,
 }
 impl Native {
+    #[cfg(test)]
     pub(crate) fn defines(&self) -> Vec<String> {
         // Numeric oracles use the same installed point/domain capabilities.
         vec![format!("-DVORK_MEDIUM_WORLD_ONLY={}",u8::from(self.world_only))]
@@ -177,7 +186,6 @@ pub(crate) use bound::certification_times;
 
 /// Register one reflected point program and adapt world to medium coordinates.
 fn native_coefficients(program: &MediumProgram,id:u32,bounded:bool,native:&mut Native) -> String {
-    native.identity.extend_from_slice(program.native.as_bytes());
     let module = format!("medium_program_{id}");
     native
         .modules

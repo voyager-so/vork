@@ -26,7 +26,7 @@ key = f'{platform.system()}-{platform.machine()}'
 if key not in PIN['archives']:
     p.error(f'unsupported platform: {key}')
 name, digest = PIN['archives'][key]['name'], PIN['archives'][key]['sha256']
-url = f'https://github.com/shader-slang/slang/releases/download/v{VERSION}/slang-{VERSION}-{name}.tar.gz'
+url = PIN['archives'][key].get('url', f'https://github.com/shader-slang/slang/releases/download/v{VERSION}/slang-{VERSION}-{name}.tar.gz')
 a.destination.parent.mkdir(parents=True, exist_ok=True)
 with tempfile.TemporaryDirectory(dir=a.destination.parent) as tmp:
     archive = Path(tmp) / 'slang.tar.gz'

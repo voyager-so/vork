@@ -10,7 +10,7 @@ pub fn is_media(path: &Path) -> bool {
         ["mov", "mp4", "mkv"].iter().any(|v| e.eq_ignore_ascii_case(v)))
 }
 
-fn is_sequence(path:&Path)->bool {
+pub(crate) fn is_sequence(path:&Path)->bool {
     path.file_name().and_then(|n|n.to_str()).is_some_and(|name| {
         name.match_indices('%').any(|(at,_)| {
             let tail=&name[at+1..];
@@ -26,7 +26,47 @@ pub enum Source {
     Sequence { files:Vec<PathBuf>, fps:Option<vork_time::Time> },
     Video(Video),
 }
+
+/// The media sources one document open has read, by path. The open owns it: every clock
+/// plan it compiles and every image it installs takes a source from here, so a source is
+/// read from disk once per open (a sequence's listing and first frame's rate, a movie's
+/// probe) and all of them agree on what was read. It is dropped with the open; nothing
+/// about a source is remembered for the next one.
+#[derive(Clone, Default)]
+pub struct Opened(std::sync::Arc<std::sync::Mutex<std::collections::BTreeMap<PathBuf, Source>>>);
+impl Opened {
+    fn read<T>(&self, path: &Path, with: impl FnOnce(&Source) -> Result<T>) -> Result<T> {
+        // One source however its path is spelled: the directory it is in, resolved (through
+        // links, `..` and a relative base), and its file name, which for a sequence is the
+        // pattern and names no file. A directory that cannot be resolved keeps its spelling
+        // and the read below reports what is wrong with it.
+        let directory = path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or(Path::new("."));
+        let directory = std::fs::canonicalize(directory).unwrap_or_else(|_| directory.to_path_buf());
+        let key = path.file_name().map_or_else(|| path.to_path_buf(), |name| directory.join(name));
+        let mut sources = self.0.lock().unwrap();
+        if !sources.contains_key(&key) {
+            sources.insert(key.clone(), Source::open(path)?);
+        }
+        with(&sources[&key])
+    }
+    /// The source at `path` as this open read it, with decoding state of its own.
+    pub(crate) fn source(&self, path: &Path) -> Result<Source> {
+        self.read(path, |source| Ok(source.fresh()))
+    }
+    /// That source's own length ([`Source::length`]).
+    pub(crate) fn length(&self, path: &Path, fps: vork_time::Time) -> Result<Rational> {
+        self.read(path, |source| source.length(fps))
+    }
+}
+
 impl Source {
+    /// What was read from disk, without this value's decoding state.
+    fn fresh(&self) -> Self {
+        match self {
+            Self::Sequence {files,fps} => Self::Sequence {files:files.clone(),fps:*fps},
+            Self::Video(video) => Self::Video(video.fresh()),
+        }
+    }
     /// Files owned by this opened source, including every discovered sequence frame.
     pub fn files(&self) -> &[PathBuf] {
         match self {
@@ -47,16 +87,44 @@ impl Source {
         }
         Ok(Self::Video(Video::open(path).with_context(||format!("movie {}; restore a playable movie and install ffmpeg/ffprobe on PATH",path.display()))?))
     }
-    pub(crate) fn open_gpu(path:&Path,r:&crate::Renderer)->Result<Self> {
-        let mut source=Self::open(path)?;
-        if let Self::Video(video)=&mut source {
+    /// Natural texel size, without decoding a frame before the device's limits are known.
+    pub(crate) fn dimensions(&self) -> Result<[u32; 2]> {
+        match self {
+            Self::Video(video) => Ok(video.size),
+            Self::Sequence { files, .. } => {
+                let path = &files[0];
+                let (width, height, _) = crate::texture_source::header(image::ImageFormat::from_path(path)?, &std::fs::read(path)?, u32::MAX)?;
+                Ok([width, height])
+            }
+        }
+    }
+    pub(crate) fn prepare_gpu(&mut self, r: &crate::Renderer) {
+        if let Self::Video(video)=self {
             // Use the installed NVIDIA adapter,
             // retaining the portable decoder for unsupported streams. FFmpeg
             // owns native decoder setup and format conversion; the existing
             // ordered texture-upload path remains the publication boundary.
-            video.hardware=r.adapter_info.vendor==crate::constants::NVIDIA_VENDOR_ID;
+            let hardware = r.adapter_info.vendor==crate::constants::NVIDIA_VENDOR_ID;
+            if hardware != video.hardware { video.session = None; }
+            video.hardware = hardware;
         }
-        Ok(source)
+    }
+    /// The content's own length in seconds: frames over the rate for a sequence; for a
+    /// movie the stream's declared duration, else the displayed span plus one mean frame.
+    pub(crate) fn length(&self,fps:vork_time::Time)->Result<Rational> {
+        match self {
+            Self::Sequence {files,fps:source_fps} => {
+                let rate=source_fps.map(|rate|decimal(&rate.to_string())).transpose()?.unwrap_or(decimal(&fps.to_string())?);
+                Ok(Rational::from_integer(files.len().into())/rate)
+            }
+            Self::Video(video) => {
+                if let Some(duration)=&video.duration {return Ok(duration.clone());}
+                let n=video.pts.len();
+                let span=(Rational::from_integer(video.pts[n-1].into())-Rational::from_integer(video.pts[0].into()))*&video.timebase;
+                let frame=if n>1 {&span/Rational::from_integer((n as i64-1).into())} else {decimal(&fps.to_string())?.recip()};
+                Ok(span+frame)
+            }
+        }
     }
     pub fn timeline(&self,fps:vork_time::Time)->Result<Vec<vork_time::Clock>> {
         self.exact_timeline(fps)?.iter().map(|time|time.value().to_string().parse()).collect()
@@ -97,6 +165,47 @@ impl Source {
             Self::Video(video) => video.frame_at(index,max_side),
         }
     }
+    /// The frame at `time` with its colour in `upload`, the encoding the caller uploads
+    /// (`texture_source::decode_color`): `explicit` is the image's declared space; without it a sequence
+    /// frame's own description decides, and footage's stream tags. `light`: the image is light
+    /// (an environment), and a colour that conversion carries outside the upload's gamut is limited to it
+    /// (`texture_source::decode_light`).
+    pub(crate) fn frame_color_exact(&mut self,time:&Germ,fps:vork_time::Time,max_side:u32,explicit:Option<vork_scene::v2::ColorSpace>,upload:vork_scene::v2::WorkingColorSpace,light:bool)->Result<image::DynamicImage> {
+        let index=self.frame_index_exact(time,fps)?;
+        match self {
+            Self::Sequence {files,..} => {
+                let path=&files[index];
+                let decode=if light {crate::texture_source::decode_light} else {crate::texture_source::decode_color};
+                decode(path,&std::fs::read(path)?,max_side,explicit,upload)
+                    .with_context(||format!("decode sequence frame {}",path.display()))
+            }
+            Self::Video(video) => {
+                use vork_scene::v2::{ColorSpace as C,WorkingColorSpace as S};
+                // The stream's own tags (ffprobe's names), when the image declares no space. HDR transfers and
+                // wide primaries are not decoded yet and refuse. Every other SDR tag (BT.709, BT.601, sRGB, or
+                // none) is read as sRGB, as Blender and browsers read video; linear light is read as linear.
+                let source = match explicit {
+                    Some(C::NonColor) => return video.frame_at(index,max_side),
+                    Some(C::Srgb) => S::Srgb, Some(C::DisplayP3) => S::DisplayP3, Some(C::LinearRec709) => S::LinearRec709,
+                    Some(C::LinearRec2020) => S::LinearRec2020, Some(C::ACEScg) => S::ACEScg,
+                    None => {
+                        let tagged=|what:&str|crate::texture_source::declared_colour(format!("footage {} is tagged {what}",video.path.display()));
+                        if matches!(video.transfer.as_str(),"smpte2084"|"arib-std-b67") {return Err(tagged("PQ or HLG, which is not decoded yet"));}
+                        match video.primaries.as_str() {
+                            "smpte432" => return Err(tagged("Display P3 (smpte432): \"Display P3\" reads the tagged colours")),
+                            "bt2020" => return Err(tagged("Rec.2020 (bt2020), which is not read yet")),
+                            "smpte431" => return Err(tagged("DCI-P3 (smpte431), which is not read yet")),
+                            _ => {}
+                        }
+                        if video.transfer=="linear" {S::LinearRec709} else {S::Srgb}
+                    }
+                };
+                // A decoded video frame has no negative samples of its own.
+                let frame=crate::texture_source::convert_image(video.frame_at(index,max_side)?,source,upload);
+                Ok(if light {crate::texture_source::limit_to_gamut(frame)} else {frame})
+            }
+        }
+    }
     pub(crate) fn identity(&self)->Result<blake3::Hash> {
         let mut hash=blake3::Hasher::new();
         let files=match self {Self::Sequence {files,..}=>files.clone(),Self::Video(video)=>vec![video.path.clone()]};
@@ -109,7 +218,7 @@ impl Source {
 
 }
 
-fn sequence(path: &Path) -> Result<Vec<PathBuf>> {
+pub(crate) fn sequence(path: &Path) -> Result<Vec<PathBuf>> {
     let name = path.file_name().context("sequence needs a filename")?.to_str().context("sequence filename must be UTF-8")?;
     let start = name.find('%').context("sequence pattern missing %")?;
     let tail = &name[start+1..];
@@ -142,7 +251,16 @@ fn sequence(path: &Path) -> Result<Vec<PathBuf>> {
         }
         previous = index;
     }
-    ensure!(missing.is_empty(), "sequence {} missing frames: {}", path.display(), missing.join(", "));
+    let mut errors = Vec::new();
+    if !missing.is_empty() {
+        errors.push(anyhow::anyhow!("sequence {} missing frames: {}; restore the missing frames or correct the pattern", path.display(), missing.join(", ")));
+    }
+    for frame in frames.values() {
+        if let Err(error) = crate::source_file(frame) {
+            errors.push(anyhow::Error::new(error).context(format!("sequence frame {}: restore a readable image file or correct the pattern", frame.display())));
+        }
+    }
+    vork_scene::v2::diagnostics::joined(errors)?;
     Ok(frames.into_values().collect())
 }
 
@@ -152,11 +270,15 @@ impl Drop for Session {
 }
 pub struct Video {
     path: PathBuf,
+    transfer: String,
+    primaries: String,
     #[cfg(test)]
     times: Vec<f64>,
     keyframes: Vec<(usize,i64)>,
     pts: Vec<i64>,
     timebase: Rational,
+    /// The stream's declared duration in seconds, when the container states one.
+    duration: Option<Rational>,
     last_request: Option<usize>,
     #[cfg(test)]
     decoded: usize,
@@ -166,6 +288,12 @@ pub struct Video {
     frames: std::collections::VecDeque<(usize, image::DynamicImage)>,
 }
 impl Video {
+    /// The probed stream again, with no decoder session and nothing decoded.
+    fn fresh(&self) -> Self {
+        Self {path:self.path.clone(), transfer:self.transfer.clone(), primaries:self.primaries.clone(), #[cfg(test)] times:self.times.clone(), keyframes:self.keyframes.clone(), pts:self.pts.clone(),
+            timebase:self.timebase.clone(), duration:self.duration.clone(), last_request:None, #[cfg(test)] decoded:0, size:self.size,
+            session:None, hardware:false, frames:Default::default()}
+    }
     fn frame_index(&self,time:&Germ)->usize {
         self.pts.partition_point(|&pts| {
             let delta=Rational::from_integer(pts.into())-Rational::from_integer(self.pts[0].into());
@@ -173,15 +301,24 @@ impl Video {
         }).saturating_sub(1)
     }
     fn open(path: &Path) -> Result<Self> {
-        crate::warnings::dropped("video_only", serde_json::json!({"file":path}),
-            "movie plates and outputs are video-only; any input audio is discarded. Add the soundtrack to the rendered video in an external editor.".into());
         // ffprobe and ffmpeg both apply container edit lists. Presentation times
         // are relative to the first displayed frame, never packet/decode order.
         let probe = Command::new("ffprobe").args(["-v","error","-select_streams","v:0","-show_frames","-show_streams","-show_entries",
-            "frame=best_effort_timestamp,key_frame:stream=width,height,time_base:stream_side_data=rotation","-of","json"])
+            "frame=best_effort_timestamp,key_frame:stream=width,height,time_base,duration,color_transfer,color_primaries:stream_side_data=rotation","-of","json"])
             .arg(path).output().context("video inputs require ffprobe and ffmpeg on PATH")?;
         ensure!(probe.status.success(), "probe video {}: {}", path.display(), String::from_utf8_lossy(&probe.stderr));
         let value: serde_json::Value = serde_json::from_slice(&probe.stdout)?;
+        // The frame probe selects only v:0. Inspect audio streams separately,
+        // without decoding them, so silent plates do not report discarded audio.
+        let audio_probe = Command::new("ffprobe")
+            .args(["-v", "error", "-select_streams", "a", "-show_entries", "stream=index", "-of", "json"])
+            .arg(path).output().context("probe movie audio streams")?;
+        ensure!(audio_probe.status.success(), "probe movie audio {}: {}", path.display(), String::from_utf8_lossy(&audio_probe.stderr));
+        let audio: serde_json::Value = serde_json::from_slice(&audio_probe.stdout)?;
+        if audio["streams"].as_array().is_some_and(|streams| !streams.is_empty()) {
+            crate::warnings::dropped("video_only", serde_json::json!({"file":path}),
+                "movie image inputs decode video only. Attach audio: {file: ...} to a node to include the soundtrack.".into());
+        }
         let stream = &value["streams"][0];
         let mut size = [stream["width"].as_u64().context("video width missing")? as u32,
                         stream["height"].as_u64().context("video height missing")? as u32];
@@ -191,6 +328,7 @@ impl Video {
         let (numerator,denominator)=stream["time_base"].as_str().context("video time base missing")?.split_once('/').context("invalid video time base")?;
         let timebase=decimal(&format!("{numerator}/{denominator}"))?;
         ensure!(timebase > Rational::from_integer(0.into()), "video time base must be positive");
+        let duration=stream["duration"].as_str().and_then(|text|decimal(text).ok()).filter(|d|d>&Rational::from_integer(0.into()));
         let pts:Vec<i64> = value["frames"].as_array().context("video has no displayed frames")?.iter()
             .map(|f|f["best_effort_timestamp"].as_i64().context("video frame has no presentation timestamp")).collect::<Result<_>>()?;
         ensure!(pts.windows(2).all(|p|p[0]<=p[1]), "video presentation timestamps must be ordered");
@@ -212,16 +350,16 @@ impl Video {
             let first = times[0];
             for time in &mut times {*time -= first;}
         }
-        Ok(Self {path:path.into(), #[cfg(test)] times, pts, timebase, keyframes, last_request:None, #[cfg(test)] decoded:0, size, session:None, hardware:false, frames:Default::default()})
+        Ok(Self {path:path.into(), transfer:stream["color_transfer"].as_str().unwrap_or("").into(), primaries:stream["color_primaries"].as_str().unwrap_or("").into(), #[cfg(test)] times, pts, timebase, duration, keyframes, last_request:None, #[cfg(test)] decoded:0, size, session:None, hardware:false, frames:Default::default()})
     }
     #[cfg(test)]
     fn frame(&mut self, time: f64, max_side:u32) -> Result<image::DynamicImage> {
-        ensure!(self.size.iter().all(|&n|n<=max_side), "{}", crate::gpu_memory::limit_message(format_args!("video {}", self.path.display()), format_args!("{}x{}", self.size[0], self.size[1]), format_args!("max_texture_dimension_2d={max_side}"), "resize the source video or use a GPU with larger texture limits"));
+        ensure!(self.size.iter().all(|&n|n<=max_side), crate::gpu_memory::device_limit(format_args!("video {}", self.path.display()), format_args!("{}x{}", self.size[0], self.size[1]), format_args!("max_texture_dimension_2d={max_side}"), "resize the source video or use a GPU with larger texture limits"));
         let index = self.frame_index(&Germ::point(vork_time::Clock::from(time).exact()));
         self.frame_at(index,max_side)
     }
     fn frame_at(&mut self,index:usize,max_side:u32)->Result<image::DynamicImage> {
-        ensure!(self.size.iter().all(|&n|n<=max_side), "{}", crate::gpu_memory::limit_message(format_args!("video {}", self.path.display()), format_args!("{}x{}", self.size[0], self.size[1]), format_args!("max_texture_dimension_2d={max_side}"), "resize the source video or use a GPU with larger texture limits"));
+        ensure!(self.size.iter().all(|&n|n<=max_side), crate::gpu_memory::device_limit(format_args!("video {}", self.path.display()), format_args!("{}x{}", self.size[0], self.size[1]), format_args!("max_texture_dimension_2d={max_side}"), "resize the source video or use a GPU with larger texture limits"));
         let previous=self.last_request.replace(index);
         if let Some((_,frame)) = self.frames.iter().find(|(cached,_)|*cached==index) {return Ok(frame.clone());}
         // For a reverse walk retain the next predicted request too. The existing
@@ -277,20 +415,27 @@ impl Video {
 
 #[cfg(test)]
 #[test]
-fn movie_inputs_warn_that_audio_is_discarded() -> Result<()> {
-    let path = std::env::temp_dir().join(format!("vork-audio-notice-{}.mp4", std::process::id()));
-    let status = Command::new("ffmpeg").args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=16x16:d=0.1",
-        "-f", "lavfi", "-i", "sine=frequency=440:duration=0.1", "-shortest", "-c:v", "libx264", "-c:a", "aac"])
-        .arg(&path).status()?;
-    ensure!(status.success(), "make a movie with audio");
-    let collector = crate::warnings::Collector::default();
-    let _scope = collector.enter();
-    Source::open(&path)?;
-    let warnings = collector.snapshot();
-    assert_eq!(warnings.len(), 1);
-    assert_eq!(warnings[0].code, "video_only");
-    assert!(warnings[0].dropped.contains("external editor"));
-    std::fs::remove_file(path)?;
+fn movie_inputs_warn_only_when_audio_is_discarded() -> Result<()> {
+    for has_audio in [false, true] {
+        let path = std::env::temp_dir().join(format!("vork-audio-notice-{}-{has_audio}.mp4", std::process::id()));
+        let mut command = Command::new("ffmpeg");
+        command.args(["-v", "error", "-y", "-f", "lavfi", "-i", "color=c=red:s=16x16:d=0.1"]);
+        if has_audio {
+            command.args(["-f", "lavfi", "-i", "sine=frequency=440:duration=0.1", "-shortest", "-c:a", "aac"]);
+        }
+        let status = command.args(["-c:v", "libx264"]).arg(&path).status()?;
+        ensure!(status.success(), "make a movie (audio={has_audio})");
+        let collector = crate::warnings::Collector::default();
+        let _scope = collector.enter();
+        Source::open(&path)?;
+        let warnings = collector.snapshot();
+        assert_eq!(warnings.len(), usize::from(has_audio), "audio={has_audio}: {warnings:?}");
+        if has_audio {
+            assert_eq!(warnings[0].code, "video_only");
+            assert!(warnings[0].dropped.contains("audio: {file: ...}"));
+        }
+        std::fs::remove_file(path)?;
+    }
     Ok(())
 }
 
@@ -300,7 +445,7 @@ mod tests {
     #[test]
     fn oversized_video_reports_dimensions_limit_and_remedy_before_decode() {
         let mut video = Video {
-            path: "source.mp4".into(), times: vec![0.], keyframes: vec![], pts: vec![0],
+            path: "source.mp4".into(), transfer:String::new(), primaries:String::new(), times: vec![0.], keyframes: vec![], pts: vec![0], duration: None,
             timebase: Rational::from_integer(1.into()), last_request: None, decoded: 0,
             size: [32, 16], session: None, hardware: false, frames: Default::default(),
         };
@@ -334,14 +479,14 @@ mod tests {
     #[test]
     #[ignore="requires a real GPU and pinned Slang"]
     fn sequence_compositor_samples_its_own_extent_and_updates_with_the_clock()->Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let root=std::env::temp_dir().join(format!("vork-footage-compositor-{}",std::process::id()));
         std::fs::create_dir_all(&root)?;
         let first=image::RgbaImage::from_fn(8,4,|x,_|image::Rgba(if x<4 {[255,0,0,255]} else {[0,255,0,255]}));
         first.save(root.join("1001.png"))?;
         image::RgbaImage::from_pixel(8,4,image::Rgba([0,0,255,255])).save(root.join("1002.png"))?;
         let input:crate::Scene=serde_json::from_value(serde_json::json!({"version":2,
-            "render":{"resolution":[4,2],"fps":24,"motion_blur":{"shutter":1,"position":"end"},"compositor":["comp"],"settings":{"samples":4,"integrator":"path","denoiser":null}},
+            "composition":{"space":"3d","compositor":["comp"]},"render":{"resolution":[4,2],"fps":24,"motion_blur":{"shutter":1,"position":"end"},"settings":{"samples":4,"integrator":"path","denoiser":null}},
             "images":{"plate":{"file":"%04d.png"}},
             "programs":{"plate":{"source":"import vork; struct Inputs {Image plate;}; float4 composite(CompositeContext c,Inputs i) {return compositor_sample(i.plate,c.uv);}"}},
             "materials":{"comp":{"program":"plate","inputs":{"plate":{"image":"plate"}}}},
@@ -388,8 +533,7 @@ mod tests {
         for early in [false, true] {
             for samples in [1, 2] {
                 let mut input = serde_json::json!({"version":2,
-                    "render":{"resolution":[4,4],"fps":24,"compositor":["comp"],
-                        "settings":{"samples":samples,"integrator":"path","denoiser":null}},
+                    "composition":{"space":"3d","compositor":["comp"]},"render":{"resolution":[4,4],"fps":24,"settings":{"samples":samples,"integrator":"path","denoiser":null}},
                     "images":{"a":{"file":"a%d.png"},"b":{"file":"b%d.png"}},
                     "programs":{"plate":{"source":"import vork; struct Inputs {Image a; Image b;}; float4 composite(CompositeContext c, Inputs i) {return 0.5*(compositor_sample(i.a,c.uv)+compositor_sample(i.b,c.uv));}"}},
                     "materials":{"comp":{"program":"plate","inputs":{"a":{"image":"a"},"b":{"image":"b"}}}},
@@ -398,8 +542,8 @@ mod tests {
                     if samples == 2 {
                         input["render"]["motion_blur"] = serde_json::json!({"shutter":1});
                     }
-                    input["images"]["capture"] = serde_json::json!({"render":{
-                        "camera":"camera","resolution":[4,4],"compositor":["capture_mix"]
+                    input["images"]["capture"] = serde_json::json!({"composition":{"compositor":["capture_mix"]},"render":{
+                        "camera":"camera","resolution":[4,4]
                     }});
                     input["materials"]["capture_mix"] = input["materials"]["comp"].clone();
                     input["programs"]["capture_copy"] = serde_json::json!({"source":"import vork; struct Inputs {Image capture;}; float4 composite(CompositeContext c, Inputs i) {return compositor_sample(i.capture,c.uv);}"});
@@ -456,7 +600,7 @@ mod tests {
         let mut input: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/analytic.json"))?;
         input["render"]["resolution"] = serde_json::json!([32,24]);
         input["render"]["settings"] = serde_json::json!({"samples":1,"integrator":"raster","denoiser":null});
-        input["render"]["compositor"] = serde_json::json!(["comp"]);
+        input["composition"]["space"] = "3d".into(); input["composition"]["compositor"] = serde_json::json!(["comp"]);
         input["images"] = serde_json::json!({"plate":{"file":"plate%d.png"}});
         input["programs"] = serde_json::json!({"plate":{"source":"import vork; struct Inputs {Image plate;}; float4 composite(CompositeContext c, Inputs i) {return 0.5*(compositor_sample(c.uv)+compositor_sample(i.plate,c.uv));}"}});
         input["materials"]["comp"] = serde_json::json!({"program":"plate","inputs":{"plate":{"image":"plate"}}});
@@ -678,21 +822,52 @@ pub(crate) struct Installed {
     pub per_sample: bool,
     pub final_compositor: bool,
     pub view: wgpu::TextureView,
-    source: std::sync::Mutex<Source>,
+    source: Option<std::sync::Mutex<Source>>,
+    /// A picture of a canvas node (`images.X.render.root` names a 2D composition): drawn by Moda's engine at the
+    /// node's local time instead of read from a file.
+    pub canvas: Option<crate::canvas_world::Picture>,
     texture: wgpu::Texture,
     mips: crate::materials::MipChain,
-    srgb: bool,
+    /// The encoding the colour decoder is asked for.
+    upload: vork_scene::v2::WorkingColorSpace,
+    /// Whether an sRGB-encoded upload is decoded to linear light for the texture: a world reads scene-linear
+    /// texels. A canvas's image graph reads the encoding the canvas blends in, which the decoder delivers as it
+    /// is.
+    linear: bool,
+    color_space: Option<vork_scene::v2::ColorSpace>,
 }
 impl Installed {
     /// End external input work while the completed shot still owns GPU resources.
     pub(crate) fn finish(&mut self) {
-        if let Source::Video(video) = self.source.get_mut().unwrap() {
+        if let Some(Source::Video(video)) = self.source.as_mut().map(|source| source.get_mut().unwrap()) {
             video.session = None; // Session kills and reaps before closing its reader.
         }
     }
-    pub(crate) fn new(r:&crate::Renderer,name:&str,path:&Path,time:Option<vork_time::Clock>,srgb:bool,fps:vork_time::Time)->Result<Self> {
-        let mut source=Source::open_gpu(path,r)?;
-        let frame=source.frame(time.as_ref().map(vork_time::Request::from).unwrap_or(vork_time::Request::Numeric(0.)),fps,r.device.limits().max_texture_dimension_2d)?;
+    /// The texture a canvas's picture is drawn into each frame: its size, scene-linear with associated alpha.
+    pub(crate) fn canvas(r:&crate::Renderer,name:&str,picture:crate::canvas_world::Picture)->Result<Self> {
+        let [width,height]=picture.size();
+        let size=wgpu::Extent3d {width,height,depth_or_array_layers:1};
+        let texture=crate::gpu_memory::texture(&r.device,&wgpu::TextureDescriptor {
+            label:Some("canvas picture"),size,mip_level_count:32-width.max(height).leading_zeros(),sample_count:1,
+            dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba16Float,
+            usage:wgpu::TextureUsages::TEXTURE_BINDING|wgpu::TextureUsages::COPY_DST|wgpu::TextureUsages::RENDER_ATTACHMENT,
+            view_formats:&[],
+        });
+        let (pipelines,sampler)=crate::materials::mip_resources(r);
+        let mips=crate::materials::MipChain::new(&r.device,&texture,None,&pipelines[2],sampler);
+        Ok(Self {name:name.into(),time:None,per_sample:true,final_compositor:false,view:texture.create_view(&Default::default()),texture,mips,source:None,canvas:Some(picture),upload:vork_scene::v2::WorkingColorSpace::LinearRec709,linear:true,color_space:None})
+    }
+    /// A world's media image: scene-linear texels.
+    pub(crate) fn new(r:&crate::Renderer,name:&str,path:&Path,time:Option<vork_time::Clock>,srgb:bool,color_space:Option<vork_scene::v2::ColorSpace>,fps:vork_time::Time,opened:&Opened)->Result<Self> {
+        Self::from_source(r,name,opened.source(path)?,time,crate::texture_source::upload(srgb),true,color_space,fps)
+    }
+    /// The resident texture of `source`. `upload`: the encoding the colour decoder is asked for. `linear`: an
+    /// sRGB-encoded upload is decoded to linear light (`Installed::linear`).
+    pub(crate) fn from_source(r:&crate::Renderer,name:&str,mut source:Source,time:Option<vork_time::Clock>,upload:vork_scene::v2::WorkingColorSpace,linear:bool,color_space:Option<vork_scene::v2::ColorSpace>,fps:vork_time::Time)->Result<Self> {
+        source.prepare_gpu(r);
+        let instant=time.as_ref().map(vork_time::Request::from).unwrap_or(vork_time::Request::Numeric(0.)).exact()?;
+        let frame=source.frame_color_exact(&instant,fps,r.device.limits().max_texture_dimension_2d,color_space,upload,false)
+            .map_err(|error|crate::texture_source::for_image(error,name))?;
         let size=wgpu::Extent3d {width:frame.width(),height:frame.height(),depth_or_array_layers:1};
         let texture=crate::gpu_memory::texture(&r.device,&wgpu::TextureDescriptor {
             label:Some("footage image"),size,mip_level_count:32-size.width.max(size.height).leading_zeros(),sample_count:1,
@@ -702,20 +877,64 @@ impl Installed {
         });
         let (pipelines,sampler)=crate::materials::mip_resources(r);
         let mips=crate::materials::MipChain::new(&r.device,&texture,None,&pipelines[2],sampler);
-        Ok(Self {name:name.into(),time,per_sample:true,final_compositor:false,view:texture.create_view(&Default::default()),texture,mips,source:std::sync::Mutex::new(source),srgb})
+        Ok(Self {name:name.into(),time,per_sample:true,final_compositor:false,view:texture.create_view(&Default::default()),texture,mips,source:Some(std::sync::Mutex::new(source)),canvas:None,upload,linear,color_space})
     }
-    pub(crate) fn frame_index(&self,time:&Germ,fps:vork_time::Time)->Result<usize> {
-        self.source.lock().unwrap().frame_index_exact(time,fps)
+    /// Resolve a canvas's owning node before either sample or compositor publication.
+    pub(crate) fn canvas_instant(&self,s:&crate::InstalledScene,samples:&crate::animation::Samples,request:&Germ)->Result<Option<Germ>> {
+        let picture=self.canvas.as_ref().expect("canvas picture");
+        let node=s.nodes.iter().position(|n|n.node.name==picture.node())
+            .with_context(||format!("image {}: canvas node {:?} is not installed",self.name,picture.node()))?;
+        s.animation.local_instant(samples,node,request)
+            .map(|base|s.animation.image_time_exact(samples,request,&self.name,base)).transpose()
     }
-    pub(crate) fn encode(&self,r:&crate::Renderer,encoder:&mut wgpu::CommandEncoder,time:&Germ,fps:vork_time::Time)->Result<()> {
-        let frame=self.source.lock().unwrap().frame_exact(time,fps,r.device.limits().max_texture_dimension_2d)?;
+    /// Decoded media has source frames; a canvas has a continuous, sided local instant.
+    /// Absence is a publication too, distinct from both a picture and an invalidated key.
+    pub(crate) fn sample_key(&self,time:Option<&Germ>,fps:vork_time::Time)->Result<Vec<u8>> {
+        let Some(time)=time else {return Ok(vec![0])};
+        let mut key=Vec::new();
+        match &self.source {
+            Some(source)=>{
+                key.push(1);
+                key.extend_from_slice(&(source.lock().unwrap().frame_index_exact(time,fps)? as u64).to_le_bytes());
+            }
+            None=>{key.push(2);time.append_key(&mut key);}
+        }
+        Ok(key)
+    }
+    /// `errors` is the owning frame's shader diagnostics: a canvas picture's view reports a non-finite result
+    /// there, so the frame refuses it where it is collected and the picture needs no read-back of its own.
+    pub(crate) fn encode(&self,r:&crate::Renderer,encoder:&mut wgpu::CommandEncoder,time:Option<&Germ>,fps:vork_time::Time,errors:Option<&wgpu::Buffer>)->Result<()> {
+        let Some(time)=time else {
+            for mip in 0..self.texture.mip_level_count() {
+                let view=self.texture.create_view(&wgpu::TextureViewDescriptor {
+                    base_mip_level:mip,mip_level_count:Some(1),..Default::default()
+                });
+                let _pass=encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label:Some("absent canvas picture"),
+                    color_attachments:&[Some(wgpu::RenderPassColorAttachment {
+                        view:&view,resolve_target:None,depth_slice:None,
+                        ops:wgpu::Operations {load:wgpu::LoadOp::Clear(wgpu::Color::TRANSPARENT),store:wgpu::StoreOp::Store},
+                    })],..Default::default()
+                });
+            }
+            return Ok(());
+        };
+        if let Some(picture)=&self.canvas {
+            let level_zero=self.texture.create_view(&wgpu::TextureViewDescriptor {mip_level_count:Some(1),..Default::default()});
+            picture.encode(r,encoder,&vork_time::Request::Exact(time.clone()),&level_zero,errors)?;
+            self.mips.encode(encoder,None);
+            return Ok(());
+        }
+        let source=self.source.as_ref().expect("a file source");
+        let frame=source.lock().unwrap().frame_color_exact(time,fps,r.device.limits().max_texture_dimension_2d,self.color_space,self.upload,false)
+            .map_err(|error|crate::texture_source::for_image(error,&self.name))?;
         ensure!(frame.width()==self.texture.width() && frame.height()==self.texture.height(),"image {}: media frame dimensions changed; re-export every frame at the same resolution",self.name);
         let rgba=frame.into_rgba32f();
         let pitch=(self.texture.width()*8).div_ceil(wgpu::COPY_BYTES_PER_ROW_ALIGNMENT)*wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
         let mut data=vec![0u8;pitch as usize*self.texture.height() as usize];
         for (row,pixels) in rgba.as_raw().chunks_exact(self.texture.width() as usize*4).enumerate() {
             for (i,&value) in pixels.iter().enumerate() {
-                let value=if self.srgb && i%4!=3 {crate::texture_source::decode_srgb(value)} else {value};
+                let value=if self.linear && !self.upload.is_linear() && i%4!=3 {crate::texture_source::decode_srgb(value)} else {value};
                 let at=row*pitch as usize+i*2;
                 data[at..at+2].copy_from_slice(&half::f16::from_f32(value).to_bits().to_le_bytes());
             }

@@ -33,7 +33,7 @@ pub(crate) fn role(source: &str) -> Role {
         Role::Medium
     } else if source.contains("CompositeContext") && declares("float4", "composite(", "CompositeContext") {
         Role::Composite
-    } else if declares("float3", "display(", "DisplayContext") {
+    } else if declares("ViewResult", "view(", "ViewContext") {
         Role::Display
     } else if declares("Hair", "surface(", "ShadingContext") {
         Role::Hair
@@ -80,13 +80,36 @@ fn setup_image() -> Result<PathBuf> {
     Ok(file)
 }
 
+/// Process-owned one-point Gaussian captures, at SH degree 0 and 3 (the
+/// standard 3DGS export), so setup reaches the kernels splat renders compile.
+fn setup_splats() -> Result<Vec<PathBuf>> {
+    static SPLAT_LOCK:std::sync::Mutex<()>=std::sync::Mutex::new(());
+    let _lock=SPLAT_LOCK.lock().unwrap();
+    [0usize, 45].into_iter().map(|rest| {
+        let file=std::env::temp_dir().join(format!("vork-setup-splat-{rest}-{}.ply",std::process::id()));
+        if !file.exists() {
+            let mut ply=String::from("ply\nformat ascii 1.0\nelement vertex 1\n");
+            let names=["x","y","z","scale_0","scale_1","scale_2","opacity","rot_0","rot_1","rot_2","rot_3","f_dc_0","f_dc_1","f_dc_2"];
+            for name in names.iter().map(|n|n.to_string()).chain((0..rest).map(|i|format!("f_rest_{i}"))) {
+                ply.push_str(&format!("property float {name}\n"));
+            }
+            // A unit-quaternion, half-opaque, grey point at the origin.
+            ply.push_str("end_header\n0 0 0 -2 -2 -2 0 1 0 0 0 0.5 0.5 0.5");
+            for _ in 0..rest {ply.push_str(" 0");}
+            ply.push('\n');
+            std::fs::write(&file,ply)?;
+        }
+        Ok(file)
+    }).collect()
+}
+
 /// One minimal setup scene.
 fn scene(compositor: serde_json::Value, motion_blur: serde_json::Value, meshes: Vec<serde_json::Value>, camera: serde_json::Value,
     world: serde_json::Value, materials: serde_json::Value, sun: serde_json::Value) -> serde_json::Value {
     let mut nodes = meshes;
     nodes.extend([camera, serde_json::json!({"type":"light","name":"sun","shape":"sun"}), world]);
     serde_json::json!({"version": 2,
-        "render": {"resolution": [64, 64], "compositor": compositor, "motion_blur": motion_blur, "settings": {"samples":1,"shadow_method":sun}},
+        "composition":{"space":"3d","compositor":compositor},"render": {"resolution": [64, 64], "motion_blur": motion_blur, "settings": {"samples":1,"shadow_method":sun}},
         "buffers": {"p": {"type": "vec3", "data": [[0, 0, 0], [1, 0, 0], [0, 1, 0]]},
             "s": {"type": "vec3", "data": [[0, -1, 0], [0, 1, 0]]},
             "w": {"type": "f32", "data": [0.1, 0.1]}, "c": {"type": "u32", "data": [2]}},
@@ -98,6 +121,17 @@ fn scene(compositor: serde_json::Value, motion_blur: serde_json::Value, meshes: 
 
 /// The scenes of one library program, in the role its entry point declares.
 fn program_scenes(r: &Renderer, name: &'static str, source: &str) -> Result<Vec<serde_json::Value>> {
+    if name == crate::splats::PROGRAM {
+        // Its inputs are SH attributes only a capture supplies: the importer binds
+        // them, promotes to path transport and selects the Gaussian intersection
+        // kernels, exactly as a render of a splat asset does. Splats need ray queries.
+        if !r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) { return Ok(Vec::new()); }
+        return setup_splats()?.into_iter().map(|file| Ok(scene(serde_json::json!([]), serde_json::Value::Null,
+            vec![serde_json::json!({"type": "asset", "name": "m", "file": file})],
+            serde_json::json!({"type": "camera", "name": "c", "translation": [0,0,3]}),
+            serde_json::json!({"type": "light", "name": "world", "shape": "environment"}),
+            serde_json::json!({}), serde_json::json!("auto")))).collect();
+    }
     let mut scenes = Vec::new();
     let mut materials = serde_json::Map::new();
     let mut light = serde_json::json!({"type": "light", "name": "world", "shape": "environment"});
@@ -153,7 +187,17 @@ fn program_scenes(r: &Renderer, name: &'static str, source: &str) -> Result<Vec<
         scenes.push(value);
     }
     if role(source) == Role::Display {
-        for scene in &mut scenes { scene["render"]["display"] = "std".into(); }
+        for scene in &mut scenes { scene["composition"] = serde_json::json!({"space":"3d","view":"std"}); }
+    }
+    Ok(scenes)
+}
+
+#[cfg(test)]
+fn authored_medium_scenes(r: &Renderer) -> Result<Vec<serde_json::Value>> {
+    let source=include_str!("../../vork-scene/tests/fixtures/medium.slang");
+    let mut scenes=program_scenes(r,"test-medium",source)?;
+    for scene in &mut scenes {
+        scene["programs"]["test-medium"]=serde_json::json!({"source":source});
     }
     Ok(scenes)
 }
@@ -221,12 +265,18 @@ fn run(r: &Renderer, jobs: impl Iterator<Item = (serde_json::Value, v2::Settings
     vork_slang::progress::phase(phase,jobs.len());
     let jobs = std::sync::Mutex::new(jobs.into_iter());
     let completed = std::sync::atomic::AtomicUsize::new(0);
+    // One configuration's failure does not stop the others warming; every
+    // failure is reported, and the first keeps its error and failure kind.
+    let failures = std::sync::Mutex::new(Vec::<(String, anyhow::Error)>::new());
     let workers = std::thread::available_parallelism().map_or(1, usize::from).min(4);
     std::thread::scope(|scope| {
         let workers: Vec<_> = (0..workers).map(|_| scope.spawn(|| -> Result<()> {
             loop {
                 let Some((scene, integrator)) = jobs.lock().unwrap().next() else { break };
-                let name = scene["materials"]["std"]["program"].as_str().unwrap_or("built-in materials").to_owned();
+                let name = scene["materials"]["std"]["program"].as_str().map(str::to_owned)
+                    .or_else(|| scene["nodes"].as_array().unwrap().iter().any(|node| node["type"] == "asset")
+                        .then(|| crate::splats::PROGRAM.to_owned()))
+                    .unwrap_or_else(|| "built-in materials".into());
                 let explicit_camera = scene["nodes"].as_array().unwrap().iter()
                     .any(|node| node["type"] == "camera" && !node["material"].is_null());
                 // The explicit standard-camera jobs retain the broad hit keys.
@@ -245,14 +295,22 @@ fn run(r: &Renderer, jobs: impl Iterator<Item = (serde_json::Value, v2::Settings
                     Ok(())
                 };
                 match compile() {
-                    Err(error) if crate::failure::is_scene(&error) => {}
-                    result => result.with_context(|| format!("setup pipelines for {name}"))?,
+                    // Sampled transport refuses a library medium it cannot bound; every other refusal is a failure.
+                    Err(error) if crate::failure::cause::<crate::medium::SampledRefusal>(&error).is_some() => {}
+                    Err(error) => failures.lock().unwrap().push((name, error)),
+                    Ok(()) => {}
                 }
                 vork_slang::progress::completed(completed.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1);
             }
             Ok(())
         })).collect();
         workers.into_iter().try_for_each(pipelines::join)
+    })?;
+    let mut failures = failures.into_inner().unwrap().into_iter();
+    let Some((name, error)) = failures.next() else { return Ok(()) };
+    let others: Vec<String> = failures.map(|(name, error)| format!("{name}: {error:#}")).collect();
+    Err(if others.is_empty() { error.context(format!("setup pipelines for {name}")) } else {
+        error.context(format!("setup pipelines for {name}; {} more setup configuration(s) also failed: {}", others.len(), others.join("; ")))
     })
 }
 
@@ -283,6 +341,113 @@ fn warm_raster_tables(r: &Renderer) -> Result<()> {
     }).collect();
     jobs.extend(camera_jobs);
     run(r,jobs.into_iter(), InstallOptions {variants:pipelines::VariantCompile::SetupPlain,..Default::default()})
+}
+
+/// The displays a canvas encodes for (`output_device::admit`).
+fn canvas_displays() -> [crate::output_device::Target; 2] {
+    [v2::OutputDisplay::Srgb, v2::OutputDisplay::DisplayP3].map(crate::output_device::Target::for_display)
+}
+
+/// A canvas runs its view in the display stage's picture form: the stage reads the canvas's picture as a
+/// texture and writes the frame, a different shader from a world's stage for the same view program, and one
+/// per display. Each std view is drawn as a root canvas's view for each display a canvas encodes for, and so
+/// is the default view of a plain canvas, exactly as a render of that canvas draws it, the picture an EXR
+/// destination reads included (an authored view's floating stage): a first canvas render, to any destination,
+/// compiles neither the program nor its stage.
+fn warm_canvas_views(r: &Renderer) -> Result<()> {
+    let views = vork_scene::libraries::prebuilt_programs().filter(|name| vork_slang::module_source(name).is_some_and(|source| role(source) == Role::Display));
+    for view in std::iter::once(None).chain(views.map(Some)) {
+        let mut composition = serde_json::json!({"space": "2d"});
+        if let Some(name) = view { composition["view"] = serde_json::json!({"program": name}); }
+        let scene: v2::Scene = serde_json::from_value(serde_json::json!({"version": 2,
+            "composition": composition, "render": {"resolution": [16, 16]}, "nodes": []}))?;
+        for display in canvas_displays() {
+            crate::canvas::warm(&scene, Path::new("."), r, display)
+                .with_context(|| format!("setup canvas view {} for {}", view.unwrap_or("default"), display.display.name()))?;
+        }
+    }
+    Ok(())
+}
+
+/// What a canvas draws, one node of each kind: Moda creates a drawing pipeline the first time a frame needs
+/// it, so setup draws frames that need each. Two canvases, because how Moda draws a node depends on what
+/// else is on the page: a group's opacity (and the like) splits the page, and on a split page a rounded shape
+/// is drawn as a path, not by the shape pipelines a plain page uses. `effects: false` is the plain page:
+/// solid and gradient fills, strokes and dashes, rounded shapes opaque and translucent. `effects: true` adds
+/// image fills, blur, drop shadow, a clip path, a mask and a group's opacity. A blurred node is drawn into a
+/// capture of one sample and a shadowed one into a capture of four, and a pipeline is created per sample
+/// count, so the effects page also blurs a group that holds one node of each kind (`soft`). A filtered node
+/// inside a filtered group is composited into the group's capture, at that capture's sample count: `soft` holds
+/// a blurred and a shadowed node, and so does a shadowed group (`lifted`). Blend modes other
+/// than normal are left to first use.
+fn canvas_catalogue(float: bool, effects: bool) -> Result<v2::Scene> {
+    let image = setup_image()?;
+    let rect = "M4 4H28V28H4Z";
+    let rounded = "M8 4H24A4 4 0 0 1 28 8V24A4 4 0 0 1 24 28H8A4 4 0 0 1 4 24V8A4 4 0 0 1 8 4Z";
+    let circle = "M4 16A12 12 0 1 0 28 16A12 12 0 1 0 4 16Z";
+    let mut composition = serde_json::json!({"space": "2d"});
+    // An authored view makes the canvas float: Moda then draws the same nodes into Rgba16Float.
+    if float { composition["view"] = serde_json::json!({"program": "std/standard"}); }
+    let mut nodes = serde_json::json!([
+            {"name": "solid", "type": "path", "d": rect, "fill": "#3a86ff", "stroke": "#ffffff", "stroke-width": 2},
+            {"name": "linear", "type": "path", "d": rect, "fill": "linear-gradient(to bottom, #415a77, #0d1b2a)", "translation": [32, 0, 0]},
+            {"name": "radial", "type": "path", "d": rect, "fill": "radial-gradient(closest-side, white, black)", "translation": [64, 0, 0]},
+            {"name": "repeating", "type": "path", "d": rounded, "fill": "repeating-linear-gradient(45deg, #ffbe0b 0px, #ffbe0b 4px, #fb5607 4px, #fb5607 8px)", "translation": [0, 32, 0]},
+            {"name": "plate", "type": "path", "d": rounded, "fill": "rgba(0, 0, 0, 0.6)", "translation": [32, 32, 0]},
+            {"name": "card", "type": "path", "d": rounded, "fill": "#06d6a0", "translation": [64, 32, 0]},
+            {"name": "ring", "type": "path", "d": circle, "fill": "none", "stroke": "#e0e1dd", "stroke-width": 3, "stroke-linecap": "round",
+                "pathLength": 100, "stroke-dasharray": [60, 40], "stroke-dashoffset": 10, "translation": [0, 64, 0]}
+    ]);
+    if effects {
+        nodes.as_array_mut().expect("nodes").extend(serde_json::json!([
+            {"name": "photo", "type": "path", "d": rounded, "fill": {"image": "picture", "fit": "cover"}, "translation": [32, 64, 0]},
+            {"name": "pattern", "type": "path", "d": rect, "fill": {"image": "picture"}, "stroke": "#ffffff", "stroke-width": 1, "stroke-opacity": 0.6, "translation": [64, 64, 0]},
+            {"name": "shadowed", "type": "path", "d": rounded, "fill": {"image": "picture", "fit": "cover"}, "filter": "drop-shadow(0 2px 2px rgba(0, 0, 0, 0.6))", "translation": [32, 64, 0]},
+            {"name": "blurred", "type": "path", "d": circle, "fill": "#ff006e", "opacity": 0.55, "filter": "blur(3px)", "translation": [16, 16, 0]},
+            {"name": "glow", "type": "path", "d": "M4 16C10 4 18 28 28 16", "fill": "none", "stroke": "#36f9c5", "stroke-width": 2, "filter": "drop-shadow(0 0 3px #36f9c5)", "translation": [48, 16, 0]},
+            {"name": "wipe", "type": "path", "d": circle},
+            {"name": "clipped", "type": "path", "d": rect, "fill": "#8338ec", "clip-path": "wipe", "translation": [16, 48, 0]},
+            {"name": "spot", "type": "path", "d": rect, "fill": "radial-gradient(closest-side, white, black)"},
+            {"name": "masked", "type": "path", "d": rect, "fill": "linear-gradient(to right, #3a86ff, #8338ec, #ff006e)", "mask": "spot", "translation": [48, 48, 0]},
+            {"name": "group", "opacity": 0.5, "translation": [8, 8, 0], "children": [
+                {"name": "under", "type": "path", "d": rect, "fill": "#ffbe0b"},
+                {"name": "over", "type": "path", "d": circle, "fill": "#fb5607", "translation": [8, 8, 0]}]},
+            {"name": "soft", "filter": "blur(1px)", "children": [
+                {"name": "soft-solid", "type": "path", "d": rect, "fill": "#3a86ff", "stroke": "#ffffff", "stroke-width": 2},
+                {"name": "soft-linear", "type": "path", "d": rect, "fill": "linear-gradient(to bottom, #415a77, #0d1b2a)", "translation": [32, 0, 0]},
+                {"name": "soft-radial", "type": "path", "d": rect, "fill": "radial-gradient(closest-side, white, black)", "translation": [64, 0, 0]},
+                {"name": "soft-repeating", "type": "path", "d": rounded, "fill": "repeating-linear-gradient(45deg, #ffbe0b 0px, #ffbe0b 4px, #fb5607 4px, #fb5607 8px)", "translation": [0, 32, 0]},
+                {"name": "soft-plate", "type": "path", "d": rounded, "fill": "rgba(0, 0, 0, 0.6)", "translation": [32, 32, 0]},
+                {"name": "soft-card", "type": "path", "d": rounded, "fill": "#06d6a0", "translation": [64, 32, 0]},
+                {"name": "soft-ring", "type": "path", "d": circle, "fill": "none", "stroke": "#e0e1dd", "stroke-width": 3, "stroke-linecap": "round",
+                    "pathLength": 100, "stroke-dasharray": [60, 40], "stroke-dashoffset": 10, "translation": [0, 64, 0]},
+                {"name": "soft-photo", "type": "path", "d": rounded, "fill": {"image": "picture", "fit": "cover"}, "translation": [32, 64, 0]},
+                {"name": "soft-pattern", "type": "path", "d": rect, "fill": {"image": "picture"}, "translation": [64, 64, 0]},
+                {"name": "soft-blurred", "type": "path", "d": circle, "fill": "#ff006e", "filter": "blur(1px)", "translation": [16, 16, 0]},
+                {"name": "soft-shadowed", "type": "path", "d": rounded, "fill": "#06d6a0", "filter": "drop-shadow(0 1px 1px rgba(0, 0, 0, 0.6))", "translation": [48, 16, 0]}]},
+            {"name": "lifted", "filter": "drop-shadow(0 1px 1px rgba(0, 0, 0, 0.6))", "children": [
+                {"name": "lifted-blurred", "type": "path", "d": circle, "fill": "#ffbe0b", "filter": "blur(1px)", "translation": [16, 48, 0]},
+                {"name": "lifted-shadowed", "type": "path", "d": rounded, "fill": "#3a86ff", "filter": "drop-shadow(0 1px 1px rgba(0, 0, 0, 0.6))", "translation": [48, 48, 0]}]}
+        ]).as_array().expect("nodes").iter().cloned());
+    }
+    Ok(serde_json::from_value(serde_json::json!({"version": 2, "composition": composition,
+        "render": {"resolution": [96, 96], "background": "#101820"},
+        "images": {"picture": {"file": image}}, "nodes": nodes}))?)
+}
+
+/// The pipelines a canvas's drawing creates: both catalogue pages on an 8-bit and on a float canvas, drawn as
+/// a render draws them, and text on each. Text has no font here; its batches are built in code
+/// (`canvas_draw::warm_text`).
+fn warm_canvas_drawing(r: &Renderer) -> Result<()> {
+    for float in [false, true] {
+        let precision = if float { "float" } else { "8-bit" };
+        for effects in [false, true] {
+            crate::canvas::warm(&canvas_catalogue(float, effects)?, Path::new("."), r, Default::default())
+                .with_context(|| format!("setup canvas drawing ({precision}{})", if effects { ", effects" } else { "" }))?;
+        }
+        crate::canvas_draw::warm_text(r, float).with_context(|| format!("setup canvas text ({precision})"))?;
+    }
+    Ok(())
 }
 
 /// The exact init scene and the render command's default profile. Use ordinary
@@ -321,23 +486,61 @@ pub(crate) fn warm(r: &Renderer) -> Result<()> {
     warm_startup(r, pipelines::VariantCompile::Inline)?;
     let mut all = table_scenes(r);
     all.extend(scenes(r, vork_scene::libraries::prebuilt_programs())?);
-    compile(r, &all)
+    compile(r, &all)?;
+    warm_canvas_views(r)?;
+    // Drawing creates driver pipelines and compiles nothing a release carries: release preparation, whose
+    // device executes nothing, has no use for it.
+    if r.release_preparation { return Ok(()); }
+    warm_canvas_drawing(r)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// Release preparation's CPU-only adapter (ray queries enabled) at std/path.
+    fn release_jobs(scenes: &[serde_json::Value]) -> Result<Vec<(serde_json::Value, v2::Settings)>> {
+        let path = v2::Profile::load("std/path")?.resolve(&Default::default())?;
+        Ok(scenes.iter().map(|scene| (scene.clone(), path.clone())).collect())
+    }
+
     #[test]
+    fn release_catalogue_warms_gaussian_radiance_through_a_capture() -> Result<()> {
+        let r = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        let source = vork_slang::module_source(crate::splats::PROGRAM).context("gaussian module")?;
+        let scenes = program_scenes(&r, crate::splats::PROGRAM, source)?;
+        assert_eq!(scenes.len(), 2, "SH degree 0 and degree 3 captures");
+        run(&r, release_jobs(&scenes)?.into_iter(), InstallOptions { variants: pipelines::VariantCompile::Setup, ..Default::default() })
+    }
+
+    #[test]
+    fn one_failed_configuration_reports_every_failure_without_stopping_the_rest() -> Result<()> {
+        let r = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        // Bound to a triangle, the radiance program's SH attributes have no source.
+        let unbound = scene(serde_json::json!([]), serde_json::Value::Null,
+            vec![serde_json::json!({"type": "mesh", "name": "m", "geometry": "triangle", "materials": ["std"]})],
+            serde_json::json!({"type": "camera", "name": "c", "translation": [0,0,3]}),
+            serde_json::json!({"type": "light", "name": "world", "shape": "environment"}),
+            serde_json::json!({"std": {"program": crate::splats::PROGRAM}}), serde_json::json!("auto"));
+        let healthy = table_scenes(&r).remove(0);
+        let jobs = release_jobs(&[unbound.clone(), healthy.clone(), unbound.clone()])?;
+        let error = run(&r, jobs.into_iter(), InstallOptions { variants: pipelines::VariantCompile::Setup, ..Default::default() })
+            .expect_err("unbound attributes refuse").to_string();
+        assert!(error.starts_with("setup pipelines for std/gaussian; 1 more setup configuration(s) also failed: std/gaussian: "), "{error}");
+        assert!(error.contains("Attribute requires an attribute binding"), "{error}");
+        run(&r, release_jobs(&[healthy])?.into_iter(), InstallOptions { variants: pipelines::VariantCompile::Setup, ..Default::default() })
+    }
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn startup_plain_hits_match_exact_specializations() -> Result<()> {
         for metalness in [0., 1.] {
-            // Adapter-free runners skip with test_renderer's diagnostic; renderer
-            // failures and actual hit-selection/pixel assertions still fail on a GPU.
-            let Some(mut r) = crate::test_renderer()? else { return Ok(()) };
+            // Explicit GPU runs require renderer creation and all assertions to succeed.
+            let mut r = crate::test_renderer()?;
             // Isolate the device-key catalogue from disk and other tests. Setup
             // must be the sole source of known keys for the first install.
             let keys=r.disk_cache.path("test-plain-hit-keys",1,blake3::hash(b""));
-            r.compiler = pipelines::Compiler::new(&r.device, r.cache.as_ref(), pipelines::Known::load(keys,false));
+            r.compiler = pipelines::Compiler::new(&r.device, r.cache.as_ref(), pipelines::Known::load(keys,false), r.compiler.blob());
             // This regression covers the exhaustive catalogue's raster hit selection.
             passes::decoupled::warm_shaders(&r);
             warm_raster_tables(&r)?;
@@ -425,7 +628,8 @@ mod tests {
         let roles: Vec<_> = vork_scene::libraries::prebuilt_programs()
             .map(|name| (name, role(vork_slang::module_source(name).unwrap()))).collect();
         for (name, expected) in [("std/sky", Role::Environment),
-            ("std/hair", Role::Hair), ("std/camera",Role::Camera), ("std/environment_image",Role::Environment)] {
+            ("std/hair", Role::Hair), ("std/camera",Role::Camera), ("std/environment_image",Role::Environment),
+            ("std/agx", Role::Display), ("std/standard", Role::Display)] {
             assert!(roles.contains(&(name, expected)), "{name}: {roles:?}");
         }
         // Authored media are recognized by their entry signature.
@@ -436,8 +640,9 @@ mod tests {
 
     /// The synthetic scenes still obey the scene schema and settings contract.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn setup_scenes_validate() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()) };
+        let r = crate::test_renderer()?;
         let mut scenes = table_scenes(&r);
         scenes.extend(self::scenes(&r, vork_scene::libraries::prebuilt_programs())?);
         let mut count = 0;
@@ -450,7 +655,7 @@ mod tests {
         Ok(())
     }
 
-    /// Exercise setup's complete compile core, including both fog variants. Running
+    /// Exercise setup's complete compile core, including authored medium variants. Running
     /// synthetic frames here used to fail the unbounded-emission diagnostic.
     #[test]
     #[ignore = "requires Vulkan/Metal and pinned Slang toolchain; complete setup warmup"]
@@ -459,7 +664,7 @@ mod tests {
         r.warm_shaders()?;
         // Compilation must also accept inputs whose infinite-world integral is
         // divergent. The same inputs must still be refused by a real frame.
-        let mut scenes = scenes(&r, ["std/fog"].into_iter())?;
+        let mut scenes = authored_medium_scenes(&r)?;
         for scene in &mut scenes {
             scene["materials"]["std"]["inputs"] = serde_json::json!({"density": 0., "emission": [1., 1., 1.]});
         }
@@ -479,8 +684,9 @@ mod tests {
     /// transmissive camera kernel: it draws the supersets setup stored, with the
     /// pixels of its own specializations.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn one_frame_renders_draw_setup_supersets() -> Result<()> {
-        let Some(mut r) = crate::test_renderer()? else { return Ok(()) };
+        let mut r = crate::test_renderer()?;
         if !r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) { return Ok(()) }
         let root = std::env::temp_dir().join(format!("vork-setup-supersets-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
@@ -488,7 +694,7 @@ mod tests {
         r.disk_cache = disk_cache::Store::for_test(root.clone());
         // Warmth comes only from this store: drop keys loaded from the shared one.
         let known = pipelines::Known::load(r.disk_cache.path("pipeline-keys", 1, blake3::hash(b"")), false);
-        r.compiler = pipelines::Compiler::new(&r.device, r.cache.as_ref(), known);
+        r.compiler = pipelines::Compiler::new(&r.device, r.cache.as_ref(), known, r.compiler.blob());
         // Setup's shipped camera generics, then its built-in-material scenes.
         passes::decoupled::warm_shaders(&r);
         compile(&r, &table_scenes(&r))?;
@@ -527,9 +733,32 @@ mod tests {
         Ok(())
     }
 
+    /// Setup prepares every std view as a canvas's view; a canvas with that view then finds its program compiled.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+    fn setup_prepares_std_views_for_canvases() -> Result<()> {
+        let r = crate::test_renderer()?;
+        let views: Vec<_> = vork_scene::libraries::prebuilt_programs()
+            .filter(|name| role(vork_slang::module_source(name).expect("std module")) == Role::Display).collect();
+        assert!(views.contains(&"std/standard") && views.contains(&"std/agx"), "{views:?}");
+        warm_canvas_views(&r)?;
+        // Every std view now finds its compiled program: a canvas with other inputs packs different words only.
+        for name in views {
+            let source = vork_slang::module_source(name).context("std view module")?;
+            let origin = PathBuf::from(format!("{name}.slang"));
+            let key = crate::display_program::program_key(&programs::abi(), source, &origin)?;
+            let _: vork_slang::DisplayProgram = programs::cached(&r, key, &vork_slang::Compiler::discover(), &programs::abi(), source, &origin,
+                |_| bail!("{name} compiled again"))?;
+        }
+        let scene: v2::Scene = serde_json::from_value(serde_json::json!({"version": 2,
+            "composition": {"space": "2d", "view": {"program": "std/standard", "inputs": {"exposure": 1}}}, "render": {"resolution": [32, 32]}, "nodes": []}))?;
+        crate::canvas::check(&scene, Path::new("."), &r)
+    }
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn setup_prebuilds_std_worlds() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()) };
+        let r = crate::test_renderer()?;
         compile(&r, &scenes(&r, ["std/sky"].into_iter())?)?;
         // Any std/sky world now finds its compiled program; only its input words differ.
         let source = vork_slang::module_source("std/sky").context("std/sky module")?;
@@ -541,7 +770,7 @@ mod tests {
         let (image, program) = environment_program::install(&r, &scene, "sky", Path::new("."))?;
         assert!(program.is_none() && image.image.pixels().any(|p| p.0[2] > 0.), "a constant, lit sky");
         // Fog at its defaults and varied, under each shadow topology: every medium kernel.
-        assert_eq!(scenes(&r, ["std/fog"].into_iter())?.len(), 2 * shadows(&r).len());
+        assert_eq!(authored_medium_scenes(&r)?.len(), 2 * shadows(&r).len());
         Ok(())
     }
 }

@@ -1,8 +1,9 @@
 {
   "version": 2,
+  "composition": {"space": "3d", "view": {"program":"std/agx","inputs":{"exposure":0}}},
   "render": {
     "background": "environment",
-    "display": {"program":"std/agx","inputs":{"exposure":0}},
+
     "resolution": [
       480,
       320

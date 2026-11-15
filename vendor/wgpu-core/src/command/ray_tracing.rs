@@ -38,9 +38,40 @@ fn submitted_update_source(submitted: Option<NonZeroU64>, current: Option<NonZer
     submitted.filter(|generation| Some(*generation) == current)
 }
 
+/// The shape (`None` when unknown) left by the build an UPDATE recorded now
+/// would refit. Commands execute in recording order, so the latest earlier
+/// build of the structure in this recording replaces the submitted one as the
+/// source. It reaches the native queue, or fails to, together with its UPDATE.
+fn update_source_shape<T>(recorded: Option<Option<T>>, submitted: impl FnOnce() -> Option<T>) -> Option<T> {
+    recorded.unwrap_or_else(submitted)
+}
+
+/// Instance count of the latest earlier TLAS build in this recording. The
+/// outer `None` means the recording has not built it; the inner one that the
+/// build left no refittable shape (marked built, or not `PreferUpdate`).
+fn recorded_tlas_shape(actions: &[AsAction], tlas: &Arc<Tlas>) -> Option<Option<u32>> {
+    actions.iter().rev().find_map(|action| match action {
+        AsAction::Build(build) => build.tlas_s_built.iter().rev()
+            .find(|entry| Arc::ptr_eq(&entry.tlas, tlas))
+            .map(|entry| entry.refit.map(|refit| refit.count)),
+        AsAction::UseTlas(_) => None,
+    })
+}
+
+/// Triangle geometry of the latest earlier BLAS build in this recording, with
+/// the same two levels as [`recorded_tlas_shape`].
+fn recorded_blas_shape<'a>(actions: &'a [AsAction], blas: &Arc<Blas>) -> Option<Option<&'a [ArcBlasTriangleGeometry]>> {
+    actions.iter().rev().find_map(|action| match action {
+        AsAction::Build(build) if build.blas_s_built.iter().any(|entry| Arc::ptr_eq(entry, blas)) =>
+            Some(build.blas_refits.iter().rev().find(|refit| Arc::ptr_eq(&refit.blas, blas))
+                .map(|refit| refit.geometries.as_slice())),
+        _ => None,
+    })
+}
+
 #[cfg(test)]
 mod refit_generation_tests {
-    use super::submitted_update_source;
+    use super::{submitted_update_source, update_source_shape};
     use core::num::NonZeroU64;
 
     #[test]
@@ -54,6 +85,19 @@ mod refit_generation_tests {
         // Failed/replaced builds must rebuild rather than reuse stale metadata.
         assert_eq!(submitted_update_source(first, second), None);
         assert_eq!(submitted_update_source(second, second), second);
+    }
+
+    #[test]
+    fn an_earlier_build_in_the_recording_replaces_the_submitted_source() {
+        // Nothing recorded yet: the submitted build, when there is one.
+        assert_eq!(update_source_shape(None, || Some(3)), Some(3));
+        assert_eq!(update_source_shape(None, || None::<u32>), None);
+        // A recorded build is the source whether or not anything was
+        // submitted, and hides a submitted build of another shape.
+        assert_eq!(update_source_shape(Some(Some(4)), || None), Some(4));
+        assert_eq!(update_source_shape(Some(Some(4)), || Some(3)), Some(4));
+        // A recorded build of unknown shape leaves nothing to refit.
+        assert_eq!(update_source_shape(Some(None), || Some(3)), None);
     }
 }
 
@@ -220,6 +264,14 @@ impl Global {
             let blas = blas_iter
                 .map(|blas_entry| {
                     let geometries = match blas_entry.geometries {
+                        BlasGeometries::AabbGeometries(geometries) => {
+                            ArcBlasGeometries::AabbGeometries(geometries.map(|g| {
+                                Ok(crate::ray_tracing::OwnedBlasAabbGeometry {
+                                    size: g.size.clone(), buffer: self.resolve_buffer_id(g.buffer)?,
+                                    offset: g.offset, stride: g.stride,
+                                })
+                            }).collect::<Result<_, BuildAccelerationStructureError>>()?)
+                        }
                         BlasGeometries::TriangleGeometries(triangle_geometries) => {
                             let tri_geo = triangle_geometries
                                 .map(|tg| {
@@ -469,21 +521,21 @@ pub(crate) fn build_acceleration_structures(
     }) in tlas_storage.iter().enumerate()
     {
         let hal::AccelerationStructureEntries::Instances(instances) = entries else { unreachable!() };
-        let source = if tlas.update_mode == wgt::AccelerationStructureUpdateMode::PreferUpdate {
-            let source = tlas.submitted_refit.read().filter(|(_, count)| *count == instances.count).map(|(generation, _)| generation);
-            let source = submitted_update_source(source, *tlas.built_index.read()).filter(|_| {
-                if force_rebuild { return false; }
-                !state.as_actions.iter().any(|action| matches!(action, AsAction::Build(build)
-                    if build.tlas_s_built.iter().any(|entry| Arc::ptr_eq(&entry.tlas, tlas))))
+        let update = tlas.update_mode == wgt::AccelerationStructureUpdateMode::PreferUpdate && {
+            let source = update_source_shape(recorded_tlas_shape(&state.as_actions[..], tlas), || {
+                let submitted = *tlas.submitted_refit.read();
+                submitted_update_source(submitted.map(|(generation, _)| generation), *tlas.built_index.read())
+                    .and(submitted).map(|(_, count)| count)
             });
-            build_command.tlas_s_built[build_index].refit = Some((source, instances.count));
-            source
-        } else { None };
+            let update = !force_rebuild && source == Some(instances.count);
+            build_command.tlas_s_built[build_index].refit = Some(crate::ray_tracing::TlasRefit { update, count: instances.count });
+            update
+        };
         tlas_descriptors.push(hal::BuildAccelerationStructureDescriptor {
             entries,
-            mode: if source.is_some() { hal::AccelerationStructureBuildMode::Update } else { hal::AccelerationStructureBuildMode::Build },
+            mode: if update { hal::AccelerationStructureBuildMode::Update } else { hal::AccelerationStructureBuildMode::Build },
             flags: tlas.flags,
-            source_acceleration_structure: if source.is_some() {Some(tlas.try_raw(state.snatch_guard)?)} else {None},
+            source_acceleration_structure: if update {Some(tlas.try_raw(state.snatch_guard)?)} else {None},
             destination_acceleration_structure: tlas.try_raw(state.snatch_guard)?,
             scratch_buffer: scratch_buffer.raw(),
             scratch_buffer_offset: *scratch_buffer_offset,
@@ -634,7 +686,7 @@ impl CommandBufferMutable {
                         // in several buffers. Intervening compatible builds and
                         // updates are legal; a changed generation alone is not
                         // evidence that native UPDATE's topology changed.
-                        if refit.source.is_some() && !previous.as_ref().is_some_and(|geometries|
+                        if refit.update && !previous.as_ref().is_some_and(|geometries|
                             crate::ray_tracing::refit_compatible(geometries, &refit.geometries)) {
                             return Err(ValidateAsActionsError::StaleBlasUpdate(refit.blas.error_ident()));
                         }
@@ -663,12 +715,12 @@ impl CommandBufferMutable {
                             let previous = updates.tlas.entry(tlas_build.tlas.tracker_index()).or_insert_with(|| {
                                 tlas_build.tlas.submitted_refit.read().map(|(_, count)| count)
                             });
-                            if let Some((Some(_), count)) = tlas_build.refit {
+                            if let Some(crate::ray_tracing::TlasRefit { update: true, count }) = tlas_build.refit {
                                 if *previous != Some(count) {
                                     return Err(ValidateAsActionsError::StaleTlasUpdate(tlas_build.tlas.error_ident()));
                                 }
                             }
-                            *previous = tlas_build.refit.map(|(_, count)| count);
+                            *previous = tlas_build.refit.map(|refit| refit.count);
                         }
                         tlas_build.tlas.try_raw(snatch_guard)?;
                         for blas in &tlas_build.dependencies {
@@ -756,27 +808,69 @@ fn iter_blas<'snatch_guard: 'buffers, 'buffers>(
         build_command.blas_s_built.push(blas.clone());
 
         match &entry.geometries {
-            ArcBlasGeometries::TriangleGeometries(triangle_geometries) => {
-                let source = if blas.update_mode == wgt::AccelerationStructureUpdateMode::PreferUpdate {
-                    blas.submitted_refit.read().as_ref().filter(|previous|
-                        crate::ray_tracing::refit_compatible(&previous.geometries, triangle_geometries)
-                    ).map(|previous| previous.generation)
-                } else { None };
-                let source = source.and_then(|generation| submitted_update_source(Some(generation), *blas.built_index.read())).filter(|_| {
-                    !state.as_actions.iter().any(|action| matches!(action, AsAction::Build(build)
-                        if build.blas_s_built.iter().any(|entry| Arc::ptr_eq(entry, blas))))
-                });
-                if blas.update_mode == wgt::AccelerationStructureUpdateMode::PreferUpdate {
-                    build_command.blas_refits.push(crate::ray_tracing::BlasRefitBuild {
-                        blas: blas.clone(), geometries: triangle_geometries.clone(), source,
+            ArcBlasGeometries::AabbGeometries(geometries) => {
+                let wgt::BlasGeometrySizeDescriptors::Aabbs { descriptors } = &blas.sizes else {
+                    return Err(BuildAccelerationStructureError::IncompatibleBlasBuildSizes(blas.error_ident()));
+                };
+                if geometries.len() != descriptors.len() {
+                    return Err(BuildAccelerationStructureError::IncompatibleBlasBuildSizes(blas.error_ident()));
+                }
+                let mut entries = Vec::with_capacity(geometries.len());
+                for (g, size) in geometries.iter().zip(descriptors) {
+                    if g.size.count > size.count {
+                        return Err(BuildAccelerationStructureError::IncompatibleBlasBuildSizes(blas.error_ident()));
+                    }
+                    if g.size.flags != size.flags {
+                        return Err(BuildAccelerationStructureError::IncompatibleBlasFlags(blas.error_ident(),size.flags,g.size.flags));
+                    }
+                    let end = crate::ray_tracing::aabb_buffer_end(g.offset,g.stride,g.size.count)?;
+                    let buffer = &g.buffer;
+                    buffer.same_device_as(blas.as_ref())?;
+                    buffer.check_usage(BufferUsages::BLAS_INPUT)?;
+                    if end > buffer.size {
+                        return Err(BuildAccelerationStructureError::InsufficientBufferSize(buffer.error_ident(),buffer.size,end));
+                    }
+                    let pending = state.tracker.buffers.set_single(buffer,BufferUses::BOTTOM_LEVEL_ACCELERATION_STRUCTURE_INPUT);
+                    if let Some(pending) = pending {
+                        input_barriers.push(pending.into_hal(buffer.as_ref(),state.snatch_guard));
+                    }
+                    state.buffer_memory_init_actions.extend(buffer.initialization_status.read().create_action(
+                        buffer,g.offset..end,MemoryInitKind::NeedsInitializedMemory));
+                    entries.push(hal::AccelerationStructureAABBs {
+                        buffer: Some(buffer.try_raw(state.snatch_guard)?), offset: g.offset as u32,
+                        count: g.size.count, stride: g.stride, flags: g.size.flags,
                     });
                 }
+                let scratch_buffer_offset = *scratch_buffer_blas_size;
+                *scratch_buffer_blas_size += align_to(
+                    max(blas.size_info.build_scratch_size,blas.size_info.update_scratch_size),
+                    u64::from(state.device.alignments.ray_tracing_scratch_buffer_alignment));
+                blas_storage.push(BlasStore {blas: blas.clone(),
+                    entries: hal::AccelerationStructureEntries::AABBs(entries),
+                    update: false, scratch_buffer_offset});
+            }
+            ArcBlasGeometries::TriangleGeometries(triangle_geometries) => {
+                let update = blas.update_mode == wgt::AccelerationStructureUpdateMode::PreferUpdate && {
+                    let current = *blas.built_index.read();
+                    let submitted = blas.submitted_refit.read();
+                    let update = update_source_shape(recorded_blas_shape(&state.as_actions[..], blas), || {
+                        submitted.as_ref().filter(|previous|
+                            submitted_update_source(Some(previous.generation), current).is_some()
+                        ).map(|previous| previous.geometries.as_slice())
+                    }).is_some_and(|geometries| crate::ray_tracing::refit_compatible(geometries, triangle_geometries));
+                    drop(submitted);
+                    build_command.blas_refits.push(crate::ray_tracing::BlasRefitBuild {
+                        blas: blas.clone(), geometries: triangle_geometries.clone(), update,
+                    });
+                    update
+                };
                 let mut triangle_entries =
                     Vec::<hal::AccelerationStructureTriangles<dyn hal::DynBuffer>>::new();
 
                 for (i, mesh) in triangle_geometries.iter().enumerate() {
                     let size_desc = match &blas.sizes {
                         wgt::BlasGeometrySizeDescriptors::Triangles { descriptors } => descriptors,
+                        _ => return Err(BuildAccelerationStructureError::IncompatibleBlasBuildSizes(blas.error_ident())),
                     };
                     if i >= size_desc.len() {
                         return Err(BuildAccelerationStructureError::IncompatibleBlasBuildSizes(
@@ -1069,7 +1163,7 @@ fn iter_blas<'snatch_guard: 'buffers, 'buffers>(
                     blas_storage.push(BlasStore {
                         blas: blas.clone(),
                         entries: hal::AccelerationStructureEntries::Triangles(triangle_entries),
-                        update: source.is_some(),
+                        update,
                         scratch_buffer_offset,
                     });
                 }

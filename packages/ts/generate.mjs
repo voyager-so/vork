@@ -27,6 +27,9 @@ let types = await compile(typeSchema, 'Scene', {
   additionalProperties: false,
 });
 types += '\n' + await compile({ ...typeSchema.$defs.Profile, $defs: typeSchema.$defs }, 'Profile', {bannerComment:'', additionalProperties:false});
+// Output descriptors share WorkingColorSpace with composition; reference that declaration once.
+const outputTypes = await compile({ ...typeSchema.$defs.OutputDestination, $defs: typeSchema.$defs }, 'OutputDestination', {bannerComment:'', additionalProperties:false});
+types += '\n' + (types.includes('export type WorkingColorSpace =') ? outputTypes.replace(/export type WorkingColorSpace = [^;]+;\n/, '') : outputTypes);
 for (const [file, value] of [['scene.schema.json', schemaText], ['src/schema.ts', types]]) {
   if (process.argv.includes('--check')) {
     if (readFileSync(new URL(file, import.meta.url), 'utf8') !== value) {

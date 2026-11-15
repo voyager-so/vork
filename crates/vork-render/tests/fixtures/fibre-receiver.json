@@ -160,10 +160,10 @@
       "angle": 0
     }
   ],
+  "composition": {"space": "3d", "view": {"program":"std/standard","inputs":{}}},
   "render": {
     "resolution": [
       64,
       64
-    ],
-    "display": {"program":"std/standard","inputs":{"dither_intensity":0}}}
+    ]}
 }

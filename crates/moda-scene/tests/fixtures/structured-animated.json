@@ -1,0 +1,49 @@
+{
+  "nodes": [
+    {
+      "id": "fx-anim-text",
+      "type": "richtext",
+      "x": 140,
+      "y": 260,
+      "rotation": 0,
+      "scale": 1,
+      "width": 1000,
+      "height": 220,
+      "htmlContent": "<p style=\"font-family: Inter; font-size: 84px; font-weight: 700; color: #e8ecf4\">PULSE</p>",
+      "effects": [
+        {
+          "type": "glow",
+          "id": "effect-anim-glow",
+          "color": "#ffbe0b",
+          "radiusPx": 12,
+          "intensity": 1.2,
+          "opacity": 1
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "effects-structured-animated",
+      "width": 1280,
+      "height": 800,
+      "nodeIds": ["fx-anim-text"],
+      "fills": [
+        {
+          "id": "fill-0",
+          "paint": {
+            "type": "solid",
+            "color": "#13161d"
+          }
+        }
+      ]
+    }
+  ],
+  "config": {
+    "renderPageClipping": true
+  },
+  "variables": [],
+  "canvasRootNodeIds": [],
+  "layoutMode": "vertical"
+}

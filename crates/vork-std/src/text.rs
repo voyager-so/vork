@@ -1,9 +1,11 @@
 //! Font outlines are authoring-time geometry. The renderer never sees a font or glyph.
+//! Moda's text engine (crate `moda-text`, the 2D canvas's text) lays the text out and gives each
+//! glyph's outline; this builder fills and extrudes them.
+use crate::moda;
 use anyhow::{Context, Result, ensure};
 use lyon_path::{
-    Path, PathEvent,
+    Path,
     geom::LineSegment,
-    iterator::PathIterator,
     math::{Point, point},
 };
 use lyon_tessellation::{BuffersBuilder, FillOptions, FillTessellator, FillVertex, VertexBuffers};
@@ -49,7 +51,7 @@ impl Default for Options {
         }
     }
 }
-const ALIGN_X: &[&str] = &["left", "center", "right", "justify", "flush"];
+const ALIGN_X: &[&str] = &["left", "center", "right"];
 const ALIGN_Y: &[&str] = &["top_baseline", "top", "center", "bottom_baseline", "bottom"];
 
 /// Builder facts generated from the same defaults used by serde.
@@ -288,117 +290,286 @@ fn validate_options(o: &Options) -> Result<()> {
             && o.bevel_resolution <= 32,
         "invalid text size/extrude/bevel"
     );
+    ensure!(
+        !matches!(o.align_x.as_str(), "justify" | "flush"),
+        "std/text.align_x {} was removed; std/text does not wrap: write left, center or right, or use wrapped canvas text for justification; see vork help upgrade",
+        o.align_x
+    );
     ensure!(ALIGN_X.contains(&o.align_x.as_str()), "invalid align_x");
     ensure!(ALIGN_Y.contains(&o.align_y.as_str()), "invalid align_y");
     Ok(())
 }
 pub(crate) fn evaluate(argument: &str) -> Result<String> {
     let options: Options = serde_json::from_str(argument)?;
+    let metadata = std::fs::metadata(&options.font)
+        .with_context(|| format!("read font {}; restore the font file or correct its path", options.font))?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput,
+            format!("font {} is not a regular file; restore a readable font file or correct its path", options.font)).into());
+    }
     let bytes =
         std::fs::read(&options.font).with_context(|| format!("read font {}", options.font))?;
-    Ok(serde_json::to_string(&geometry(options, &bytes)?)?)
+    let label = options.font.clone();
+    Ok(serde_json::to_string(&geometry(options, &label, &bytes)?)?)
 }
-fn geometry(o: Options, bytes: &[u8]) -> Result<Value> {
+/// Moda's text host, vector font store and degraded tier for one font, kept per thread: std/text lays
+/// out many strings in few fonts, and the store keeps each glyph's outline once parsed.
+struct Hosted {
+    host: moda_text::TextHost,
+    store: moda_text::vector::VectorFontStore,
+    degraded: std::cell::OnceCell<moda_text::degraded::DegradedEngine>,
+    font_bytes: usize,
+}
+impl Hosted {
+    /// Moda's degraded tier, the lane that shapes right-to-left and complex scripts, on the same font.
+    fn degraded(&self) -> &moda_text::degraded::DegradedEngine {
+        self.degraded.get_or_init(|| self.host.degraded_engine())
+    }
+}
+thread_local! {
+    static HOSTS: std::cell::RefCell<std::collections::VecDeque<([u8; 32], std::rc::Rc<Hosted>)>> = Default::default();
+}
+fn hosted(label: &str, bytes: &[u8]) -> Result<std::rc::Rc<Hosted>> {
+    let key = *blake3::hash(bytes).as_bytes();
+    if let Some(hosted) = HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        let index = hosts.iter().position(|(k, _)| *k == key)?;
+        let entry = hosts.remove(index)?;
+        let host = entry.1.clone();
+        hosts.push_back(entry);
+        Some(host)
+    }) {
+        return Ok(hosted);
+    }
+    let host = moda::host(&[vec![moda::Face { label: label.into(), bytes: bytes.to_vec() }]])?;
+    let store = host.vector_font_store_lenient();
+    let hosted = std::rc::Rc::new(Hosted { host, store, degraded: Default::default(), font_bytes: bytes.len() });
+    HOSTS.with(|hosts| {
+        let mut hosts = hosts.borrow_mut();
+        hosts.push_back((key, hosted.clone()));
+        // Entry and byte ceilings bound both small parsed stores and large font binaries.
+        while hosts.len() > 8 || hosts.iter().map(|(_, h)| h.font_bytes).sum::<usize>() > 64 * 1024 * 1024 {
+            hosts.pop_front();
+        }
+    });
+    Ok(hosted)
+}
+/// One placed line of laid-out text (px, y down): its top, height and baseline, and where its advance
+/// starts and how wide it is.
+struct Line {
+    top: f64,
+    height: f64,
+    baseline: f64,
+    start: f64,
+    width: f64,
+}
+fn lines_of(layout: &Value) -> Vec<Line> {
+    let at = |line: &Value, key: &str| line[key].as_f64().unwrap_or(0.);
+    layout["paragraphs"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|paragraph| paragraph["lines"].as_array().into_iter().flatten())
+        .map(|line| Line {
+            top: at(line, "lineTopY"),
+            height: at(line, "lineHeightPx"),
+            baseline: at(line, "baselineY"),
+            start: at(line, "lineStartX"),
+            width: at(line, "totalWidth"),
+        })
+        .collect()
+}
+/// The text's glyph outlines as closed contours in font units (x right, y down from the node's top-left),
+/// aligned in the box (the widest line), with its lines.
+struct Laid {
+    contours: Vec<Vec<Point>>,
+    lines: Vec<Line>,
+    box_width: f64,
+}
+/// Moda's vector lane: the text laid out at one px per font unit, aligned in the widest line by CSS
+/// text-align, each placed glyph's outline Moda's, flattened as its extrusion flattens it.
+fn vector_laid(o: &Options, label: &str, hosted: &Hosted, style: &str, upem: f64) -> Result<Option<Laid>> {
+    let html = paragraphs(&o.body, &format!("text-align: {}; {style}; font-size: {upem}px", o.align_x));
+    let mut spec = moda_text::RichTextNodeSpec { node_id: o.name.clone(), html_content: html, auto_width: true, ..Default::default() };
+    let layout = moda_text::vector::layout_rich_text_node_vector(&spec, &hosted.store, &hosted.host.catalog);
+    if layout["engine"].as_str() != Some("vector") {
+        return Ok(None);
+    }
+    let box_width = moda::widest_line(&layout);
+    spec.width = Some(box_width);
+    let layout = moda_text::vector::layout_rich_text_node_vector(&spec, &hosted.store, &hosted.host.catalog);
+    let Some(runs) = moda_text::vector::extract::extract_vector_text_runs(&spec, &hosted.store, &hosted.host.catalog) else {
+        return Ok(None);
+    };
+    let mut contours = Vec::new();
+    for run in &runs {
+        let variations = moda_text::font_variations::parse_font_variation_settings(&run.font_variations);
+        let instance = moda_text::vector::measure::Instance { size_px: Some(run.font_size_px), variations: &variations };
+        let font = hosted
+            .store
+            .font_for_variant(&hosted.host.catalog, &run.family, run.weight, &run.style, instance)
+            .with_context(|| format!("font {label}: Moda's vector text lane cannot read it"))?;
+        for glyph in &run.glyphs {
+            // Moda's outline in em, y down from the glyph's origin.
+            let rings = font
+                .glyph_em_contours(glyph.glyph_id)
+                .map_err(|error| anyhow::anyhow!("font {label}: glyph {}: {}", glyph.glyph_id, error.message()))?;
+            let baseline = run.baseline_y_px - glyph.y_offset_px;
+            for ring in rings.iter() {
+                contours.push(
+                    ring.iter()
+                        .map(|[x, y]| point((glyph.x_px + x * run.font_size_px) as f32, (baseline + y * run.font_size_px) as f32))
+                        .collect(),
+                );
+            }
+        }
+    }
+    Ok(Some(Laid { contours, lines: lines_of(&layout), box_width }))
+}
+/// Moda's degraded tier, the lane that shapes what the vector lane declines (right-to-left and bidi text,
+/// Arabic joining, Indic and Southeast Asian clusters): the same paragraphs laid out and shaped by it, each
+/// glyph's outline the face's at the size it is drawn. The tier draws through a raster, so it lays the text
+/// out at a size whose raster fits and the result is scaled to font units; its lines start at the left and
+/// are aligned in the widest line here, by their advances, as text-align aligns them.
+fn degraded_laid(o: &Options, hosted: &Hosted, style: &str, upem: f64) -> Result<Laid> {
+    let engine = hosted.degraded();
+    let spec_at = |size: f64| moda_text::ops::TextNodeSpec {
+        node_id: o.name.clone(),
+        html: paragraphs(&o.body, &format!("text-align: left; {style}; font-size: {size}px")).into(),
+        opacity: 1.,
+        auto_width: true,
+        ..Default::default()
+    };
+    // Raster budget: the walk draws at twice its logical size and refuses textures past 8192 px.
+    let (w, h) = engine.canvas_logical_size(&spec_at(upem));
+    let size = upem * (1500. / w.max(1.)).min(1500. / h.max(1.)).min(1.);
+    let k = upem / size;
+    let spec = spec_at(size);
+    let layout = engine.layout_json(&spec).map_err(|error| anyhow::anyhow!("std/text.body: Moda's degraded text lane: {error}"))?;
+    let mut lines = lines_of(&layout);
+    let outlines = engine.glyph_outlines(&spec).map_err(|error| anyhow::anyhow!("std/text.body: Moda's degraded text lane: {error}"))?;
+    let box_width = lines.iter().map(|line| line.width).fold(0., f64::max);
+    // Each line's shift into the box, by text-align.
+    let shift = |line: &Line| match o.align_x.as_str() {
+        "center" => (box_width - line.width) * 0.5 - line.start,
+        "right" => box_width - line.width - line.start,
+        _ => -line.start,
+    };
+    let mut contours = Vec::new();
+    for glyph in &outlines {
+        let Some(line) = lines.iter().min_by(|a, b| {
+            (a.baseline - f64::from(glyph.pen[1])).abs().total_cmp(&(b.baseline - f64::from(glyph.pen[1])).abs())
+        }) else {
+            continue;
+        };
+        let dx = shift(line);
+        let at = |p: [f32; 2]| point(((f64::from(p[0]) + dx) * k) as f32, (f64::from(p[1]) * k) as f32);
+        let mut builder = Path::builder();
+        let mut open = false;
+        for segment in &glyph.segments {
+            use moda_text::degraded::OutlineSegment as S;
+            match *segment {
+                S::MoveTo(p) => {
+                    if open {
+                        builder.end(true);
+                    }
+                    builder.begin(at(p));
+                    open = true;
+                }
+                S::LineTo(p) if open => _ = builder.line_to(at(p)),
+                S::QuadTo(c, p) if open => _ = builder.quadratic_bezier_to(at(c), at(p)),
+                S::CurveTo(a, b, p) if open => _ = builder.cubic_bezier_to(at(a), at(b), at(p)),
+                S::Close if open => {
+                    builder.end(true);
+                    open = false;
+                }
+                _ => {}
+            }
+        }
+        if open {
+            builder.end(true);
+        }
+        use lyon_path::iterator::PathIterator;
+        let mut ring = Vec::new();
+        // A quarter of a font unit, five times the distance at which points merge (`geometry`).
+        for event in builder.build().iter().flattened(0.25) {
+            match event {
+                lyon_path::PathEvent::Begin { at } => ring = vec![at],
+                lyon_path::PathEvent::Line { to, .. } => ring.push(to),
+                lyon_path::PathEvent::End { .. } => contours.push(std::mem::take(&mut ring)),
+                _ => {}
+            }
+        }
+    }
+    for line in &mut lines {
+        let dx = shift(line);
+        *line = Line { top: line.top * k, height: line.height * k, baseline: line.baseline * k, start: (line.start + dx) * k, width: line.width * k };
+    }
+    Ok(Laid { contours, lines, box_width: box_width * k })
+}
+/// One paragraph per line of `body`, styled with `style`.
+fn paragraphs(body: &str, style: &str) -> String {
+    body.split('\n').map(|line| format!("<p style=\"{style}\">{}</p>", moda::escape_html(line))).collect()
+}
+fn geometry(o: Options, label: &str, bytes: &[u8]) -> Result<Value> {
     validate_options(&o)?;
-    let face = vork_text::Font::new(bytes, 0)?;
-    let scale = o.size / face.units_per_em() as f32;
+    for ch in o.body.chars() {
+        ensure!(ch == '\n' || !ch.is_control(), "unsupported text control character {ch:?}");
+    }
+    let face = ttf_parser::Face::parse(bytes, 0)
+        .map_err(|error| anyhow::anyhow!("font {label}: not a TrueType or OpenType font ({error})"))?;
+    for ch in o.body.chars().filter(|c| !c.is_whitespace()) {
+        ensure!(face.glyph_index(ch).is_some_and(|g| g.0 != 0), "font has no glyph for {ch:?}");
+    }
+    ensure!(o.body.chars().any(|c| !c.is_whitespace()), "text has no outlined glyphs");
+    // Moda lays out in px: at one px per font unit its numbers are the font's own.
+    let upem = f64::from(face.units_per_em());
+    let scale = o.size / upem as f32;
     // Lyon's absolute fill tolerance also joins vertices within half of it of an edge.
     // Keep that well below one font unit at any size, and remove the points it would
     // join from the contours too, so caps and walls share exactly one outline.
     let merge = scale * 0.05;
-    let mut lines: Vec<(Vec<Vec<Point>>, f32)> = Vec::new();
-    let shaped_lines = face.layout(&o.body)?;
-    let max_width = shaped_lines
-        .iter()
-        .map(|line| line.width * scale)
-        .fold(0., f32::max);
-    for (line_index, (line, source)) in shaped_lines.iter().zip(o.body.split('\n')).enumerate() {
-        // Expand shaped clusters, never individual code points inside a conjunct.
-        let boundaries: Vec<_> = line
-            .glyphs
-            .iter()
-            .enumerate()
-            .filter(|(i, g)| {
-                line.glyphs
-                    .get(i + 1)
-                    .is_none_or(|next| next.cluster != g.cluster)
-            })
-            .map(|(i, _)| i)
-            .collect();
-        let spaces = boundaries
-            .iter()
-            .filter(|&&i| source[line.glyphs[i].cluster..].starts_with(' '))
-            .count();
-        let gaps = boundaries.len().saturating_sub(1);
-        let justify = o.align_x == "justify" && line_index + 1 < shaped_lines.len() && spaces > 0;
-        let flush = o.align_x == "flush" && gaps > 0;
-        let extra = if justify {
-            (max_width - line.width * scale) / spaces as f32
-        } else if flush {
-            (max_width - line.width * scale) / gaps as f32
-        } else {
-            0.
-        };
-        let mut contours = Vec::<Vec<Point>>::new();
-        let mut spacing = 0.;
-        for (glyph_index, glyph) in line.glyphs.iter().enumerate() {
-            if let Some(path) = face.outline(glyph) {
-                let mut contour = Vec::new();
-                // Adaptive outline flattening: 1/1024 em in output units.
-                for event in path.iter().flattened(face.units_per_em() as f32 / 1024.) {
-                    match event {
-                        PathEvent::Begin { at } => {
-                            contour.clear();
-                            contour.push(point(at.x * scale + spacing, at.y * scale));
-                        }
-                        PathEvent::Line { to, .. } => {
-                            contour.push(point(to.x * scale + spacing, to.y * scale));
-                        }
-                        PathEvent::End { .. } => {
-                            simplify(&mut contour, merge);
-                            if contour.len() >= 3 {
-                                contours.push(std::mem::take(&mut contour));
-                            }
-                        }
-                        _ => unreachable!(),
-                    }
-                }
-            }
-            let boundary = boundaries.binary_search(&glyph_index).is_ok();
-            if boundary
-                && ((justify && source[glyph.cluster..].starts_with(' '))
-                    || (flush && glyph_index + 1 < line.glyphs.len()))
-            {
-                spacing += extra;
-            }
-        }
-        lines.push((contours, line.width * scale + spacing));
-    }
-    let line_height = o.size; // Blender Text space_line=1.
-    let last_y = -(lines.len().saturating_sub(1) as f32) * line_height;
-    let top = face.ascender() as f32 * scale;
-    let bottom = last_y + face.descender() as f32 * scale;
-    let y_shift = match o.align_y.as_str() {
-        "top" => -top,
-        "center" => -(top + bottom) * 0.5,
-        "bottom_baseline" => -last_y,
-        "bottom" => -bottom,
+    let hosted = hosted(label, bytes)?;
+    // One paragraph per line. CSS line-height 1 puts the lines one size apart (Blender Text's
+    // space_line 1); the box is the widest line, so text-align places each line within it.
+    let style = format!(
+        "font-family: '{}'; font-weight: {}; font-style: {}; line-height: 1",
+        moda::family(0),
+        face.weight().to_number(),
+        if face.is_italic() { "italic" } else { "normal" }
+    );
+    // Moda's vector lane draws what it can shape; what it declines its degraded tier shapes.
+    let laid = match vector_laid(&o, label, &hosted, &style, upem)? {
+        Some(laid) => laid,
+        None => degraded_laid(&o, &hosted, &style, upem)?,
+    };
+    let (Some(first), Some(last)) = (laid.lines.first(), laid.lines.last()) else {
+        anyhow::bail!("text has no outlined glyphs");
+    };
+    let (top, bottom) = (first.top, last.top + last.height);
+    // The layout's point (px, y down) that becomes the geometry's origin.
+    let origin_x = match o.align_x.as_str() {
+        "center" => laid.box_width * 0.5,
+        "right" => laid.box_width,
         _ => 0.,
     };
-    let mut contours = Vec::new();
-    for (line, (mut paths, width)) in lines.into_iter().enumerate() {
-        let x_shift = match o.align_x.as_str() {
-            "center" => -width * 0.5,
-            "right" => -width,
-            _ => 0.,
-        };
-        for path in &mut paths {
-            for p in path {
-                p.x += x_shift;
-                p.y += y_shift - line as f32 * line_height;
-            }
+    let origin_y = match o.align_y.as_str() {
+        "top" => top,
+        "center" => (top + bottom) * 0.5,
+        "bottom_baseline" => last.baseline,
+        "bottom" => bottom,
+        _ => first.baseline,
+    };
+    let mut contours = Vec::<Vec<Point>>::new();
+    for ring in &laid.contours {
+        let mut contour: Vec<Point> = ring
+            .iter()
+            .map(|p| point((f64::from(p.x) - origin_x) as f32 * scale, (origin_y - f64::from(p.y)) as f32 * scale))
+            .collect();
+        simplify(&mut contour, merge);
+        if contour.len() >= 3 {
+            contours.push(contour);
         }
-        contours.extend(paths);
     }
     ensure!(!contours.is_empty(), "text has no outlined glyphs");
     // Non-zero winding preserves counters and overlapping glyph outlines.
@@ -503,54 +674,93 @@ impl Mesh {
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    use lyon_path::{PathEvent, iterator::PathIterator};
     const FONT: &[u8] = include_bytes!("../tests/fonts/LiberationSans-Regular.ttf");
+    fn text(o: Options) -> Result<Value> {
+        geometry(o, "LiberationSans-Regular.ttf", FONT)
+    }
+    fn points(g: &Value) -> Vec<[f32; 3]> {
+        serde_json::from_value(g["buffers"]["text_position"]["data"].clone()).unwrap()
+    }
     #[test]
-    fn complex_scripts_use_positioned_outlines() {
-        for (bytes, text) in [
-            (
-                include_bytes!("../../vork-text/tests/fonts/NotoSansArabic-Regular.ttf").as_slice(),
-                "سلام",
-            ),
-            (
-                include_bytes!("../../vork-text/tests/fonts/NotoSansDevanagari-Regular.ttf")
-                    .as_slice(),
-                "क्षि",
-            ),
-        ] {
-            let g = geometry(
-                Options {
-                    body: text.into(),
-                    align_x: "right".into(),
-                    ..Options::default()
-                },
-                bytes,
-            )
-            .unwrap();
-            let points = g["buffers"]["text_position"]["data"].as_array().unwrap();
-            let font = vork_text::Font::new(bytes, 0).unwrap();
-            let line = font.layout(text).unwrap().remove(0);
-            let mut expected = f32::NEG_INFINITY;
-            for glyph in &line.glyphs {
-                for event in font
-                    .outline(glyph)
-                    .unwrap()
-                    .iter()
-                    .flattened(font.units_per_em() as f32 / 1024.)
-                {
-                    if let PathEvent::Line { to, .. } = event {
-                        expected = expected.max((to.x - line.width) / font.units_per_em() as f32);
-                    }
-                }
-            }
-            let actual = points
-                .iter()
-                .map(|p| p[0].as_f64().unwrap() as f32)
-                .fold(f32::NEG_INFINITY, f32::max);
-            assert!(
-                (actual - expected).abs() < 1e-5,
-                "{text}: {actual} != {expected}"
-            );
+    fn retired_parsed_hosts_are_evicted() {
+        HOSTS.with(|hosts| hosts.borrow_mut().clear());
+        let original = include_bytes!("../tests/fonts/LiberationSans-Regular.ttf");
+        let first = hosted("first", original).unwrap();
+        let retired = std::rc::Rc::downgrade(&first);
+        drop(first);
+        for suffix in 0..16u8 {
+            let mut bytes = original.to_vec();
+            bytes.push(suffix);
+            drop(hosted("varied", &bytes).unwrap());
         }
+        assert!(retired.upgrade().is_none(), "retired parsed font host remains rooted");
+    }
+
+    #[test]
+    fn complex_scripts_are_shaped_by_the_degraded_tier() {
+        // Arabic joins: the shaped word is narrower than its letters set apart. (Joined letters overlap where they
+        // connect, so, as with any overlapping outlines, walls stand inside the caps: the mesh is not closed.)
+        let arabic = include_bytes!("../tests/fonts/NotoSansArabic-Regular.ttf");
+        let width = |body: &str| {
+            let g = geometry(Options { body: body.into(), extrude: 0.01, ..Options::default() }, "NotoSansArabic-Regular.ttf", arabic).unwrap();
+            let x: Vec<f32> = points(&g).iter().map(|p| p[0]).collect();
+            x.iter().copied().fold(f32::NEG_INFINITY, f32::max) - x.iter().copied().fold(f32::INFINITY, f32::min)
+        };
+        let joined = width("سلام");
+        let apart = width("س ل ا م");
+        assert!(joined > 0.3 && joined < apart, "{joined} {apart}");
+        // align_x centres the line's advance on the origin.
+        let g = geometry(Options { body: "سلام".into(), align_x: "center".into(), ..Options::default() }, "NotoSansArabic-Regular.ttf", arabic).unwrap();
+        let x: Vec<f32> = points(&g).iter().map(|p| p[0]).collect();
+        let (left, right) = (x.iter().copied().fold(f32::INFINITY, f32::min), x.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        assert!((left + right).abs() < 0.1 * (right - left), "{left} {right}");
+    }
+    #[test]
+    fn what_moda_declines_is_refused() {
+        for align_x in ["justify", "flush"] {
+            let error = text(Options {
+                body: "a b\nc".into(),
+                align_x: align_x.into(),
+                ..Options::default()
+            })
+            .unwrap_err()
+            .to_string();
+            assert!(error.contains(&format!("std/text.align_x {align_x} was removed")), "{error}");
+            assert_eq!(error.lines().count(), 1, "{error}");
+            assert!(error.contains("write left, center or right") && error.ends_with("see vork help upgrade"), "{error}");
+        }
+    }
+    #[test]
+    fn lines_are_one_size_apart_and_aligned() {
+        let lowest = |body: &str, align_x: &str| {
+            let p = points(
+                &text(Options {
+                    body: body.into(),
+                    size: 2.,
+                    align_x: align_x.into(),
+                    ..Options::default()
+                })
+                .unwrap(),
+            );
+            let x = p.iter().map(|p| p[0]);
+            (
+                p.iter().map(|p| p[1]).fold(f32::INFINITY, f32::min),
+                x.clone().fold(f32::INFINITY, f32::min),
+                x.fold(f32::NEG_INFINITY, f32::max),
+            )
+        };
+        let (one, ..) = lowest("H", "left");
+        let (two, ..) = lowest("H\nH", "left");
+        let (three, ..) = lowest("H\n\nH", "left");
+        assert!((one - two - 2.).abs() < 1e-3, "{one} {two}");
+        assert!((one - three - 4.).abs() < 1e-3, "{one} {three}");
+        let (_, left, _) = lowest("HH", "left");
+        let (_, _, right) = lowest("HH", "right");
+        let (_, centre_left, centre_right) = lowest("HH", "center");
+        assert!(left >= 0. && left < 0.3, "{left}");
+        assert!(right <= 0. && right > -0.3, "{right}");
+        assert!((centre_left + centre_right).abs() < 1e-3, "{centre_left} {centre_right}");
     }
     #[test]
     fn counters_survive_caps_and_extrusion() {
@@ -560,7 +770,7 @@ pub(crate) mod tests {
             bevel_depth: 0.02,
             ..Options::default()
         };
-        let g = geometry(o, FONT).unwrap();
+        let g = text(o).unwrap();
         let p = g["buffers"]["text_position"]["data"].as_array().unwrap();
         let indices = g["buffers"]["text_indices"]["data"].as_array().unwrap();
         assert!(indices.len() > 100);
@@ -590,37 +800,28 @@ pub(crate) mod tests {
     #[test]
     fn invalid_options_and_missing_glyphs_fail() {
         assert!(
-            geometry(
-                Options {
-                    size: -1.,
-                    ..Options::default()
-                },
-                FONT
-            )
+            text(Options {
+                size: -1.,
+                ..Options::default()
+            })
             .is_err()
         );
         assert!(
-            geometry(
-                Options {
-                    body: "\u{10ffff}".into(),
-                    ..Options::default()
-                },
-                FONT
-            )
+            text(Options {
+                body: "\u{10ffff}".into(),
+                ..Options::default()
+            })
             .is_err()
         );
         assert!(serde_json::from_str::<Options>(r#"{"bevel":1}"#).is_err());
     }
     fn closed(body: &str, bevel_depth: f32) -> Result<(), String> {
-        let g = geometry(
-            Options {
-                body: body.into(),
-                extrude: 0.01,
-                bevel_depth,
-                ..Options::default()
-            },
-            FONT,
-        )
+        let g = text(Options {
+            body: body.into(),
+            extrude: 0.01,
+            bevel_depth,
+            ..Options::default()
+        })
         .map_err(|e| e.to_string())?;
         watertight(&g, "text")
     }
@@ -709,6 +910,8 @@ pub(crate) mod tests {
                 continue;
             }
             match closed(&c.to_string(), 0.) {
+                // Text Moda's vector lane declines (complex scripts, lone marks) is refused, not built.
+                Err(e) if e.contains("declined") => {}
                 Err(e) if !e.contains("no outlined glyphs") => failures.push(format!("{c:?}: {e}")),
                 _ => checked += 1,
             }

@@ -1,3 +1,4 @@
+import {writeExecutable} from './executable-fixture.mjs';
 import { readdir } from 'node:fs/promises';
 import {existsSync} from 'node:fs';
 import { spawnSync } from 'node:child_process';
@@ -7,14 +8,14 @@ import { mkdtemp, readFile, rm, rename, mkdir, writeFile, symlink, realpath, chm
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import * as sdk from '../dist/index.js';
-import {mkdtempSync, writeFileSync, readFileSync, rmSync} from 'node:fs';
+import {mkdtempSync, readFileSync, rmSync} from 'node:fs';
 // Exercise argv through the public render wrapper and a child process.
 function renderArguments(scene, options) {
   const dir = mkdtempSync(join(tmpdir(), 'vork-render-argv-'));
   const binary = join(dir, 'vork');
   const capture = join(dir, 'argv.json');
   const previous = process.env.VORK_BIN;
-  writeFileSync(binary, '#!/usr/bin/env node\n' +
+  writeExecutable(binary, '#!/usr/bin/env node\n' +
     `require('node:fs').writeFileSync(${JSON.stringify(capture)}, JSON.stringify(process.argv.slice(2)));`, {mode:0o755});
   process.env.VORK_BIN = binary;
   try {
@@ -311,6 +312,32 @@ test('SDK rebases a shared nested file buffer only once',async()=>{
 });
 
 
+test('text font paths survive relocation', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'vork-text-fonts-'));
+  try {
+    await mkdir(join(directory, 'fonts'));
+    for (const name of ['a.ttf', 'b.otf']) await writeFile(join(directory, 'fonts', name), name);
+    for (const font of ['fonts/a.ttf', ['fonts/a.ttf', 'fonts/b.otf']]) {
+      const text = {type:'text',content:'Hello',font};
+      const run = {content:'Hello',font};
+      const scene = {version:2,composition:{space:'2d'},nodes:[text,{children:[{...text,content:[run]}]}]};
+      const original = structuredClone(scene);
+      const path = await sdk.writeScene(scene, join(directory, 'out/deep/scene.json'), directory);
+      const saved = JSON.parse(await readFile(path, 'utf8'));
+      const expected = Array.isArray(font) ? font.map(f => '../../' + f) : '../../' + font;
+      const nested = saved.nodes[1].children[0];
+      for (const node of [saved.nodes[0], nested, nested.content[0]]) {
+        assert.deepEqual(node.font, expected);
+        const files = [node.font].flat(), authored = [font].flat();
+        for (let i = 0; i < files.length; i++) {
+          assert.equal(await realpath(resolve(dirname(path), files[i])), await realpath(resolve(directory, authored[i])));
+        }
+      }
+      assert.deepEqual(scene, original);
+    }
+  } finally { await rm(directory, {recursive:true,force:true}); }
+});
+
 test('inline resource paths survive relocation', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'vork-inline-paths-'));
   try {
@@ -353,8 +380,8 @@ test('resource slots match inline lowering, including shared definitions', async
       instances:{count:buffer,attributes:{x:buffer}},skin:{inverse_bind_matrices:buffer}},
     {type:'light',image,medium:material,material},
     {type:'asset',file:'asset.glb',materials:{slot:material}},
-  ],images:{nested:{render:{compositor:[material]}}},
-  render:{compositor:[material],compositor_per_step:[material]},
+  ],images:{nested:{render:{},composition:{compositor:[material]}}},
+  composition:{space:'3d',compositor:[material]},render:{compositor_per_step:[material]},
   animation:[{tracks:[{keys:{times:buffer,values:buffer}}]}]};
   try {
     const path = await sdk.writeScene(scene,join(directory,'out/scene.json'),directory);
@@ -379,7 +406,7 @@ test('relocation preserves expanded text geometry and nested display images', {s
   const text = sdk.text('label',options);
   const display = {program:'blender/filmic',inputs:{lut:{image:{file:'lut.exr'}}}};
   const scene = {version:2,...text,nodes:[{type:'mesh',geometry:{...text.geometry.label}}],
-    render:{display},images:{capture:{render:{compositor:[{program:'authored_white_balance',
+    composition:{space:'3d',view:display},images:{capture:{render:{},composition:{compositor:[{program:'authored_white_balance',
       inputs:{texture:{image:{file:'nested.exr'}}}}]}}}};
   try {
     const path = await sdk.writeScene(scene,join(directory,'out/scene.json'),directory);
@@ -387,8 +414,8 @@ test('relocation preserves expanded text geometry and nested display images', {s
     assert.ok(saved.geometry.label.attributes.POSITION);
     assert.deepEqual(saved.nodes[0].geometry.attributes,saved.geometry.label.attributes);
     assert.equal(saved.geometry.label.font,undefined);
-    assert.equal(saved.render.display.inputs.lut.image.file,'../lut.exr');
-    assert.equal(saved.images.capture.render.compositor[0].inputs.texture.image.file,'../nested.exr');
+    assert.equal(saved.composition.view.inputs.lut.image.file,'../lut.exr');
+    assert.equal(saved.images.capture.composition.compositor[0].inputs.texture.image.file,'../nested.exr');
     assert.equal(options.font,join(directory,'fonts/a.ttf'));
     assert.deepEqual(await readFile(options.font),font);
   } finally { await rm(directory,{recursive:true,force:true}); }

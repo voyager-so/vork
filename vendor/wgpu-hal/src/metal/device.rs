@@ -1,7 +1,7 @@
 use alloc::{borrow::ToOwned as _, string::String, sync::Arc, vec::Vec};
 use core::ptr::NonNull;
 use parking_lot::Mutex;
-use std::{thread, time};
+use std::time;
 
 use bytemuck::TransparentWrapper;
 use objc2::{
@@ -26,7 +26,7 @@ use objc2_metal::{
     MTLVertexStepFunction,
 };
 
-use super::{conv, PassthroughShader, ShaderModuleSource};
+use super::{compile_admission, conv, PassthroughShader, ShaderModuleSource};
 use crate::{auxil::map_naga_stage, TlasInstance};
 
 type DeviceResult<T> = Result<T, crate::DeviceError>;
@@ -107,6 +107,8 @@ fn specialize_argument_arrays(source: &str, counts: &[(u32, u32)]) -> Result<Str
 
 struct CompiledShader {
     library: Retained<ProtocolObject<dyn MTLLibrary>>,
+    /// Bytes of source behind `library`: what compiling a pipeline state from it is charged.
+    source_bytes: u64,
     function: Retained<ProtocolObject<dyn MTLFunction>>,
     wg_size: MTLSize,
     wg_memory_sizes: Vec<u32>,
@@ -222,28 +224,65 @@ fn file_url(path: &std::path::Path) -> Retained<NSURL> {
 }
 
 /// Create a pipeline through a binary archive. A hit loads the stored binary
-/// without compiling. A miss compiles exactly as without an archive (concurrent
-/// with other creations), then records the result in the archive so the next
-/// process that supplies the serialized archive hits.
+/// without compiling, so it is not admitted. A miss compiles exactly as without
+/// an archive, under the process's compile admission, then records the result
+/// in the archive so the next process that supplies the serialized archive hits,
+/// and counts the addition. It never waits for a serialization: an addition that
+/// meets one is deferred to whoever next holds the archive's lock, the next
+/// serialization included, and is recorded there under its own admission.
 fn through_archive<P>(
     cache: Option<&super::PipelineCache>,
+    additions: &core::sync::atomic::AtomicUsize,
+    admission: &compile_admission::Admission,
+    label: crate::Label<'_>,
+    source_bytes: u64,
     create: impl Fn(Option<&NSArray<ProtocolObject<dyn MTLBinaryArchive>>>, MTLPipelineOption) -> Result<P, Retained<NSError>>,
-    add: impl FnOnce(&ProtocolObject<dyn MTLBinaryArchive>) -> Result<(), Retained<NSError>>,
+    add: impl Fn(&ProtocolObject<dyn MTLBinaryArchive>) -> Result<(), Retained<NSError>> + Clone + 'static,
 ) -> Result<P, String> {
-    let describe = |error: Retained<NSError>| alloc::format!("{error:?}");
+    let compile = || {
+        create(None, MTLPipelineOption::empty())
+            .map_err(|error| compile_admission::Failure::new(&error, alloc::format!("{error:?}")))
+    };
     let Some(cache) = cache else {
-        return create(None, MTLPipelineOption::empty()).map_err(describe);
+        return admission.compile(label, source_bytes, compile);
     };
     let archives = NSArray::from_retained_slice(&[cache.archive.clone()]);
     if let Ok(pipeline) = create(Some(&archives), MTLPipelineOption::FailOnBinaryArchiveMiss) {
         return Ok(pipeline);
     }
-    let pipeline = create(None, MTLPipelineOption::empty()).map_err(describe)?;
-    // The binary was just compiled, so adding it reuses the driver's result.
-    let _guard = cache.files.lock();
-    add(&cache.archive).map_err(|error| {
-        alloc::format!("the pipeline compiled but the Metal binary archive refused it: {error:?}")
+    // Recording a pipeline in the archive is a compiler request too: it reuses
+    // the binary just compiled only while the driver still holds it. Both run
+    // under one admission, and a retry repeats both.
+    let pipeline = admission.compile(label, source_bytes, || {
+        let pipeline = compile()?;
+        // An addition is counted only once it is in the archive or in the deferred queue.
+        // A serialization drains that queue under the lock, so a caller that reads the
+        // count and then serializes has written every addition the count included.
+        // The lock is only tried: an admitted compilation never waits for it, which
+        // is what lets a drain wait for admission while holding it.
+        let Some(_guard) = cache.files.try_lock() else {
+            let (archive, add) = (cache.archive.clone(), add.clone());
+            cache.deferred.lock().push(super::DeferredAddition(compile_admission::Deferred::new(label, source_bytes, move || {
+                add(&archive).map_err(|error| compile_admission::Failure::new(&error, alloc::format!("{error:?}")))
+            })));
+            additions.fetch_add(1, core::sync::atomic::Ordering::Release);
+            return Ok(pipeline);
+        };
+        add(&cache.archive).map_err(|error| {
+            compile_admission::Failure::new(
+                &error,
+                alloc::format!("the pipeline compiled but the Metal binary archive refused it: {error:?}"),
+            )
+        })?;
+        additions.fetch_add(1, core::sync::atomic::Ordering::Release);
+        Ok(pipeline)
     })?;
+    // The permit is released. Record what earlier pipelines deferred, each under
+    // its own admission; never from inside an admitted attempt, whose permit
+    // would account for the wrong work and could wait on itself.
+    if let Some(_guard) = cache.files.try_lock() {
+        cache.record_deferred(admission);
+    }
     Ok(pipeline)
 }
 
@@ -255,7 +294,7 @@ fn fnv(seed: u64, parts: &[&[u8]]) -> u64 {
 }
 
 impl super::Device {
-    fn compile_passthrough_msl(&self, source: &str) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
+    fn compile_passthrough_msl(&self, label: crate::Label<'_>, source: &str) -> Result<Retained<ProtocolObject<dyn MTLLibrary>>, String> {
         let options = MTLCompileOptions::new();
         // Match Naga modules: honor invariant vertex positions in passthrough MSL.
         if available!(macos = 11.0, ios = 13.0, tvos = 14.0, visionos = 1.0) {
@@ -283,9 +322,12 @@ impl super::Device {
         }
         // Obtain the device from shared
         let device = &self.shared.device;
-        device
-            .newLibraryWithSource_options_error(&NSString::from_str(source), Some(&options))
-            .map_err(|e| format!("MSL: {e:?}"))
+        let source_string = NSString::from_str(source);
+        compile_admission::service().compile(label, source.len() as u64, || {
+            device
+                .newLibraryWithSource_options_error(&source_string, Some(&options))
+                .map_err(|e| compile_admission::Failure::new(&e, format!("MSL: {e:?}")))
+        })
     }
 
     fn load_shader(
@@ -295,6 +337,7 @@ impl super::Device {
         layout: &super::PipelineLayout,
         primitive_class: MTLPrimitiveTopologyClass,
         naga_stage: naga::ShaderStage,
+        label: crate::Label<'_>,
     ) -> Result<CompiledShader, crate::PipelineError> {
         match stage.module.source {
             ShaderModuleSource::Naga(ref naga_shader) => {
@@ -397,16 +440,17 @@ impl super::Device {
                     options.setPreserveInvariance(true);
                 }
 
-                let library = self
-                    .shared
-                    .device
-                    .newLibraryWithSource_options_error(
-                        &NSString::from_str(&source),
-                        Some(&options),
-                    )
+                let source_string = NSString::from_str(&source);
+                let library = compile_admission::service()
+                    .compile(label, source.len() as u64, || {
+                        self.shared
+                            .device
+                            .newLibraryWithSource_options_error(&source_string, Some(&options))
+                            .map_err(|err| compile_admission::Failure::new(&err, format!("Metal: {err}")))
+                    })
                     .map_err(|err| {
                         log::debug!("Naga generated shader:\n{source}");
-                        crate::PipelineError::Linkage(stage_bit, format!("Metal: {err}"))
+                        crate::PipelineError::Linkage(stage_bit, err)
                     })?;
 
                 let ep_index = module
@@ -483,6 +527,7 @@ impl super::Device {
 
                 Ok(CompiledShader {
                     library,
+                    source_bytes: source.len() as u64,
                     function,
                     wg_size,
                     wg_memory_sizes,
@@ -494,7 +539,7 @@ impl super::Device {
                 let library = if let Some(source) = &shader.source {
                     let source = specialize_argument_arrays(source, &layout.argument_array_counts[naga_stage])
                         .map_err(|e| crate::PipelineError::Linkage(map_naga_stage(naga_stage), e))?;
-                    self.compile_passthrough_msl(&source)
+                    self.compile_passthrough_msl(label, &source)
                         .map_err(|e| crate::PipelineError::Linkage(map_naga_stage(naga_stage), e))?
                 } else {
                     shader.library.as_ref().unwrap().clone()
@@ -503,6 +548,7 @@ impl super::Device {
                     .ok_or(crate::PipelineError::EntryPoint(naga_stage))?;
                 Ok(CompiledShader {
                     library,
+                    source_bytes: shader.source_bytes,
                     function,
                     wg_size: MTLSize {
                         width: shader.num_workgroups.0 as usize,
@@ -557,6 +603,7 @@ impl super::Device {
             shared: Arc::new(shared),
             features,
             counters: Default::default(),
+            archive_additions: Default::default(),
         }
     }
 
@@ -569,6 +616,15 @@ impl super::Device {
 
     pub fn raw_device(&self) -> &Retained<ProtocolObject<dyn MTLDevice>> {
         &self.shared.device
+    }
+
+    /// How many pipelines this device has added to a binary archive, or queued for it behind a
+    /// serialization. An owner with one pipeline cache on the device reads the count and then
+    /// serializes: that serialization holds every addition the count included. Seeing the same
+    /// count again, it knows the archive holds nothing new: every pipeline since was an archive
+    /// hit, and serializing again would only rewrite the same bytes.
+    pub fn archive_additions(&self) -> usize {
+        self.archive_additions.load(core::sync::atomic::Ordering::Acquire)
     }
 }
 
@@ -1363,6 +1419,7 @@ impl crate::Device for super::Device {
                     source: ShaderModuleSource::Passthrough(PassthroughShader {
                         library: Some(library),
                         source: None,
+                        source_bytes: file.len() as u64,
                         num_workgroups,
                     }),
                     // This goes unused for passthrough shaders
@@ -1375,13 +1432,14 @@ impl crate::Device for super::Device {
             } => {
                 let flexible = source.contains("[];");
                 let library = if flexible { None } else {
-                    Some(self.compile_passthrough_msl(source).map_err(crate::ShaderError::Compilation)?)
+                    Some(self.compile_passthrough_msl(desc.label, source).map_err(crate::ShaderError::Compilation)?)
                 };
 
                 Ok(super::ShaderModule {
                     source: ShaderModuleSource::Passthrough(PassthroughShader {
                         library,
                         source: flexible.then(|| source.to_owned()),
+                        source_bytes: source.len() as u64,
                         num_workgroups,
                     }),
                     // This goes unused for passthrough shaders
@@ -1408,6 +1466,8 @@ impl crate::Device for super::Device {
         >,
     ) -> Result<super::RenderPipeline, crate::PipelineError> {
         autoreleasepool(|_| {
+            // Source behind every stage: what compiling the pipeline state is charged.
+            let mut source_bytes = 0;
             enum MetalGenericRenderPipelineDescriptor {
                 Standard(Retained<MTLRenderPipelineDescriptor>),
                 Mesh(Retained<MTLMeshRenderPipelineDescriptor>),
@@ -1524,7 +1584,9 @@ impl crate::Device for super::Device {
                             desc.layout,
                             primitive_class,
                             naga::ShaderStage::Vertex,
+                            desc.label,
                         )?;
+                        source_bytes += vs.source_bytes;
 
                         descriptor.setVertexFunction(Some(&vs.function));
 
@@ -1630,7 +1692,9 @@ impl crate::Device for super::Device {
                             desc.layout,
                             primitive_class,
                             naga::ShaderStage::Task,
+                            desc.label,
                         )?;
+                        source_bytes += ts.source_bytes;
                         unsafe { descriptor.setObjectFunction(Some(&ts.function)) };
                         if supports_mutability {
                             Self::set_buffers_mutability(
@@ -1659,7 +1723,9 @@ impl crate::Device for super::Device {
                             desc.layout,
                             primitive_class,
                             naga::ShaderStage::Mesh,
+                            desc.label,
                         )?;
+                        source_bytes += ms.source_bytes;
                         unsafe { descriptor.setMeshFunction(Some(&ms.function)) };
                         if supports_mutability {
                             Self::set_buffers_mutability(
@@ -1700,7 +1766,9 @@ impl crate::Device for super::Device {
                         desc.layout,
                         primitive_class,
                         naga::ShaderStage::Fragment,
+                        desc.label,
                     )?;
+                    source_bytes += fs.source_bytes;
 
                     unsafe { descriptor.setFragmentFunction(Some(&fs.function)) };
                     if supports_mutability {
@@ -1823,6 +1891,10 @@ impl crate::Device for super::Device {
             let raw = match descriptor {
                 MetalGenericRenderPipelineDescriptor::Standard(d) => through_archive(
                     desc.cache,
+                    &self.archive_additions,
+                    compile_admission::service(),
+                    desc.label,
+                    source_bytes,
                     |archives, options| {
                         d.setBinaryArchives(archives);
                         self.shared
@@ -1831,17 +1903,23 @@ impl crate::Device for super::Device {
                                 &d, options, None,
                             )
                     },
-                    |archive| archive.addRenderPipelineFunctionsWithDescriptor_error(&d),
+                    {
+                        let d = d.clone();
+                        move |archive: &ProtocolObject<dyn MTLBinaryArchive>| archive.addRenderPipelineFunctionsWithDescriptor_error(&d)
+                    },
                 ),
-                MetalGenericRenderPipelineDescriptor::Mesh(d) => self
-                    .shared
-                    .device
-                    .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
-                        &d,
-                        MTLPipelineOption::empty(),
-                        None,
-                    )
-                    .map_err(|e| format!("{e:?}")),
+                MetalGenericRenderPipelineDescriptor::Mesh(d) => {
+                    compile_admission::service().compile(desc.label, source_bytes, || {
+                        self.shared
+                            .device
+                            .newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
+                                &d,
+                                MTLPipelineOption::empty(),
+                                None,
+                            )
+                            .map_err(|e| compile_admission::Failure::new(&e, format!("{e:?}")))
+                    })
+                }
             }
             .map_err(|e| {
                 crate::PipelineError::Linkage(
@@ -1897,9 +1975,11 @@ impl crate::Device for super::Device {
                 desc.layout,
                 MTLPrimitiveTopologyClass::Unspecified,
                 naga::ShaderStage::Compute,
+                desc.label,
             )?;
 
             descriptor.setComputeFunction(Some(&cs.function));
+            let cs_source_bytes = cs.source_bytes;
 
             // https://developer.apple.com/documentation/metal/mtlpipelinebufferdescriptor/mutability
             if available!(macos = 10.13, ios = 11.0, tvos = 11.0, visionos = 1.0) {
@@ -1922,6 +2002,10 @@ impl crate::Device for super::Device {
 
             let raw = through_archive(
                 desc.cache,
+                &self.archive_additions,
+                compile_admission::service(),
+                desc.label,
+                cs_source_bytes,
                 |archives, options| {
                     descriptor.setBinaryArchives(archives);
                     self.shared
@@ -1932,7 +2016,10 @@ impl crate::Device for super::Device {
                             None,
                         )
                 },
-                |archive| archive.addComputePipelineFunctionsWithDescriptor_error(&descriptor),
+                {
+                    let descriptor = descriptor.clone();
+                    move |archive: &ProtocolObject<dyn MTLBinaryArchive>| archive.addComputePipelineFunctionsWithDescriptor_error(&descriptor)
+                },
             );
 
             let raw: Retained<ProtocolObject<dyn MTLComputePipelineState>> =
@@ -1982,7 +2069,7 @@ impl crate::Device for super::Device {
                 Ok(archive) => {
                     let files = Arc::new(Mutex::new(source.into_iter().collect()));
                     super::register_archive_files(&files);
-                    Ok(super::PipelineCache { archive, files })
+                    Ok(super::PipelineCache { archive, files, deferred: Default::default() })
                 }
                 Err(error) => {
                     if let Some(path) = &source {
@@ -2014,6 +2101,7 @@ impl crate::Device for super::Device {
             if !super::archive_files_open() {
                 return None;
             }
+            cache.record_deferred(compile_admission::service());
             let path = archive_path();
             let serialized = cache.archive.serializeToURL_error(&file_url(&path));
             // Serialization rebinds the archive to this file, even when reading it back fails.
@@ -2136,15 +2224,24 @@ impl crate::Device for super::Device {
             // Poll every buffer even when this fence value was already reached.
             // A device failure must precede readback, not become a successful wait.
             if fence.get_latest()? >= wait_value { return Ok(true); }
-            if !fence.pending_signals.iter().any(|(value, _)| *value >= wait_value) {
+            // The queue serial that signals this value: every buffer up to it must finish.
+            let Some(serial) = fence.pending_signals.iter().find(|(value, _)| *value >= wait_value).map(|(_, serial)| *serial) else {
                 return Err(crate::DeviceError::LostWithReason(format!(
                     "Metal has no active command buffer for fence value {wait_value}"
                 )));
-            }
-            if timeout.is_some_and(|timeout| start.elapsed() >= timeout) {
-                return Ok(false);
-            }
-            thread::sleep(core::time::Duration::from_millis(1));
+            };
+            let remaining = match timeout {
+                Some(timeout) => match timeout.checked_sub(start.elapsed()) {
+                    Some(remaining) if !remaining.is_zero() => Some(remaining),
+                    _ => return Ok(false),
+                },
+                None => None,
+            };
+            // A pending signal was pushed by a submission, which set the fence's queue. Sleep until the queue's
+            // completed handlers have reported every buffer up to that serial (one wake-up, when the last of them
+            // finishes), then poll again: the statuses are what publishes the fence.
+            let Some(completion) = fence.completion.as_ref() else { return Ok(false) };
+            completion.wait_for(serial, remaining);
         }
     }
 
@@ -2219,7 +2316,7 @@ impl crate::Device for super::Device {
     }
 
     fn tlas_instance_layout(&self) -> Option<crate::TlasInstanceLayout> {
-        Some(crate::TlasInstanceLayout { stride: core::mem::size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>() as u32, transform: [0,3,6,9,1,4,7,10,2,5,8,11], custom_index: (core::mem::offset_of!(MTLIndirectAccelerationStructureInstanceDescriptor, userID) / 4) as u32, mask: (core::mem::offset_of!(MTLIndirectAccelerationStructureInstanceDescriptor, mask) / 4) as u32, mask_shift: 0 })
+        Some(crate::TlasInstanceLayout { stride: core::mem::size_of::<MTLIndirectAccelerationStructureInstanceDescriptor>() as u32, transform: [0,3,6,9,1,4,7,10,2,5,8,11], custom_index: (core::mem::offset_of!(MTLIndirectAccelerationStructureInstanceDescriptor, userID) / 4) as u32, mask: (core::mem::offset_of!(MTLIndirectAccelerationStructureInstanceDescriptor, mask) / 4) as u32, mask_shift: 0, triangle_flags: (core::mem::offset_of!(MTLIndirectAccelerationStructureInstanceDescriptor, options) / 4) as u32, disable_triangle_culling: MTLAccelerationStructureInstanceOptions::DisableTriangleCulling.bits() as u32, force_non_opaque: MTLAccelerationStructureInstanceOptions::NonOpaque.bits() as u32 })
     }
 
     fn tlas_instance_to_bytes(&self, instance: TlasInstance) -> Vec<u8> {
@@ -2427,6 +2524,67 @@ mod binary_archive_tests {
     use super::*;
     use crate::Device as _;
 
+    fn add(descriptor: &Retained<MTLComputePipelineDescriptor>) -> impl Fn(&ProtocolObject<dyn MTLBinaryArchive>) -> Result<(), Retained<NSError>> + Clone + 'static {
+        let descriptor = descriptor.clone();
+        move |archive: &ProtocolObject<dyn MTLBinaryArchive>| archive.addComputePipelineFunctionsWithDescriptor_error(&descriptor)
+    }
+
+    /// A process serializes its archive more than once: a session after each render that
+    /// compiled something, a 3D shot after preparation and again at its end. Pipelines added
+    /// after one serialization must be in the next, and one that met a serialization in
+    /// progress (deferred) must be in the one after it.
+    #[test]
+    fn additions_after_a_serialization_are_in_the_next_serialization() {
+        autoreleasepool(|_| {
+            let raw = objc2_metal::MTLCreateSystemDefaultDevice().expect("Metal GPU required");
+            let device = unsafe { super::super::Device::device_from_raw(raw.clone(), wgt::Features::PIPELINE_CACHE) };
+            let source = alloc::format!(
+                "#include <metal_stdlib>\nkernel void first(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{ out[i] = i * {0}u + 11u; }}\nkernel void second(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{ out[i] = i * {0}u + 13u; }}\nkernel void third(device uint* out [[buffer(0)]], uint i [[thread_position_in_grid]]) {{ out[i] = i * {0}u + 17u; }}\n",
+                std::process::id()
+            );
+            let library = raw.newLibraryWithSource_options_error(&NSString::from_str(&source), None).unwrap();
+            let descriptors: Vec<_> = ["first", "second", "third"].into_iter().map(|name| {
+                let descriptor = MTLComputePipelineDescriptor::new();
+                descriptor.setComputeFunction(Some(&library.newFunctionWithName(&NSString::from_str(name)).unwrap()));
+                descriptor
+            }).collect();
+            let create = |descriptor: &Retained<MTLComputePipelineDescriptor>| {
+                let (raw, descriptor) = (raw.clone(), descriptor.clone());
+                move |archives: Option<&NSArray<ProtocolObject<dyn MTLBinaryArchive>>>, options| {
+                    descriptor.setBinaryArchives(archives);
+                    raw.newComputePipelineStateWithDescriptor_options_reflection_error(&descriptor, options, None)
+                }
+            };
+            let cache = unsafe { device.create_pipeline_cache(&crate::PipelineCacheDescriptor { label: None, data: None }) }.unwrap();
+            through_archive(Some(&cache), &device.archive_additions, compile_admission::service(), None, 0, create(&descriptors[0]), add(&descriptors[0])).unwrap();
+            let one = unsafe { device.pipeline_cache_get_data(&cache) }.expect("first serialization");
+            through_archive(Some(&cache), &device.archive_additions, compile_admission::service(), None, 0, create(&descriptors[1]), add(&descriptors[1])).unwrap();
+            // The third meets a serialization in progress: it is created at once and recorded later.
+            // It is counted only once it is queued, where the next serialization finds it.
+            {
+                let _serializing = cache.files.lock();
+                assert_eq!(device.archive_additions(), 2);
+                through_archive(Some(&cache), &device.archive_additions, compile_admission::service(), Some("third"), 4096, create(&descriptors[2]), add(&descriptors[2])).unwrap();
+                assert_eq!((cache.deferred.lock().len(), device.archive_additions()), (1, 3));
+                // The deferred recording keeps what it is admitted with when it is drained.
+                let deferred = cache.deferred.lock();
+                assert_eq!((deferred[0].0.label(), deferred[0].0.source_bytes()), (Some("third"), 4096));
+            }
+            // The caller's protocol: read the count, then serialize. Everything counted is written.
+            let counted = device.archive_additions();
+            let three = unsafe { device.pipeline_cache_get_data(&cache) }.expect("second serialization");
+            assert_eq!(counted, 3);
+            assert!(cache.deferred.lock().is_empty());
+            assert!(three.len() > one.len(), "the second serialization holds no more than the first: {} and {} bytes", three.len(), one.len());
+            let reloaded = unsafe { device.create_pipeline_cache(&crate::PipelineCacheDescriptor { label: None, data: Some(&three) }) }.unwrap();
+            let archives = NSArray::from_retained_slice(&[reloaded.archive.clone()]);
+            for (name, descriptor) in ["first", "second", "third"].into_iter().zip(&descriptors) {
+                assert!(create(descriptor)(Some(&archives), MTLPipelineOption::FailOnBinaryArchiveMiss).is_ok(),
+                    "the second serialization lost the pipeline {name}");
+            }
+        });
+    }
+
     /// A pipeline compiled through an empty archive is stored; the serialized
     /// archive, reloaded as a new cache, serves it without compiling, and data
     /// Metal cannot open is a named rejection rather than device loss.
@@ -2451,8 +2609,11 @@ mod binary_archive_tests {
             let only_empty = NSArray::from_retained_slice(&[empty.archive.clone()]);
             // The probe really requires an archive entry, whatever Apple's shared cache holds.
             assert!(create(Some(&only_empty), MTLPipelineOption::FailOnBinaryArchiveMiss).is_err());
-            through_archive(Some(&empty), &create, |archive| archive.addComputePipelineFunctionsWithDescriptor_error(&descriptor)).unwrap();
+            assert_eq!(device.archive_additions(), 0);
+            through_archive(Some(&empty), &device.archive_additions, compile_admission::service(), None, 0, &create, add(&descriptor)).unwrap();
             assert!(create(Some(&only_empty), MTLPipelineOption::FailOnBinaryArchiveMiss).is_ok());
+            // The miss was recorded as an addition.
+            assert_eq!(device.archive_additions(), 1);
 
             let data = unsafe { device.pipeline_cache_get_data(&empty) }.expect("serialized archive");
             let again = unsafe { device.pipeline_cache_get_data(&empty) }.expect("an archive serializes repeatedly");
@@ -2464,7 +2625,8 @@ mod binary_archive_tests {
             let archives = NSArray::from_retained_slice(&[reloaded.archive.clone()]);
             assert!(create(Some(&archives), MTLPipelineOption::FailOnBinaryArchiveMiss).is_ok());
             // A hit neither compiles nor adds to the archive.
-            through_archive(Some(&reloaded), &create, |_| panic!("an archive hit must not compile or add")).unwrap();
+            through_archive(Some(&reloaded), &device.archive_additions, compile_admission::service(), None, 0, &create, |_| panic!("an archive hit must not compile or add")).unwrap();
+            assert_eq!(device.archive_additions(), 1);
             let saved = unsafe { device.pipeline_cache_get_data(&reloaded) }.expect("a reloaded archive serializes");
             assert_eq!(saved.len(), data.len());
             let files = reloaded.files.lock().clone();
@@ -2511,7 +2673,7 @@ mod binary_archive_tests {
                 raw.newComputePipelineStateWithDescriptor_options_reflection_error(&descriptor, options, None)
             };
             let empty = unsafe { device.create_pipeline_cache(&crate::PipelineCacheDescriptor { label: None, data: None }) }.unwrap();
-            through_archive(Some(&empty), &create, |archive| archive.addComputePipelineFunctionsWithDescriptor_error(&descriptor)).unwrap();
+            through_archive(Some(&empty), &device.archive_additions, compile_admission::service(), None, 0, &create, add(&descriptor)).unwrap();
             let data = unsafe { device.pipeline_cache_get_data(&empty) }.expect("serialized archive");
             let warm = unsafe { device.create_pipeline_cache(&crate::PipelineCacheDescriptor { label: None, data: Some(&data) }) }.unwrap();
             let files: Vec<_> = [empty.files.lock().clone(), warm.files.lock().clone()].concat();
@@ -2521,7 +2683,7 @@ mod binary_archive_tests {
             assert_eq!(super::super::release_archive_files_for_exit(), 2);
             assert!(files.iter().all(|file| !file.exists()), "exit release left backing files");
             // The released archive still serves the stored pipeline without compiling.
-            through_archive(Some(&warm), &create, |_| panic!("a released archive must still hit")).unwrap();
+            through_archive(Some(&warm), &device.archive_additions, compile_admission::service(), None, 0, &create, |_| panic!("a released archive must still hit")).unwrap();
             // No new backing file appears after the release.
             assert!(unsafe { device.pipeline_cache_get_data(&warm) }.is_none());
             assert!(warm.files.lock().is_empty());

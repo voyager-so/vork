@@ -29,6 +29,15 @@ struct Coordinates {
     float3 normal_dx; float3 normal_dy;
     float3 incoming; float3 incoming_dx; float3 incoming_dy;
 };
+// Attribute storage is invocation-local scratch: evaluating another surface (for
+// example a shadow candidate) replaces it. Bind the receiver at each stage entry.
+MaterialUv surface_material_context(Varying v, Coordinates k) {
+    let m=material_uv(v,k.uv_dx,k.uv_dy,k.uv1_dx,k.uv1_dy,k.material_filter);
+#if VORK_ATTRIBUTES > 0
+    for(uint a=0u;a<VORK_ATTRIBUTES;a++) { material_attribute_dx[a]=k.attribute_dx[a];material_attribute_dy[a]=k.attribute_dy[a]; }
+#endif
+    return m;
+}
 // TEXCOORD_1, or zero for draws without one (tangent w carries the flag).
 float2 varying_uv1(Varying v) {return select(abs(v.TANGENT.w)>=2.,float2(0.),v.TEXCOORD_1);}
 Coordinates raster_coordinates(inout Varying v, bool object_front, float3 incident) {
@@ -70,7 +79,11 @@ Coordinates raster_coordinates(inout Varying v, bool object_front, float3 incide
     k.attribute_dx[7]=ddx(v.attr7);k.attribute_dy[7]=ddy(v.attr7);
 #endif
 #if VORK_ATTRIBUTES > 8
+#ifdef VORK_STAGE_SCALARS
+    [unroll] for(uint i=8u;i<VORK_ATTRIBUTES;i++) {let extra=attribute_extra(v,i-8u);k.attribute_dx[i]=ddx(extra);k.attribute_dy[i]=ddy(extra);}
+#else
     [unroll] for(uint i=8u;i<VORK_ATTRIBUTES;i++) {k.attribute_dx[i]=ddx(v.attr_extra[i-8u]);k.attribute_dy[i]=ddy(v.attr_extra[i-8u]);}
+#endif
 #endif
     return k;
 }
@@ -154,12 +167,12 @@ float3 surface_normal<V:IVariant,let input:uint,let word:uint>(Varying v, float3
     return result;
 }
 // Tangent maps share raster/ray footprints and the normal map's UV-frame rule.
-float3 surface_tangent<V:IVariant>(Varying v, float3 normal, MaterialUv m, Coordinates k) {
+float3 surface_tangent<V:IVariant,uint input,uint word>(Varying v, float3 normal, MaterialUv m, Coordinates k) {
     var result=v.TANGENT.xyz;
     if (V.has_anisotropy) {
-        let r=material_record(v.object);let b=material_byte<V>(r,MATERIAL_TANGENT);
+        let r=material_record(v.object);let b=material_byte<V>(r,input);
         if ((b&0x80000000u)!=0u && (b&REG_MATERIAL_TAP_INDEX_MASK)==0u) {
-            result=material_vector_frame(v,normal,material_constant_color(r,MATERIAL_TANGENT_WORD));
+            result=material_vector_frame(v,normal,material_constant_color(r,word));
         }
         if ((b&REG_MATERIAL_TAP_INDEX_MASK)!=0u) {
             let tap=material_tap(r,b&REG_MATERIAL_TAP_INDEX_MASK,m);
@@ -168,9 +181,9 @@ float3 surface_tangent<V:IVariant>(Varying v, float3 normal, MaterialUv m, Coord
             result=tangent;
             if (valid) {
                 let sample_=material_sample(tap).xyz*2.-1.;
-                let strength=material_value(r,MATERIAL_TANGENT_WORD);
+                let strength=material_value(r,word);
                 var factors=float3(strength,strength,1.);
-                if ((b&0x80000000u)!=0u) {factors=material_constant_color(r,MATERIAL_TANGENT_WORD);}
+                if ((b&0x80000000u)!=0u) {factors=material_constant_color(r,word);}
                 let local=sample_*factors;
                 result=axis*local.x+cross(normal,axis)*handedness*local.y+normal*local.z;
             }
@@ -185,7 +198,7 @@ bool material_front(Varying v, bool front) {
 // Whether this face is drawn: double-sided materials (tag z bit 1) cover both.
 bool material_covers<V:IVariant>(Varying v, bool front) {return material_covers_side<V>(v,material_front(v,front));}
 bool material_covers_side<V:IVariant>(uint object, bool object_front) {
-    return !V.has_sided || (material_records[material_record(object)].tag.z&REG_FLAG_DOUBLE_SIDED)!=0u || object_front;
+    return (material_records[material_record(object)].tag.z&REG_FLAG_DOUBLE_SIDED)!=0u || object_front;
 }
 bool material_covers_side<V:IVariant>(Varying v, bool object_front) {
     return material_covers_side<V>(v.object,object_front);
@@ -200,14 +213,11 @@ bool material_covers_side<V:IVariant>(Varying v, bool object_front) {
 struct Surface { bool front_facing; Closure closure; float3 geometric; float3 view; bool discarded; float4 aovs[VORK_AOV_SLOTS]; float4 hair0; float4 hair1; bool is_hair; float3 strand; float weight; uint lobes; float3 normal; };
 // Raster reflection and transmission see the same incident-medium-relative
 // interface. Path supplies its active incident and transmitted owners.
-Surface transmission_interface<V:IVariant>(Surface s,float3 facet,bool interior_transport=false) {
+Surface transmission_interface<V:IVariant>(Surface s,float3 facet) {
     if (V.has_solid_transmission && !s.front_facing && !s.closure.geometry_thin_walled && s.closure.transmission_weight>0.) {
-        let eta=s.closure.specular_ior;
+        let eta=dielectric_ior(s.closure);
         let normal=solid_exit_normal(s.closure.geometry_normal,facet,-s.view,eta);
         s.closure=exiting_closure(s.closure,normal);
-        if (interior_transport && dot(refract(-s.view,normal,eta),refract(-s.view,normal,eta))==0.) {
-            s.closure.specular_weight*=1.-s.closure.transmission_weight;
-        }
     }
     return s;
 }
@@ -253,16 +263,32 @@ Surface surface_response<V:IVariant>(Surface s) {
     if (!V.has_fuzz) {s.closure.fuzz_weight=0.;}
     if (!V.has_tint) {s.closure.specular_color=float3(1.);}
     if (!V.has_anisotropy) {s.closure.specular_roughness_anisotropy=0.;}
+    if (!V.has_coat_anisotropy) {s.closure.coat_roughness_anisotropy=0.;}
     if (!V.has_film) {s.closure.thin_film_weight=0.;}
+    if (!V.has_weighted_ior) {s.closure.specular_weight=1.;}
+    return s;
+}
+// Every proof of a key that is the union of all installed materials
+// (materials.rs installed_features): the response proofs above and the lobes no
+// installed closure has. A kernel with such a key states them where it receives
+// a surface across a boundary the compiler does not see through; the response
+// code it then inlines folds on the stated values, closures it builds itself
+// included. A raster key is one material's and may omit transport on purpose
+// (opaque evaluation), and no raster or hit key carries the scene unions, so
+// any other key states only its response proofs here.
+Surface installed_surface<V:IVariant>(Surface s) {
+    s=surface_response<V>(s);
+    if (!V.installed) {return s;}
+    if (!V.metal) {s.closure.base_metalness=0.;}
+    if (!V.has_transmission) {s.closure.transmission_weight=0.;}
+    if (!V.has_subsurface) {s.closure.subsurface_weight=0.;}
+    if (!V.has_hair) {s.is_hair=false;}
     return s;
 }
 // One surface evaluation for raster fragments and ray hits: `object_front` is
 // the side of the object's own winding, `view` points toward the viewer.
 Surface surface_at<V:IVariant, P:IProgram,let decode_table:bool=true>(Varying v, bool object_front, float3 view, Coordinates k, Lobe lobe) {
-    let m=material_uv(v,k.uv_dx,k.uv_dy,k.uv1_dx,k.uv1_dy,k.material_filter);
-#if VORK_ATTRIBUTES > 0
-    for(uint a=0u;a<VORK_ATTRIBUTES;a++) { material_attribute_dx[a]=k.attribute_dx[a];material_attribute_dy[a]=k.attribute_dy[a]; }
-#endif
+    let m=surface_material_context(v,k);
     let record=material_record(v.object);
     // Program records contain OpenPBR defaults, not table texture sockets
     // (materials::Pending::program). Only the authored bin skips this decoder;
@@ -271,17 +297,18 @@ Surface surface_at<V:IVariant, P:IProgram,let decode_table:bool=true>(Varying v,
     let discarded=!material_covers_side<V>(v,object_front);
     let geometric=surface_geometric(v,object_front);
     var normal_variance=float2(0.);var n=geometric;var tangent=v.TANGENT.xyz;
-    if(decode_table) {n=surface_normal<V,MATERIAL_NORMAL,MATERIAL_NORMAL_WORD>(v,geometric,m,k,normal_variance);tangent=surface_tangent<V>(v,n,m,k);}
+    if(decode_table) {n=surface_normal<V,MATERIAL_NORMAL,MATERIAL_NORMAL_WORD>(v,geometric,m,k,normal_variance);tangent=surface_tangent<V,MATERIAL_TANGENT,MATERIAL_TANGENT_WORD>(v,n,m,k);}
     var c=closure_defaults(n,tangent);
     if(decode_table) {c=material_closure<V>(record,m,n,tangent);}
     if (any(normal_variance>float2(0.))) {
         c.specular_roughness=filtered_ggx_roughness(c.specular_roughness,normal_variance);
     }
     // OpenPBR: the coat's normal defaults to the unperturbed normal, not the base normal map.
-    c.geometry_coat_normal=geometric;
+    c.geometry_coat_normal=geometric;c.geometry_coat_tangent=v.TANGENT.xyz;
     if (decode_table && V.has_coat) {
         float2 coat_variance;
         c.geometry_coat_normal=surface_normal<V,MATERIAL_COAT_NORMAL,MATERIAL_COAT_NORMAL_WORD>(v,geometric,m,k,coat_variance);
+        c.geometry_coat_tangent=surface_tangent<V,MATERIAL_COAT_TANGENT,MATERIAL_COAT_TANGENT_WORD>(v,c.geometry_coat_normal,m,k);
         if (any(coat_variance>float2(0.))) {
             c.coat_roughness=filtered_ggx_roughness(c.coat_roughness,coat_variance);
         }
@@ -290,9 +317,17 @@ Surface surface_at<V:IVariant, P:IProgram,let decode_table:bool=true>(Varying v,
     Surface s={};s.front_facing=object_front;s.closure=c;s.geometric=geometric;s.view=view;s.discarded=discarded;
     s.strand=v.TANGENT.xyz;s.weight=1.;s.lobes=1u;s.normal=n;
     var evaluated=surface_response<V>(P.apply(v,s,k,lobe));
-    // glTF records (tag z bit 3): COLOR_0 multiplies the base colour.
-    if ((material_records[record].tag.z&REG_FLAG_VERTEX_COLOR)!=0u) { evaluated.closure.base_color*=v.COLOR_0.rgb; }
-    if ((material_records[record].tag.z&REG_FLAG_GLTF_UNLIT)!=0u) { evaluated.closure.emission_color=evaluated.closure.base_color;evaluated.closure.emission_luminance=1.; }
+    // Keep this runtime record operation independent of optional closure state.
+    // Even default-white COLOR_0 can interpolate to a value slightly off one.
+    if ((material_records[record].tag.z&REG_FLAG_VERTEX_COLOR)!=0u) {
+        evaluated.closure.base_color*=v.COLOR_0.rgb;
+#ifndef VORK_NO_GLTF_TINT
+        if (V.has_gltf_tint) { evaluated.closure.gltf_material=true; }
+#endif
+    }
+#ifndef VORK_NO_GLTF_TINT
+    if (V.has_gltf_tint && (material_records[record].tag.z&REG_FLAG_GLTF_UNLIT)!=0u) { evaluated.closure.emission_color=evaluated.closure.base_color;evaluated.closure.emission_luminance=1.; }
+#endif
     return evaluated;
 }
 float3 surface_geometric(Varying v, bool object_front) {return finite_unit_normal(v.NORMAL,float3(0.,0.,1.))*select(object_front,1.,-1.);}

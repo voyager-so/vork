@@ -103,13 +103,11 @@ float4 blender_image(Image image,float2 uv,float2 x,float2 y,ShadingContext ctx)
 
 
 class Compiler:
-    def __init__(self, material, image_input, engine="EEVEE", *, best_effort=False, bake_input=None, curve_input=None, available_attributes=None, medium=False, transmission_omission=None, subsurface_omission=None):
+    def __init__(self, material, image_input, engine="EEVEE", *, best_effort=False, bake_input=None, curve_input=None, available_attributes=None, medium=False):
         if engine not in ("EEVEE", "BLENDER_EEVEE", "BLENDER_EEVEE_NEXT", "CYCLES"):
             raise UnsupportedMaterial(f'unsupported surface engine {engine!r}')
         self.engine = "CYCLES" if engine == "CYCLES" else "EEVEE"
         self.medium = medium
-        self.transmission_omission = transmission_omission
-        self.subsurface_omission = subsurface_omission
         self.available_attributes = available_attributes
         self.bake_input = bake_input
         self.object_specific = False
@@ -137,8 +135,6 @@ class Compiler:
         self.preview_images = {}
 
     def subsurface_transport_restriction(self):
-        if self.subsurface_omission is not None:
-            return self.subsurface_omission
         output = self.material.node_tree.get_output_node(self.engine)
         if output is None:
             return 'no active surface output'
@@ -672,7 +668,7 @@ return 1.-pow(facing,exponent);''',1
                 self.report(node, 'Color', 'coloured transparent transport is not translated', 'neutral transparent coverage')
             return f'return Transparent_BSDF({get("Color",3)});', 'Closure'
         if node.type == 'MATH':
-            operations = {'ADD','SUBTRACT','MULTIPLY','DIVIDE','MULTIPLY_ADD','MINIMUM','MAXIMUM','LESS_THAN','GREATER_THAN','ABSOLUTE','FLOOR','CEIL','POWER','FRACTION','TRUNC','SINE','COSINE','TANGENT','ARCTANGENT','SQRT','SIGN','RADIANS','DEGREES','EXPONENT','ROUND','MODULO','FLOORED_MODULO'}
+            operations = {'ADD','SUBTRACT','MULTIPLY','DIVIDE','MULTIPLY_ADD','MINIMUM','MAXIMUM','LESS_THAN','GREATER_THAN','ABSOLUTE','FLOOR','CEIL','POWER','FRACT','TRUNC','SINE','COSINE','TANGENT','ARCTANGENT','SQRT','SIGN','RADIANS','DEGREES','EXPONENT','ROUND','MODULO','FLOORED_MODULO'}
             if node.operation not in operations:
                 self.fail(node, socket.name, f'{node.operation} Math is not translated')
             args = [self.input(s,1) for s in node.inputs[:3]]
@@ -747,25 +743,11 @@ return 1.-pow(facing,exponent);''',1
                         self.report(node,'Subsurface Weight',
                                 f'Blender {self.engine}/{node.subsurface_method} subsurface transport is approximated',
                                 'opaque native Burley diffusion; retain weight, base colour and world-space RGB radii')
-            omit=self.transmission_omission is not None
-            if omit:
-                t=node.inputs['Transmission Weight']
-                metal_only=not metallic.is_linked and metallic.default_value==1.
-                if (t.is_linked or t.default_value!=0.) and not metal_only:
-                    if not self.best_effort:
-                        self.fail(node,'Transmission Weight',self.transmission_omission)
-                    self.report(node,'Transmission Weight',self.transmission_omission,
-                                'retain diffuse attenuation and reflection; omit refraction')
-                body+='float omitted_transmission=saturate(c.transmission_weight);c.transmission_weight=0.;'
             if not metallic.is_linked and metallic.default_value in (0.,1.):
                 if metallic.default_value==1.:
                     body+='c.specular_weight=1.;c.specular_color=float3(1.);'
-                elif omit:
-                    body+='c.base_weight*=1.-omitted_transmission;'
                 return body+'return c;','Closure'
             body+='float metallic=c.base_metalness;Closure metal=c;metal.base_metalness=1.;metal.specular_weight=1.;metal.specular_color=float3(1.);c.base_metalness=0.;'
-            if omit:
-                body+='c.base_weight*=1.-omitted_transmission;'
             body+='return blend(c,metal,metallic);'
             return body,'Blend'
         if node.type == 'BSDF_GLASS':
@@ -787,11 +769,6 @@ return 1.-pow(facing,exponent);''',1
                 # Preserve the authored exact off state in the lowered closure.
                 # General float predicate proofs must allow GPU contraction/FTZ.
                 body += 'c.thin_film_weight=0.;'
-            if self.transmission_omission is not None:
-                if not self.best_effort:
-                    self.fail(node,'BSDF',self.transmission_omission)
-                self.report(node,'BSDF',self.transmission_omission,'retain Glass reflection; omit refraction')
-                body+='c.transmission_weight=0.;'
             return body+'return c;', 'Closure'
         if node.type == 'BSDF_GLOSSY':
             for name in ('Anisotropy', 'Rotation'):
@@ -1006,7 +983,10 @@ return {name}_lookup(x,inputs,ctx).{suffix};
                                   'Closure c={};c.base_weight=0.;c.specular_weight=0.;'
                                   'c.geometry_opacity=0.;return c;}')
             return self.finish('empty', 'Closure')
+        from .volume import empty_volume
         for channel in ('Volume', 'Displacement'):
+            if channel == 'Volume' and empty_volume(output.inputs[channel]):
+                continue
             if output.inputs[channel].is_linked:
                 if not self.best_effort:
                     self.fail(output, channel, 'only surface graphs are translated')

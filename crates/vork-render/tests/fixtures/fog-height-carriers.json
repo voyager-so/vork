@@ -1,15 +1,15 @@
 {
   "version": 2,
-  "render": {
-    "resolution": [16, 12],
-    "camera": "cam",
-    "display": {
+  "composition": {"space": "3d", "view": {
       "program": "std/agx",
       "inputs": {
         "exposure": -0.7,
         "look": "punchy"
       }
-    }
+    }},
+  "render": {
+    "resolution": [16, 12],
+    "camera": "cam"
   },
   "programs": {
     "fog": {

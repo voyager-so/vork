@@ -1,0 +1,15 @@
+# Ported from Moda (desktop-moda native/crates/moda-shaders); the changes are listed in PROVENANCE.md.
+[package]
+name = "moda-shaders"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Moda's extracted production WGSL and pipeline-state manifest (moda-render M0a). build.rs naga-validates every module."
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[build-dependencies]
+naga = { version = "29", features = ["wgsl-in"] }

@@ -15,6 +15,7 @@ ENV VORK_SLANGC=/opt/slang/bin/slangc
 COPY docs ./docs
 COPY examples ./examples
 COPY libraries ./libraries
+COPY skills ./skills
 ARG VORK_BUILD_COMMIT
 RUN test -n "$VORK_BUILD_COMMIT" && VORK_BUILD_COMMIT="$VORK_BUILD_COMMIT" cargo build --locked --release -p vork-cli
 RUN objcopy --only-keep-debug /target/release/vork /target/release/vork.debug && strip --strip-unneeded /target/release/vork

@@ -25,6 +25,9 @@ mod resolve_native;
 mod camera_native;
 #[path = "src/surface_native.rs"]
 mod surface_native;
+#[path = "src/camera_dispatch_native.rs"]
+#[allow(dead_code)]
+mod camera_dispatch_native;
 
 /// Each shader owns its entry list beside its source (`<module>.entries`).
 fn entries() -> Vec<(String, String, String)> {
@@ -60,7 +63,7 @@ fn entries() -> Vec<(String, String, String)> {
 }
 
 // A pass owns resource-register defines and compiler options beside its source.
-fn module_options(command: &mut Command, module: &Path, targeted: bool) {
+fn module_options(command: &mut Command, module: &Path, target: Option<&str>) {
     let path = module.with_extension("defines");
     if let Ok(defines) = fs::read_to_string(&path) {
         for define in defines.split_whitespace() {
@@ -69,11 +72,20 @@ fn module_options(command: &mut Command, module: &Path, targeted: bool) {
     }
     // Module validation emits target-independent IR. Options such as fp-mode
     // require a target and belong to the native entry compilation below.
-    if targeted {
+    if let Some(target) = target {
+        for define in target_defines(module, target) {
+            command.arg(format!("-D{define}"));
+        }
         if let Ok(flags) = fs::read_to_string(module.with_extension("flags")) {
             command.args(flags.split_whitespace());
         }
     }
+}
+
+// Target-specific compiler boundaries must not change the other backend.
+fn target_defines(module: &Path, target: &str) -> Vec<String> {
+    fs::read_to_string(module.with_extension(format!("{target}.defines")))
+        .unwrap_or_default().split_whitespace().map(str::to_owned).collect()
 }
 
 // A module may restrict its registered native artifacts beside its entries.
@@ -87,6 +99,22 @@ fn targets(module: &Path) -> Vec<&'static str> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => vec!["spirv", "metal"],
         Err(e) => panic!("{}: {e}", module.display()),
     }
+}
+
+/// Keep shipped pipeline identity independent of when the code is hashed.
+fn input_key(code: &[u8], entry: &str, metal: bool, threads: (u32, u32, u32)) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"shipped-entry-v1");
+    hash.update(&[u8::from(metal)]);
+    for part in [code, entry.as_bytes()] {
+        hash.update(&(part.len() as u64).to_le_bytes());
+        hash.update(part);
+    }
+    let threads = if metal { threads } else { (0, 0, 0) };
+    for size in [threads.0, threads.1, threads.2] {
+        hash.update(&size.to_le_bytes());
+    }
+    *hash.finalize().as_bytes()
 }
 
 fn slangc() -> PathBuf {
@@ -202,6 +230,18 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
         renderer_registry::generate(false),
     )
     .unwrap();
+    // Use the same reflected input decoder and dispatch bridge as installed cameras.
+    let camera_source="../../libraries/std/camera.slang";
+    println!("cargo:rerun-if-changed={camera_source}");
+    println!("cargo:rerun-if-changed=src/camera_dispatch_native.rs");
+    let abi=vork_slang::Abi {aov_count:0,context:vork_slang::Abi::spec_context(),closure:vork_slang::openpbr_fields()};
+    let camera=vork_slang::Compiler::discover().compile_camera(&abi,&fs::read_to_string(camera_source).unwrap(),Path::new("std/camera.slang"),"shippedcamera").expect("compile shipped standard camera");
+    let dispatch=camera_dispatch_native::generate(&abi,[(1,&camera)]);
+    for (name,source) in dispatch.modules {
+        let path=generated.join(format!("{name}.slang"));
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(path,source).unwrap();
+    }
     // Entries, then the precompiled generic colour stages (one per stage and technique).
     let entries = entries();
     let mut units: Vec<(String, PathBuf, &str, &str)> = entries
@@ -273,6 +313,19 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
             }}}
         }
     }
+    // The prebuilt path engine, one unit per family, on both backends. Metal
+    // takes the path kernel's registers; the unit's stem is not the module's.
+    let mut path_engines=Vec::new();
+    for engine in surface_native::PathEngine::ALL {
+        let name=engine.name();
+        let path=generated.join(format!("{name}.slang"));
+        fs::write(&path,engine.source()).unwrap();
+        fs::write(path.with_extension("defines"),surface_native::PathEngine::DEFINES.join(" ")).unwrap();
+        let registers=forward_variant::hit_kernel_registers("path",engine.adaptive,false);
+        fs::write(path.with_extension("metal.defines"),registers.iter().map(|define|define.trim_start_matches("-D")).collect::<Vec<_>>().join(" ")).unwrap();
+        units.push((name.clone(),path,surface_native::PathEngine::ENTRY,"compute"));
+        path_engines.push((engine,name));
+    }
     let generics: Vec<_> = Stage::ALL.into_iter().flat_map(|stage| [false, true].map(|hashed| ForwardKey::generic(stage, hashed))).collect();
     // Built-in geometry stages vary only with the named-attribute count. Ship
     // every supported count, including table-material attribute reads.
@@ -334,12 +387,13 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
         if module.file_stem().is_some_and(|s|s=="decoupled") {
             command.arg(generated.join("decoupled.slang")).arg("-DVORK_CAMERA_SPLIT");
         } else {command.arg(&module);}
-        module_options(&mut command, &module, false);
+        module_options(&mut command, &module, None);
         for path in include {
             command.arg("-I").arg(path);
         }
         let out = dir.join(module.file_name().unwrap()).with_extension("slang-module");
         command
+            .arg("-DVORK_NO_GAUSSIANS")
             .args(["-warnings-as-errors", "all"])
             .arg("-o")
             .arg(&out);
@@ -376,12 +430,12 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
                         let stem = dir.join(format!("{name}.{ext}"));
                         let mut command = Command::new(slangc);
                         command.arg(path);
-                        module_options(&mut command, path, true);
+                        module_options(&mut command, path, Some(target));
                         if target == "metal" {
                             if *stage == "vertex" {command.args(["-DVORK_MATERIAL_WORDS_REGISTER=t3","-DVORK_FRAME_LIGHTS_REGISTER=t30","-DVORK_FRAME_CLUSTERS_REGISTER=b29","-DVORK_POINT_WORDS_REGISTER=t2"]);}
                             command.args(forward_variant::hit_kernel_registers(
                                 path.file_stem().unwrap().to_str().unwrap(),
-                                *entry == "path_main",path.file_stem().unwrap() == "probe_update"));
+                                false,path.file_stem().unwrap() == "probe_update"));
                         }
                         for dir in include {
                             command.arg("-I").arg(dir);
@@ -391,6 +445,7 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
                             .args(SLANG_FLAGS)
                             .arg("-zero-initialize")
                             .arg(NATIVE_OPTIMIZATION)
+                            .arg("-DVORK_NO_GAUSSIANS")
                             .args(["-warnings-as-errors", "all"])
                             .args(flags)
                             .arg("-o")
@@ -402,6 +457,16 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
                         if let Err(e) = run(command, &stem.with_extension(format!("{ext}.log"))) {
                             failed.store(true, Ordering::Relaxed);
                             return Err(format!("slangc {name} ({target}): {e}"));
+                        }
+                        // These boundaries constrain Slang, not the driver. Normalize
+                        // before embedding/hashing so shipped identities use actual code.
+                        // The path engine gets what a scene's own path kernel gets
+                        // at runtime (slang_forward.rs, driver_inline).
+                        if target == "spirv" && (name.starts_with("path_engine_") || target_defines(path, target).iter()
+                            .any(|define| define == "VORK_SURFACE_SLANG_OUTLINE")) {
+                            let mut code = fs::read(&stem).map_err(|e| e.to_string())?;
+                            vork_slang::spirv::allow_driver_inlining(&mut code).map_err(|e| e.to_string())?;
+                            fs::write(&stem, code).map_err(|e| e.to_string())?;
                         }
                         // Slang's MSL source needs the same native FP contract
                         // as runtime shaders (vork_slang's precise emission).
@@ -437,6 +502,24 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
         }
     }
     let mut rust = String::new();
+    // Each distinct compiled module is one static, so the executable holds its
+    // bytes once however many entries and tables name it. (A `const` holding
+    // `include_bytes!` is copied into every codegen unit that uses it.)
+    let mut embedded = std::collections::BTreeMap::<([u8; 32], bool), String>::new();
+    let mut embed = |rust: &mut String, file: String, metal: bool| -> String {
+        let code = fs::read(&file).unwrap();
+        let next = embedded.len();
+        embedded.entry((*blake3::hash(&code).as_bytes(), metal)).or_insert_with(|| {
+            let name = format!("EMBEDDED_{next}");
+            // A build embeds the form its platform runs: Metal source on Apple
+            // (lib.rs supported_backends offers no Vulkan there), SPIR-V everywhere
+            // else. Tests embed both. Both identities stay: they are computed here.
+            rust.push_str(if metal { "#[cfg(any(target_vendor = \"apple\", test))] " }
+                else { "#[cfg(any(not(target_vendor = \"apple\"), test))] " });
+            writeln!(rust, "static {name}: [u8; {}] = *include_bytes!({file:?});", code.len()).unwrap();
+            name
+        }).clone()
+    };
     for (name, module, entry, stage) in &units {
         let metal = targets(module).contains(&"metal") && host.iter().any(|h| h == "metal");
         if !metal {
@@ -456,22 +539,29 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
                 .find(|e| e["name"] == *entry)
                 .and_then(|e| e["threadGroupSize"].as_array())
                 .unwrap_or_else(|| panic!("{name}: no threadGroupSize in reflection"));
-            format!("({}, {}, {})", size[0], size[1], size[2])
+            let size: Vec<u32> = size.iter().map(|v| v.as_u64().unwrap().try_into().unwrap()).collect();
+            (size[0], size[1], size[2])
         } else {
-            "(0, 0, 0)".to_string()
+            (0, 0, 0)
         };
-        // Only Apple builds run Metal; elsewhere MSL is embedded for tests alone.
+        let spirv_key = input_key(&fs::read(path("spv")).unwrap(), entry, false, threads);
+        let metal_key = input_key(&fs::read(path("metal")).unwrap(), entry, true, threads);
+        let empty_metal_key = input_key(&[], entry, true, threads);
+        let spirv = embed(&mut rust, path("spv"), false);
+        let msl = embed(&mut rust, path("metal"), true);
         writeln!(
             rust,
             "pub(crate) const {upper}: Compiled = Compiled {{ name: \"{name}\", entry: \"{entry}\", \
-             spirv: include_bytes!({:?}), \
-             msl: {{ #[cfg(any(target_vendor = \"apple\", test))] const MSL: &str = include_str!({:?}); \
+             spirv: {{ #[cfg(any(not(target_vendor = \"apple\"), test))] const SPIRV: &[u8] = &{spirv}; \
+             #[cfg(not(any(not(target_vendor = \"apple\"), test)))] const SPIRV: &[u8] = &[]; SPIRV }}, \
+             msl: {{ #[cfg(any(target_vendor = \"apple\", test))] const MSL: &str = match std::str::from_utf8(&{msl}) {{ Ok(source) => source, Err(_) => panic!(\"Metal source is UTF-8\") }}; \
              #[cfg(not(any(target_vendor = \"apple\", test)))] const MSL: &str = \"\"; MSL }}, \
-             threads: {threads}, \
+             input_keys: [{spirv_key:?}, {{ \
+             #[cfg(any(target_vendor = \"apple\", test))] const KEY: [u8; 32] = {metal_key:?}; \
+             #[cfg(not(any(target_vendor = \"apple\", test)))] const KEY: [u8; 32] = {empty_metal_key:?}; KEY }}], \
+             threads: {threads:?}, \
              #[cfg(test)] stage: \"{stage}\", #[cfg(test)] spirv_reflection: include_str!({:?}), \
              #[cfg(test)] msl_reflection: include_str!({:?}) }};",
-            path("spv"),
-            path("metal"),
             path("spv.json"),
             path("metal.json"),
             upper = name.to_uppercase(),
@@ -492,6 +582,8 @@ pub fn compile(out: &Path, closure_dir: &Path) -> (String, blake3::Hash) {
     writeln!(rust,"pub(crate) const CAMERAS: &[(u8,u8,&str,&Compiled)]=&[{}];",cameras.join(",")).unwrap();
     let surfaces:Vec<_>=surfaces.iter().map(|(family,rays,probes,coverage,boundaries,name)|format!("(crate::surface_native::SurfaceKernel::{family:?},{rays},{probes},{coverage},{boundaries},&{})",name.to_uppercase())).collect();
     writeln!(rust,"pub(crate) const SURFACES: &[(crate::surface_native::SurfaceKernel,bool,bool,bool,u32,&Compiled)]=&[{}];",surfaces.join(",")).unwrap();
+    let path_engines:Vec<_>=path_engines.iter().map(|(engine,name)|format!("(crate::surface_native::PathEngine {{adaptive:{},boundaries:{}}},&{})",engine.adaptive,engine.boundaries,name.to_uppercase())).collect();
+    writeln!(rust,"pub(crate) const PATH_ENGINES: &[(crate::surface_native::PathEngine,&Compiled)]=&[{}];",path_engines.join(",")).unwrap();
     let stream_consts: Vec<_> = streams.iter().map(|(a,m,e,n)|format!("({a}, \"{m}\", \"{e}\", &{})",n.to_uppercase())).collect();
     writeln!(rust,"pub(crate) const STREAMS: &[(u32,&str,&str,&Compiled)] = &[{}];",stream_consts.join(",")).unwrap();
     let control_consts: Vec<_> = controls.iter().map(|(a,d,s,h,n)|format!("({a},{d},{s},{h},&{})",n.to_uppercase())).collect();

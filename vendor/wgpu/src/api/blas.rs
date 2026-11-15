@@ -10,6 +10,8 @@ use crate::{Buffer, Label};
 
 /// Descriptor for the size defining attributes of a triangle geometry, for a bottom level acceleration structure.
 pub type BlasTriangleGeometrySizeDescriptor = wgt::BlasTriangleGeometrySizeDescriptor;
+/// Size and flags for procedural AABB geometry.
+pub type BlasAabbGeometrySizeDescriptor = wgt::BlasAabbGeometrySizeDescriptor;
 static_assertions::assert_impl_all!(BlasTriangleGeometrySizeDescriptor: Send, Sync);
 
 /// Descriptor for the size defining attributes, for a bottom level acceleration structure.
@@ -118,8 +120,24 @@ static_assertions::assert_impl_all!(BlasTriangleGeometry<'_>: WasmNotSendSync);
 
 /// Contains the sets of geometry that go into a [Blas].
 pub enum BlasGeometries<'a> {
+    /// Procedural primitives bounded by axis-aligned boxes.
+    AabbGeometries(Vec<BlasAabbGeometry<'a>>),
     /// Triangle geometry variant.
     TriangleGeometries(Vec<BlasTriangleGeometry<'a>>),
+}
+
+/// One set of procedural primitive bounds for a bottom level structure.
+pub struct BlasAabbGeometry<'a> {
+    /// Number of boxes and geometry flags.
+    pub size: &'a BlasAabbGeometrySizeDescriptor,
+    /// Six float32 values per box: minimum xyz followed by maximum xyz.
+    /// The buffer must have BLAS_INPUT usage; all coordinates must be finite,
+    /// with each minimum no greater than its corresponding maximum.
+    pub buffer: &'a Buffer,
+    /// Byte offset, aligned to 8 bytes.
+    pub offset: wgt::BufferAddress,
+    /// Byte distance between boxes, at least 24 and a multiple of 8.
+    pub stride: wgt::BufferAddress,
 }
 static_assertions::assert_impl_all!(BlasGeometries<'_>: WasmNotSendSync);
 

@@ -4,6 +4,7 @@ use crate::*;
 
 pub(crate) struct Resources {
     pub pixels: wgpu::Buffer,
+    pub(crate) invalid_bitmap: std::ops::Range<u64>,
     pub(crate) output_layout: wgpu::BindGroupLayout,
     pub(crate) display_inputs: Option<wgpu::Buffer>,
     pub(crate) compositor_inputs: crate::compositor::FrameInputs,
@@ -19,7 +20,7 @@ impl Resources {
         uniform: &wgpu::Buffer,
         ao_guides: Option<(&wgpu::TextureView, &wgpu::TextureView)>,
         lights: &wgpu::Buffer,
-        path_light_tree: Option<&wgpu::Buffer>,
+        analytic_light_tree: &wgpu::Buffer,
         cluster_config: &wgpu::Buffer,
         cluster_lights: &wgpu::Buffer,
         material_records: &wgpu::Buffer,
@@ -72,6 +73,8 @@ impl Resources {
         // pixels and dispatches belong to their own logical output extent.
         let [output_width, output_height] = view_desc.extent;
         let size = if graph.runs(crate::graph::Pass::Resolve) || graph.runs(crate::graph::Pass::AovResolve) || graph.runs(crate::graph::Pass::Path) {u64::from(output_width) * u64::from(output_height) * u64::from(planes) * 4} else {16};
+        let bitmap_bytes = crate::frame::invalid_pixel_bitmap_bytes(u64::from(output_width) * u64::from(output_height));
+        let invalid_bitmap = size..size + bitmap_bytes;
         // Captures can rerun between camera exposure samples.
         // Keep each capture's resolve separate from the retained camera sum.
         let buffer = |label: &str, size: u64, usage| {
@@ -83,10 +86,10 @@ impl Resources {
             s.transients.buffer(d, label, size, usage)
         };
         // Resolve stages unassociated scene-linear colour for the display program.
-        let pixels = buffer("packed PNG pixels", size,
-            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC);
+        let pixels = buffer("packed PNG pixels", invalid_bitmap.end,
+            wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_SRC | wgpu::BufferUsages::COPY_DST);
         let catcher_base=planes.saturating_sub(4 + if !capture {4} else {0});
-        if graph.runs(crate::graph::Pass::Path) {passes::path::record(s,r,uniform,lights,path_light_tree.unwrap_or(cluster_lights),cluster_config,cluster_lights,objects,rays,material,resolved,&targets.aov_values,targets,&targets.catcher,&pixels,catcher_base,recorder,view_desc)?;}
+        if graph.runs(crate::graph::Pass::Path) {passes::path::record(s,r,uniform,lights,analytic_light_tree,cluster_config,cluster_lights,objects,rays,material,resolved,&targets.aov_values,targets,&targets.catcher,&pixels,catcher_base,(invalid_bitmap.start / 4) as u32,recorder,view_desc)?;}
         let accumulation = buffer(
             "linear sample accumulation",
             if needs_source && (exposure_samples > 1 || !compositor.is_empty() || s.has_catchers || denoiser.is_some() || reconstruct) {
@@ -126,7 +129,7 @@ impl Resources {
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             )
         });
-        let reconstruction = reconstruct.then(|| crate::denoise::spatial::Stage::new(r, &accumulation, denoised.as_ref().unwrap(), guides.unwrap(), [w,h], exposure_samples)).transpose()?;
+        let reconstruction = reconstruct.then(|| crate::denoise::spatial::Stage::new(r, &accumulation, denoised.as_ref().unwrap(), [w,h], exposure_samples)).transpose()?;
         let denoiser = denoiser.filter(|_|s.plan.effects.denoise)
             .map(|settings| {
                 let mut stage=crate::denoise::Stage::new(
@@ -144,7 +147,7 @@ impl Resources {
             })
             .transpose()?;
 
-        let compositor_inputs = crate::compositor::FrameInputs::new(s, r, compositor);
+        let compositor_inputs = crate::compositor::FrameInputs::new(&s.compositor, r, compositor);
         let mut post_color = if let Some(denoised) = &denoised {
             denoised.clone()
         } else {
@@ -238,7 +241,7 @@ impl Resources {
         let display_base = (!capture).then_some(planes - 4);
         if !capture {
             let stage = &s.display_program;
-            dispatches.push(stage.dispatch(r, uniform, display_inputs.as_ref(), &pixels, shader_errors.context("display diagnostics")?, [output_width,output_height]));
+            dispatches.push(stage.dispatch(r, uniform, display_inputs.as_ref(), pixels.as_entire_binding(), shader_errors.context("display diagnostics")?, [output_width,output_height]));
         }
         recorder.compute(
             crate::graph::Pass::Resolve,
@@ -247,7 +250,7 @@ impl Resources {
             true,
             dispatches,
         );
-        Ok((Self { pixels, output_layout:resolve_pipeline.get_bind_group_layout(1), display_inputs, compositor_inputs, denoiser, reconstruction, nonfinite:targets.nonfinite.clone(), display_base }, output_bind))
+        Ok((Self { pixels, invalid_bitmap, output_layout:resolve_pipeline.get_bind_group_layout(1), display_inputs, compositor_inputs, denoiser, reconstruction, nonfinite:targets.nonfinite.clone(), display_base }, output_bind))
     }
 }
 

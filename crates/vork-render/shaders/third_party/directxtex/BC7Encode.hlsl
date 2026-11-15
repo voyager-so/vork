@@ -1713,6 +1713,9 @@ uint2x4 compress_endpoints5(inout uint2x4 endPoint)
 }
 uint2x4 compress_endpoints6(inout uint2x4 endPoint, uint2 P)
 {
+    // Mode 6 shares each p-bit across RGBA. Opaque endpoints require odd
+    // parity; RGB error must never buy a nonopaque representation.
+    if (endPoint[0].a == 255 && endPoint[1].a == 255) P = uint2(1, 1);
     uint2x4 quantized;
     for (uint j = 0; j < 2; j++)
     {

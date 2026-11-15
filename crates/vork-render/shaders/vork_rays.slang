@@ -10,19 +10,19 @@
 #define VORK_RAY_BINDING_GROUP 2
 #endif
 #ifndef VORK_RAY_SEQUENCE_REGISTER
-#define VORK_RAY_SEQUENCE_REGISTER t10
-#define VORK_RAY_SCENE_REGISTER t11
-#define VORK_RAY_ALPHA_REGISTER t12
+#define VORK_RAY_SEQUENCE_REGISTER t11
+#define VORK_RAY_SCENE_REGISTER t12
+#define VORK_RAY_ALPHA_REGISTER t13
 #ifdef VORK_METAL
-#define VORK_RAY_HITS_REGISTER b13
+#define VORK_RAY_HITS_REGISTER b14
 #else
-#define VORK_RAY_HITS_REGISTER t13
+#define VORK_RAY_HITS_REGISTER t14
 #endif
 #endif
 import vork_constants;
 import light_connection;
 #ifdef VORK_CAMERA_SPLIT
-[[vk::binding(14,4)]] public StructuredBuffer<float> receiver_emitter_weights : register(t28);
+[[vk::binding(14,4)]] public StructuredBuffer<float> receiver_emitter_weights : register(t29);
 #endif
 import vork_sampling;
 [[vk::binding(0,VORK_RAY_BINDING_GROUP)]] public StructuredBuffer<uint> shadow_sequence RASTER_REGISTER(VORK_RAY_SEQUENCE_REGISTER);

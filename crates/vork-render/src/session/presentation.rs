@@ -21,6 +21,8 @@ impl Session {
         let r = &self.renderer;
         let surface = r.instance.create_surface(target).context("create window surface; run on a desktop with a supported display driver")?;
         let caps = surface.get_capabilities(&r.adapter);
+        ensure!(!caps.formats.is_empty() && !caps.present_modes.is_empty(),
+            "display driver could not query window surface capabilities; use a supported desktop display and graphics driver");
         let format = caps.formats.iter().copied().find(|f| matches!(f, wgpu::TextureFormat::Bgra8Unorm | wgpu::TextureFormat::Rgba8Unorm))
             .context("display requires an RGBA8/BGRA8 unorm surface to preserve vork display-encoded colour; use another display adapter")?;
         ensure!(caps.present_modes.contains(&wgpu::PresentMode::Fifo), "display has no FIFO/vsync support; select another display adapter");
@@ -114,7 +116,7 @@ impl Presentation<'_> {
     fn configure(&mut self, r: &Renderer) -> Result<()> {
         if !self.reconfigure || self.size.contains(&0) { return Ok(()); }
         ensure!(self.size.iter().all(|v| *v <= r.device.limits().max_texture_dimension_2d),
-            "{}", crate::gpu_memory::limit_message("window", format_args!("{}x{} pixels",self.size[0],self.size[1]), format_args!("{} pixels per axis",r.device.limits().max_texture_dimension_2d), "resize the window within the texture dimension limit"));
+            crate::gpu_memory::device_limit("window", format_args!("{}x{} pixels",self.size[0],self.size[1]), format_args!("{} pixels per axis",r.device.limits().max_texture_dimension_2d), "resize the window within the texture dimension limit"));
         self.config.width = self.size[0]; self.config.height = self.size[1];
         let scope = r.device.push_error_scope(wgpu::ErrorFilter::Validation);
         self.surface.configure(&r.device, &self.config);

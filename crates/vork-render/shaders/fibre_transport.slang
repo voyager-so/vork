@@ -9,7 +9,7 @@ struct FibreLight {float4x4 matrices[6];float4 tiles[6];float4 clip[6];};
 #ifndef VORK_FIBRE_BINDING
 #define VORK_FIBRE_BINDING 0
 #endif
-[[vk::binding(VORK_FIBRE_BINDING,2)]] StructuredBuffer<FibreLight> fibre_lights : register(t14);
+[[vk::binding(VORK_FIBRE_BINDING,2)]] StructuredBuffer<FibreLight> fibre_lights : register(t15);
 [[vk::binding(VORK_FIBRE_BINDING+1,2)]] Texture2D<float> fibre_near : register(t4);
 [[vk::binding(VORK_FIBRE_BINDING+2,2)]] Texture2D<float> fibre_far : register(t5);
 [[vk::binding(VORK_FIBRE_BINDING+3,2)]] Texture2D<float4> fibre_counts : register(t6);

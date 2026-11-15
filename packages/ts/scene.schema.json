@@ -1,5 +1,22 @@
 {
   "$defs": {
+    "Active": {
+      "anyOf": [
+        {
+          "type": "boolean"
+        },
+        {
+          "description": "`[start, end)`: present when start <= p < end.",
+          "items": {
+            "$ref": "#/$defs/Clock"
+          },
+          "maxItems": 2,
+          "minItems": 2,
+          "type": "array"
+        }
+      ],
+      "description": "When the node exists, in parent seconds: always, never, or a half-open window."
+    },
     "AimTarget": {
       "anyOf": [
         {
@@ -179,6 +196,30 @@
       "type": "object",
       "x-help-extra": "material.attribute: binds geometry or instance columns to numeric inputs; custom programs read_attribute(handle,ctx) gives value, dx, dy"
     },
+    "Audio": {
+      "additionalProperties": false,
+      "description": "Sound attached to any node. Omit file for a group gain.",
+      "properties": {
+        "file": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-help": "file-path|null; mono/stereo; relative to scene; omitted = children only",
+          "x-help-path": "node.audio.file",
+          "x-source": "vork sound source"
+        },
+        "gain": {
+          "default": 1.0,
+          "format": "float",
+          "type": "number",
+          "x-help": "number; linear amplitude over source plus children; default 1; keyable",
+          "x-help-path": "node.audio.gain",
+          "x-source": "Web Audio GainNode"
+        }
+      },
+      "type": "object"
+    },
     "Background": {
       "anyOf": [
         {
@@ -192,6 +233,10 @@
         },
         {
           "$ref": "#/$defs/BackgroundMode"
+        },
+        {
+          "description": "A 2D canvas's background: a CSS colour behind every node.",
+          "type": "string"
         }
       ]
     },
@@ -205,7 +250,7 @@
     "Blend": {
       "enum": [
         "replace",
-        "add"
+        "combine"
       ],
       "type": "string"
     },
@@ -561,6 +606,9 @@
       "enum": [
         "sRGB",
         "Linear Rec.709",
+        "Linear Rec.2020",
+        "ACEScg",
+        "Display P3",
         "Non-Color"
       ],
       "type": "string"
@@ -574,7 +622,7 @@
           "$ref": "#/$defs/CompositeNode"
         }
       ],
-      "description": "An ordered image-graph node. Resource names remain shorthand for an unnamed node."
+      "description": "An ordered image-graph step. Resource names remain shorthand for an unnamed step."
     },
     "CompositeNode": {
       "additionalProperties": false,
@@ -625,6 +673,72 @@
         }
       ]
     },
+    "Composition": {
+      "additionalProperties": false,
+      "description": "`composition`: on the scene, `{space: \"2d\"}` makes the document a canvas; on a node, a canvas or a world (compose.rs).",
+      "properties": {
+        "color_space": {
+          "$ref": "#/$defs/WorkingColorSpace",
+          "description": "Working RGB encoding; omitted: Linear Rec.709 for worlds, sRGB for canvases.",
+          "x-help": "Linear Rec.709|Linear Rec.2020|ACEScg|sRGB|Display P3; omitted: worlds Linear Rec.709, canvases sRGB",
+          "x-help-path": "composition.color_space",
+          "x-source": "vork colour contract (docs/design/colour.md)"
+        },
+        "compositor": {
+          "description": "This composition's image graph, run in its working space before its view.",
+          "items": {
+            "$ref": "#/$defs/CompositeEntry"
+          },
+          "type": "array",
+          "x-help": "(material-name|{material,name?,resolution?})[]; ordered image graph in the working space, before the view; last is the output; material may be inline; a canvas's graph works in the canvas's working encoding (sRGB code values by default)",
+          "x-help-path": "composition.compositor",
+          "x-source": "vork colour contract (docs/design/colour.md)"
+        },
+        "preserveAspectRatio": {
+          "description": "SVG 2 `preserveAspectRatio`; omitted means `xMidYMid meet`; unsupported on a canvas inside a canvas.",
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-help": "string|null; none, or x(Min|Mid|Max)Y(Min|Mid|Max) then meet|slice; null = xMidYMid meet; unsupported on a canvas inside a canvas",
+          "x-help-path": "composition.preserveAspectRatio",
+          "x-source": "SVG 2 preserveAspectRatio"
+        },
+        "space": {
+          "$ref": "#/$defs/Space",
+          "x-help": "2d|3d; 2d: a canvas, top-left origin, y down, painted in node order; 3d: a standalone or nested closed world",
+          "x-help-path": "composition.space",
+          "x-source": "END-STATE-API §7"
+        },
+        "view": {
+          "$ref": "#/$defs/NameOr",
+          "description": "Local view material. Omission selects AgX for worlds, Standard for canvases; never inherited.",
+          "x-help": "material-name|inline material; local default: worlds std/agx, canvases std/standard; never inherited",
+          "x-help-path": "composition.view",
+          "x-source": "vork colour contract (docs/design/colour.md)"
+        },
+        "viewBox": {
+          "description": "SVG 2 `viewBox`: min-x, min-y, width, height of the canvas's own coordinates; unsupported on a canvas inside a canvas.",
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "maxItems": 4,
+          "minItems": 4,
+          "type": [
+            "array",
+            "null"
+          ],
+          "x-help": "[min-x,min-y,width,height]|null; the canvas's own coordinates, placed in render.resolution; null = render.resolution px; unsupported on a canvas inside a canvas",
+          "x-help-path": "composition.viewBox",
+          "x-source": "SVG 2 viewBox"
+        }
+      },
+      "required": [
+        "space"
+      ],
+      "type": "object"
+    },
     "ComputeDispatch": {
       "anyOf": [
         {
@@ -660,6 +774,43 @@
           "type": "string"
         }
       ]
+    },
+    "Content": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "$ref": "#/$defs/Run"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "`content`: a string, or styled runs laid out as one text."
+    },
+    "DashArray": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NoDash"
+        },
+        {
+          "items": {
+            "format": "float",
+            "type": "number"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "SVG `stroke-dasharray`: `\"none\"` (solid) or the dash and gap lengths in px; an odd count repeats."
+    },
+    "Direction": {
+      "description": "CSS `direction`.",
+      "enum": [
+        "ltr",
+        "rtl"
+      ],
+      "type": "string"
     },
     "EdgeCrease": {
       "additionalProperties": false,
@@ -706,6 +857,66 @@
           "type": "array"
         }
       ]
+    },
+    "FillRule": {
+      "description": "SVG `fill-rule`.",
+      "enum": [
+        "nonzero",
+        "evenodd"
+      ],
+      "type": "string"
+    },
+    "Fit": {
+      "description": "CSS `object-fit`.",
+      "enum": [
+        "contain",
+        "cover",
+        "fill",
+        "none"
+      ],
+      "type": "string"
+    },
+    "FontFiles": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      ],
+      "description": "`font`: a font file (.ttf/.otf), or a list of files."
+    },
+    "FontStyle": {
+      "description": "CSS `font-style`.",
+      "enum": [
+        "normal",
+        "italic",
+        "oblique"
+      ],
+      "type": "string"
+    },
+    "FontWeight": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/FontWeightKeyword"
+        },
+        {
+          "format": "float",
+          "type": "number"
+        }
+      ],
+      "description": "CSS `font-weight`: a number from 1 to 1000, `normal` (400) or `bold` (700)."
+    },
+    "FontWeightKeyword": {
+      "enum": [
+        "normal",
+        "bold"
+      ],
+      "type": "string"
     },
     "Geometry": {
       "anyOf": [
@@ -981,10 +1192,24 @@
             }
           ],
           "default": null,
-          "description": "Blender `Image.colorspace_settings.name`. Omitted follows Blender's file default.",
-          "x-help": "sRGB|Linear Rec.709|Non-Color|null; null: hdr/exr/ies linear, others sRGB",
+          "description": "Explicit input encoding; omitted uses embedded colour metadata, then the format fallback.",
+          "x-help": "sRGB|Display P3|Linear Rec.709|Linear Rec.2020|ACEScg|Non-Color|null; omitted/null: embedded colour description, else hdr/exr/ies linear Rec.709 and other files sRGB",
           "x-help-path": "image.color_space",
           "x-source": "Blender 5.2.1 Image.colorspace_settings.name"
+        },
+        "composition": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/ImageComposition"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "A rendered image's composition: its image graph, run on the capture before it is published.",
+          "x-help": "{compositor}|null; a rendered image's image graph; requires render",
+          "x-help-path": "image.composition",
+          "x-source": "vork"
         },
         "file": {
           "type": [
@@ -1056,6 +1281,51 @@
       },
       "type": "object"
     },
+    "ImageComposition": {
+      "additionalProperties": false,
+      "description": "`images.<name>.composition`: the image graph of a rendered image.",
+      "properties": {
+        "compositor": {
+          "items": {
+            "$ref": "#/$defs/CompositeEntry"
+          },
+          "type": "array",
+          "x-help": "same ordered image graph as composition.compositor; names local to this capture",
+          "x-help-path": "image.composition.compositor",
+          "x-source": "vork"
+        }
+      },
+      "type": "object"
+    },
+    "ImagePaint": {
+      "additionalProperties": false,
+      "description": "An image as a paint: bound as every image is (`{image: name}`), drawn in the shape's bounding box\nand clipped by the shape.",
+      "properties": {
+        "fit": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Fit"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-help": "contain|cover|fill|none|null; centred in the shape's box; null = natural size from the box's top-left, repeated as the image's wrap_s and wrap_t say",
+          "x-help-path": "paint.fit",
+          "x-source": "CSS object-fit"
+        },
+        "image": {
+          "type": "string",
+          "x-help": "image-name; PNG or JPEG, sRGB; clipped by the shape",
+          "x-help-path": "paint.image",
+          "x-source": "END-STATE-API §2 (a picture is a path filled with an image)"
+        }
+      },
+      "required": [
+        "image"
+      ],
+      "type": "object"
+    },
     "ImageRender": {
       "additionalProperties": false,
       "description": "Settings that a nested image may author. The parent owns transport and time;\na capture has a closed shutter and runs the automatic per-step compositor.",
@@ -1076,16 +1346,6 @@
           "x-help": "camera-node-name|null; null = the only authored camera, else first imported",
           "x-help-path": "image.render.camera",
           "x-source": "vork (explicit contract/technique choice)"
-        },
-        "compositor": {
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/CompositeEntry"
-          },
-          "type": "array",
-          "x-help": "same image graph as render.compositor; names local to this capture",
-          "x-help-path": "image.render.compositor",
-          "x-source": "vork"
         },
         "resolution": {
           "default": [
@@ -1174,7 +1434,7 @@
           "$ref": "#/$defs/ChannelBinding"
         },
         {
-          "$ref": "#/$defs/NodeBinding"
+          "$ref": "#/$defs/StepBinding"
         },
         {
           "description": "An enum token of the program's reflected input type.",
@@ -1269,7 +1529,7 @@
             "blend": {
               "$ref": "#/$defs/Blend",
               "default": "replace",
-              "x-help": "replace|add",
+              "x-help": "replace|combine",
               "x-help-path": "animation.layer.blend",
               "x-source": "vork (explicit contract/technique choice)"
             },
@@ -1340,7 +1600,7 @@
             "blend": {
               "$ref": "#/$defs/Blend",
               "default": "replace",
-              "x-help": "replace|add",
+              "x-help": "replace|combine",
               "x-help-path": "animation.layer.blend",
               "x-source": "vork (explicit contract/technique choice)"
             },
@@ -1418,6 +1678,53 @@
       "type": "string",
       "x-help-extra": "lights: with no environment light the world is RGB [0.05,0.05,0.05]"
     },
+    "LineBreak": {
+      "description": "CSS `line-break`.",
+      "enum": [
+        "auto",
+        "loose",
+        "normal",
+        "strict",
+        "anywhere"
+      ],
+      "type": "string"
+    },
+    "LineCap": {
+      "description": "SVG `stroke-linecap`.",
+      "enum": [
+        "butt",
+        "round",
+        "square"
+      ],
+      "type": "string"
+    },
+    "LineHeight": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/LineHeightNormal"
+        },
+        {
+          "format": "float",
+          "type": "number"
+        }
+      ],
+      "description": "CSS `line-height`: `normal` (the font's own line metrics) or a multiple of the font size."
+    },
+    "LineHeightNormal": {
+      "enum": [
+        "normal"
+      ],
+      "type": "string"
+    },
+    "LineJoin": {
+      "description": "SVG `stroke-linejoin`; SVG 2's `miter-clip` and `arcs` are refused as not built.",
+      "enum": [
+        "miter",
+        "round",
+        "bevel"
+      ],
+      "type": "string"
+    },
     "MagFilter": {
       "enum": [
         "nearest",
@@ -1442,7 +1749,7 @@
           },
           "default": {},
           "type": "object",
-          "x-help": "{name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{node}|{channel}|{geometry}}",
+          "x-help": "{name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{step}|{channel}|{geometry}}",
           "x-help-extra": "material.inputs (transmission): transmission_depth 0 = sqrt(tint) per solid interface; thin sheets = full tint; positive-depth solids = Beer absorption\nmaterial.inputs (animation): numeric scalar/vector/colour inputs on surface/environment/compute/compositor/display programs use ordinary tracks; geometry_thin_walled is structural; an omitted animated program input has a zero blend baseline (author inputs for another baseline)\nmaterial.inputs.subsurface: thick: radius × radius_scale; thin: diffuse reflection/transmission split by scatter_anisotropy",
           "x-help-path": "material.inputs",
           "x-source": "OpenPBR Surface 1.1.1 defaults (spec table)"
@@ -1641,11 +1948,56 @@
       ],
       "description": "A resource name or inline definition."
     },
+    "NoDash": {
+      "description": "The string `\"none\"`: a solid stroke.",
+      "enum": [
+        "none"
+      ],
+      "type": "string"
+    },
+    "NoPaint": {
+      "description": "The string `\"none\"` (SVG `fill=\"none\"`): nothing is painted.",
+      "enum": [
+        "none"
+      ],
+      "type": "string"
+    },
     "Node": {
       "description": "Translation, rotation and scale (glTF node TRS), flat on the node. Rotation is\nstored as a quaternion; an authored `{\"euler\": [x,y,z]}` converts losslessly.",
       "oneOf": [
         {
           "properties": {
+            "active": {
+              "$ref": "#/$defs/Active",
+              "description": "When the node exists, in parent seconds. Off: no picture, no sound, no evaluation, children included.",
+              "x-help": "true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step)",
+              "x-help-path": "node.active",
+              "x-source": "vork (node existence; Unity active)"
+            },
+            "animation": {
+              "description": "Layers evaluated on this node's clock; paths start at this node.",
+              "items": {
+                "$ref": "#/$defs/NodeLayer"
+              },
+              "type": "array",
+              "x-help": "layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself",
+              "x-help-path": "node.animation",
+              "x-source": "vork (node-owned animation)"
+            },
+            "audio": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Audio"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Sound source and gain over this node's complete subtree mix.",
+              "x-help": "{file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch",
+              "x-help-path": "node.audio",
+              "x-source": "Web Audio (gain); vork sound"
+            },
             "children": {
               "default": [],
               "items": {
@@ -1655,6 +2007,40 @@
               "x-help": "node[]",
               "x-help-path": "node.children",
               "x-source": "vork (explicit contract/technique choice)"
+            },
+            "clip-path": {
+              "description": "2D canvas only: the named node's shape clips this node, drawn in this node's coordinates (SVG\nclip-path, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself",
+              "x-help-path": "node.clip-path",
+              "x-source": "SVG 2 / CSS Masking clip-path"
+            },
+            "composition": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Composition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`{space: \"2d\"}`: a canvas whose children paint to one picture; `{space: \"3d\"}`, in a canvas: a closed\n3D world rendered to one picture and placed in the canvas (END-STATE-API §7).",
+              "x-help": "composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box",
+              "x-help-path": "node.composition",
+              "x-source": "END-STATE-API §7"
+            },
+            "filter": {
+              "description": "2D canvas only: CSS filter functions over the node's picture, in order.\nLayer blur refuses sigma above 100 target pixels after accumulated transforms.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses",
+              "x-help-path": "node.filter",
+              "x-source": "CSS Filter Effects filter"
             },
             "is_holdout": {
               "default": false,
@@ -1682,12 +2068,31 @@
               "x-help-path": "node.light_link_tags",
               "x-source": "vork (explicit contract/technique choice)"
             },
+            "mask": {
+              "description": "2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's\ncoordinates (SVG mask, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself",
+              "x-help-path": "node.mask",
+              "x-source": "SVG 2 / CSS Masking mask (luminance)"
+            },
             "name": {
               "default": "",
               "type": "string",
               "x-help": "string; globally unique, including imported nodes",
               "x-help-path": "node.name",
               "x-source": "vork (explicit contract/technique choice)"
+            },
+            "opacity": {
+              "default": 1.0,
+              "description": "2D canvas only: the node's whole picture, children included, placed once (CSS opacity).",
+              "format": "float",
+              "type": "number",
+              "x-help": "number; 2D; 0..1; the node's picture, children included, placed once",
+              "x-help-path": "node.opacity",
+              "x-source": "CSS opacity"
             },
             "pass_index": {
               "format": "uint32",
@@ -1742,6 +2147,20 @@
               "x-help": "node-name|[x,y,z]|null; aims -Z, world Y up; rotation is an offset on top; structural, not animatable: aim at a named node and animate its translation",
               "x-help-path": "node.target",
               "x-source": "Blender Track To constraint (vork target shorthand)"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NodeClock"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The clock for node-owned animation and media: local = offset + (parent - start) * speed, wrapped or held in the trimmed section.",
+              "x-help": "{start,offset,duration,speed,loop}|null; node-owned animation/media clock; time-reading programs, conflicting movie clocks and scene-time tracks inside retimed compositions refuse; null inherits parent/active-window clock",
+              "x-help-path": "node.time",
+              "x-source": "vork (node clock)"
             },
             "translation": {
               "default": [
@@ -1814,6 +2233,37 @@
         },
         {
           "properties": {
+            "active": {
+              "$ref": "#/$defs/Active",
+              "description": "When the node exists, in parent seconds. Off: no picture, no sound, no evaluation, children included.",
+              "x-help": "true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step)",
+              "x-help-path": "node.active",
+              "x-source": "vork (node existence; Unity active)"
+            },
+            "animation": {
+              "description": "Layers evaluated on this node's clock; paths start at this node.",
+              "items": {
+                "$ref": "#/$defs/NodeLayer"
+              },
+              "type": "array",
+              "x-help": "layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself",
+              "x-help-path": "node.animation",
+              "x-source": "vork (node-owned animation)"
+            },
+            "audio": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Audio"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Sound source and gain over this node's complete subtree mix.",
+              "x-help": "{file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch",
+              "x-help-path": "node.audio",
+              "x-source": "Web Audio (gain); vork sound"
+            },
             "children": {
               "default": [],
               "items": {
@@ -1823,6 +2273,40 @@
               "x-help": "node[]",
               "x-help-path": "node.children",
               "x-source": "vork (explicit contract/technique choice)"
+            },
+            "clip-path": {
+              "description": "2D canvas only: the named node's shape clips this node, drawn in this node's coordinates (SVG\nclip-path, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself",
+              "x-help-path": "node.clip-path",
+              "x-source": "SVG 2 / CSS Masking clip-path"
+            },
+            "composition": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Composition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`{space: \"2d\"}`: a canvas whose children paint to one picture; `{space: \"3d\"}`, in a canvas: a closed\n3D world rendered to one picture and placed in the canvas (END-STATE-API §7).",
+              "x-help": "composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box",
+              "x-help-path": "node.composition",
+              "x-source": "END-STATE-API §7"
+            },
+            "filter": {
+              "description": "2D canvas only: CSS filter functions over the node's picture, in order.\nLayer blur refuses sigma above 100 target pixels after accumulated transforms.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses",
+              "x-help-path": "node.filter",
+              "x-source": "CSS Filter Effects filter"
             },
             "geometry": {
               "$ref": "#/$defs/NameOr5",
@@ -1869,6 +2353,16 @@
               "x-help-path": "node.light_link_tags",
               "x-source": "vork (explicit contract/technique choice)"
             },
+            "mask": {
+              "description": "2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's\ncoordinates (SVG mask, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself",
+              "x-help-path": "node.mask",
+              "x-source": "SVG 2 / CSS Masking mask (luminance)"
+            },
             "materials": {
               "default": [],
               "items": {
@@ -1896,6 +2390,15 @@
               "x-help": "string; globally unique, including imported nodes",
               "x-help-path": "node.name",
               "x-source": "vork (explicit contract/technique choice)"
+            },
+            "opacity": {
+              "default": 1.0,
+              "description": "2D canvas only: the node's whole picture, children included, placed once (CSS opacity).",
+              "format": "float",
+              "type": "number",
+              "x-help": "number; 2D; 0..1; the node's picture, children included, placed once",
+              "x-help-path": "node.opacity",
+              "x-source": "CSS opacity"
             },
             "pass_index": {
               "format": "uint32",
@@ -1963,6 +2466,20 @@
               "x-help": "node-name|[x,y,z]|null; aims -Z, world Y up; rotation is an offset on top; structural, not animatable: aim at a named node and animate its translation",
               "x-help-path": "node.target",
               "x-source": "Blender Track To constraint (vork target shorthand)"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NodeClock"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The clock for node-owned animation and media: local = offset + (parent - start) * speed, wrapped or held in the trimmed section.",
+              "x-help": "{start,offset,duration,speed,loop}|null; node-owned animation/media clock; time-reading programs, conflicting movie clocks and scene-time tracks inside retimed compositions refuse; null inherits parent/active-window clock",
+              "x-help-path": "node.time",
+              "x-source": "vork (node clock)"
             },
             "translation": {
               "default": [
@@ -2037,6 +2554,37 @@
         },
         {
           "properties": {
+            "active": {
+              "$ref": "#/$defs/Active",
+              "description": "When the node exists, in parent seconds. Off: no picture, no sound, no evaluation, children included.",
+              "x-help": "true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step)",
+              "x-help-path": "node.active",
+              "x-source": "vork (node existence; Unity active)"
+            },
+            "animation": {
+              "description": "Layers evaluated on this node's clock; paths start at this node.",
+              "items": {
+                "$ref": "#/$defs/NodeLayer"
+              },
+              "type": "array",
+              "x-help": "layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself",
+              "x-help-path": "node.animation",
+              "x-source": "vork (node-owned animation)"
+            },
+            "audio": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Audio"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Sound source and gain over this node's complete subtree mix.",
+              "x-help": "{file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch",
+              "x-help-path": "node.audio",
+              "x-source": "Web Audio (gain); vork sound"
+            },
             "children": {
               "default": [],
               "items": {
@@ -2047,11 +2595,45 @@
               "x-help-path": "node.children",
               "x-source": "vork (explicit contract/technique choice)"
             },
+            "clip-path": {
+              "description": "2D canvas only: the named node's shape clips this node, drawn in this node's coordinates (SVG\nclip-path, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself",
+              "x-help-path": "node.clip-path",
+              "x-source": "SVG 2 / CSS Masking clip-path"
+            },
+            "composition": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Composition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`{space: \"2d\"}`: a canvas whose children paint to one picture; `{space: \"3d\"}`, in a canvas: a closed\n3D world rendered to one picture and placed in the canvas (END-STATE-API §7).",
+              "x-help": "composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box",
+              "x-help-path": "node.composition",
+              "x-source": "END-STATE-API §7"
+            },
             "file": {
               "type": "string",
               "x-help": "file-path",
               "x-help-path": "node.asset.file",
               "x-source": "vork (explicit contract/technique choice)"
+            },
+            "filter": {
+              "description": "2D canvas only: CSS filter functions over the node's picture, in order.\nLayer blur refuses sigma above 100 target pixels after accumulated transforms.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses",
+              "x-help-path": "node.filter",
+              "x-source": "CSS Filter Effects filter"
             },
             "is_holdout": {
               "default": false,
@@ -2079,6 +2661,16 @@
               "x-help-path": "node.light_link_tags",
               "x-source": "vork (explicit contract/technique choice)"
             },
+            "mask": {
+              "description": "2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's\ncoordinates (SVG mask, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself",
+              "x-help-path": "node.mask",
+              "x-source": "SVG 2 / CSS Masking mask (luminance)"
+            },
             "materials": {
               "additionalProperties": {
                 "$ref": "#/$defs/NameOr"
@@ -2105,6 +2697,15 @@
               "x-help": "{imported-name|#index: overrides}; #index = glTF node index",
               "x-help-path": "node.asset.nodes",
               "x-source": "vork (explicit contract/technique choice)"
+            },
+            "opacity": {
+              "default": 1.0,
+              "description": "2D canvas only: the node's whole picture, children included, placed once (CSS opacity).",
+              "format": "float",
+              "type": "number",
+              "x-help": "number; 2D; 0..1; the node's picture, children included, placed once",
+              "x-help-path": "node.opacity",
+              "x-source": "CSS opacity"
             },
             "pass_index": {
               "format": "uint32",
@@ -2159,6 +2760,20 @@
               "x-help": "node-name|[x,y,z]|null; aims -Z, world Y up; rotation is an offset on top; structural, not animatable: aim at a named node and animate its translation",
               "x-help-path": "node.target",
               "x-source": "Blender Track To constraint (vork target shorthand)"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NodeClock"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The clock for node-owned animation and media: local = offset + (parent - start) * speed, wrapped or held in the trimmed section.",
+              "x-help": "{start,offset,duration,speed,loop}|null; node-owned animation/media clock; time-reading programs, conflicting movie clocks and scene-time tracks inside retimed compositions refuse; null inherits parent/active-window clock",
+              "x-help-path": "node.time",
+              "x-source": "vork (node clock)"
             },
             "translation": {
               "default": [
@@ -2233,6 +2848,37 @@
         },
         {
           "properties": {
+            "active": {
+              "$ref": "#/$defs/Active",
+              "description": "When the node exists, in parent seconds. Off: no picture, no sound, no evaluation, children included.",
+              "x-help": "true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step)",
+              "x-help-path": "node.active",
+              "x-source": "vork (node existence; Unity active)"
+            },
+            "animation": {
+              "description": "Layers evaluated on this node's clock; paths start at this node.",
+              "items": {
+                "$ref": "#/$defs/NodeLayer"
+              },
+              "type": "array",
+              "x-help": "layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself",
+              "x-help-path": "node.animation",
+              "x-source": "vork (node-owned animation)"
+            },
+            "audio": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Audio"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Sound source and gain over this node's complete subtree mix.",
+              "x-help": "{file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch",
+              "x-help-path": "node.audio",
+              "x-source": "Web Audio (gain); vork sound"
+            },
             "children": {
               "default": [],
               "items": {
@@ -2242,6 +2888,40 @@
               "x-help": "node[]",
               "x-help-path": "node.children",
               "x-source": "vork (explicit contract/technique choice)"
+            },
+            "clip-path": {
+              "description": "2D canvas only: the named node's shape clips this node, drawn in this node's coordinates (SVG\nclip-path, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself",
+              "x-help-path": "node.clip-path",
+              "x-source": "SVG 2 / CSS Masking clip-path"
+            },
+            "composition": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Composition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`{space: \"2d\"}`: a canvas whose children paint to one picture; `{space: \"3d\"}`, in a canvas: a closed\n3D world rendered to one picture and placed in the canvas (END-STATE-API §7).",
+              "x-help": "composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box",
+              "x-help-path": "node.composition",
+              "x-source": "END-STATE-API §7"
+            },
+            "filter": {
+              "description": "2D canvas only: CSS filter functions over the node's picture, in order.\nLayer blur refuses sigma above 100 target pixels after accumulated transforms.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses",
+              "x-help-path": "node.filter",
+              "x-source": "CSS Filter Effects filter"
             },
             "focus_object": {
               "default": null,
@@ -2279,6 +2959,16 @@
               "x-help-path": "node.light_link_tags",
               "x-source": "vork (explicit contract/technique choice)"
             },
+            "mask": {
+              "description": "2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's\ncoordinates (SVG mask, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself",
+              "x-help-path": "node.mask",
+              "x-source": "SVG 2 / CSS Masking mask (luminance)"
+            },
             "material": {
               "anyOf": [
                 {
@@ -2299,6 +2989,15 @@
               "x-help": "string; globally unique, including imported nodes",
               "x-help-path": "node.name",
               "x-source": "vork (explicit contract/technique choice)"
+            },
+            "opacity": {
+              "default": 1.0,
+              "description": "2D canvas only: the node's whole picture, children included, placed once (CSS opacity).",
+              "format": "float",
+              "type": "number",
+              "x-help": "number; 2D; 0..1; the node's picture, children included, placed once",
+              "x-help-path": "node.opacity",
+              "x-source": "CSS opacity"
             },
             "pass_index": {
               "format": "uint32",
@@ -2353,6 +3052,20 @@
               "x-help": "node-name|[x,y,z]|null; aims -Z, world Y up; rotation is an offset on top; structural, not animatable: aim at a named node and animate its translation",
               "x-help-path": "node.target",
               "x-source": "Blender Track To constraint (vork target shorthand)"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NodeClock"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The clock for node-owned animation and media: local = offset + (parent - start) * speed, wrapped or held in the trimmed section.",
+              "x-help": "{start,offset,duration,speed,loop}|null; node-owned animation/media clock; time-reading programs, conflicting movie clocks and scene-time tracks inside retimed compositions refuse; null inherits parent/active-window clock",
+              "x-help-path": "node.time",
+              "x-source": "vork (node clock)"
             },
             "translation": {
               "default": [
@@ -2426,6 +3139,13 @@
         },
         {
           "properties": {
+            "active": {
+              "$ref": "#/$defs/Active",
+              "description": "When the node exists, in parent seconds. Off: no picture, no sound, no evaluation, children included.",
+              "x-help": "true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step)",
+              "x-help-path": "node.active",
+              "x-source": "vork (node existence; Unity active)"
+            },
             "angle": {
               "default": 0.009180432,
               "format": "float",
@@ -2433,6 +3153,30 @@
               "x-help": "number; sun full angular diameter in radians; 0 = sharp shadows",
               "x-help-path": "light.angle",
               "x-source": "Blender 5.2.1 SunLight.angle (Add Light default)"
+            },
+            "animation": {
+              "description": "Layers evaluated on this node's clock; paths start at this node.",
+              "items": {
+                "$ref": "#/$defs/NodeLayer"
+              },
+              "type": "array",
+              "x-help": "layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself",
+              "x-help-path": "node.animation",
+              "x-source": "vork (node-owned animation)"
+            },
+            "audio": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Audio"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Sound source and gain over this node's complete subtree mix.",
+              "x-help": "{file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch",
+              "x-help-path": "node.audio",
+              "x-source": "Web Audio (gain); vork sound"
             },
             "children": {
               "default": [],
@@ -2443,6 +3187,16 @@
               "x-help": "node[]",
               "x-help-path": "node.children",
               "x-source": "vork (explicit contract/technique choice)"
+            },
+            "clip-path": {
+              "description": "2D canvas only: the named node's shape clips this node, drawn in this node's coordinates (SVG\nclip-path, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself",
+              "x-help-path": "node.clip-path",
+              "x-source": "SVG 2 / CSS Masking clip-path"
             },
             "color": {
               "description": "None: LightShape::default_color (white, or Blender's world colour for an\nenvironment without an image).",
@@ -2460,6 +3214,20 @@
               "x-help-path": "light.color",
               "x-source": "Blender 5.2.1 Light.color (Add Light default)"
             },
+            "composition": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Composition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`{space: \"2d\"}`: a canvas whose children paint to one picture; `{space: \"3d\"}`, in a canvas: a closed\n3D world rendered to one picture and placed in the canvas (END-STATE-API §7).",
+              "x-help": "composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box",
+              "x-help-path": "node.composition",
+              "x-source": "END-STATE-API §7"
+            },
             "energy": {
               "format": "float",
               "type": [
@@ -2469,6 +3237,16 @@
               "x-help": "number|null; sun W/m²; local W; environment multiplier",
               "x-help-path": "light.energy",
               "x-source": "Blender 5.2.1 Light.energy (Add Light default)"
+            },
+            "filter": {
+              "description": "2D canvas only: CSS filter functions over the node's picture, in order.\nLayer blur refuses sigma above 100 target pixels after accumulated transforms.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses",
+              "x-help-path": "node.filter",
+              "x-source": "CSS Filter Effects filter"
             },
             "illuminates": {
               "items": {
@@ -2521,6 +3299,16 @@
               "x-help-path": "node.light_link_tags",
               "x-source": "vork (explicit contract/technique choice)"
             },
+            "mask": {
+              "description": "2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's\ncoordinates (SVG mask, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself",
+              "x-help-path": "node.mask",
+              "x-source": "SVG 2 / CSS Masking mask (luminance)"
+            },
             "material": {
               "anyOf": [
                 {
@@ -2555,6 +3343,15 @@
               "x-help": "string; globally unique, including imported nodes",
               "x-help-path": "node.name",
               "x-source": "vork (explicit contract/technique choice)"
+            },
+            "opacity": {
+              "default": 1.0,
+              "description": "2D canvas only: the node's whole picture, children included, placed once (CSS opacity).",
+              "format": "float",
+              "type": "number",
+              "x-help": "number; 2D; 0..1; the node's picture, children included, placed once",
+              "x-help-path": "node.opacity",
+              "x-source": "CSS opacity"
             },
             "pass_index": {
               "format": "uint32",
@@ -2681,6 +3478,20 @@
               "x-help-path": "light.temperature",
               "x-source": "Blender 5.2.1 Light.temperature with use_temperature"
             },
+            "time": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NodeClock"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The clock for node-owned animation and media: local = offset + (parent - start) * speed, wrapped or held in the trimmed section.",
+              "x-help": "{start,offset,duration,speed,loop}|null; node-owned animation/media clock; time-reading programs, conflicting movie clocks and scene-time tracks inside retimed compositions refuse; null inherits parent/active-window clock",
+              "x-help-path": "node.time",
+              "x-source": "vork (node clock)"
+            },
             "translation": {
               "default": [
                 0.0,
@@ -2751,32 +3562,1096 @@
           ],
           "title": "LightNode",
           "type": "object"
+        },
+        {
+          "description": "2D canvas only (END-STATE-API §7, text): CSS's names for the properties of text; the origin\nis the top-left of the text box; the glyph outlines take SVG's fill, stroke and stroke-width.",
+          "properties": {
+            "active": {
+              "$ref": "#/$defs/Active",
+              "description": "When the node exists, in parent seconds. Off: no picture, no sound, no evaluation, children included.",
+              "x-help": "true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step)",
+              "x-help-path": "node.active",
+              "x-source": "vork (node existence; Unity active)"
+            },
+            "animation": {
+              "description": "Layers evaluated on this node's clock; paths start at this node.",
+              "items": {
+                "$ref": "#/$defs/NodeLayer"
+              },
+              "type": "array",
+              "x-help": "layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself",
+              "x-help-path": "node.animation",
+              "x-source": "vork (node-owned animation)"
+            },
+            "audio": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Audio"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Sound source and gain over this node's complete subtree mix.",
+              "x-help": "{file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch",
+              "x-help-path": "node.audio",
+              "x-source": "Web Audio (gain); vork sound"
+            },
+            "children": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/Node"
+              },
+              "type": "array",
+              "x-help": "node[]",
+              "x-help-path": "node.children",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "clip-path": {
+              "description": "2D canvas only: the named node's shape clips this node, drawn in this node's coordinates (SVG\nclip-path, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself",
+              "x-help-path": "node.clip-path",
+              "x-source": "SVG 2 / CSS Masking clip-path"
+            },
+            "composition": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Composition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`{space: \"2d\"}`: a canvas whose children paint to one picture; `{space: \"3d\"}`, in a canvas: a closed\n3D world rendered to one picture and placed in the canvas (END-STATE-API §7).",
+              "x-help": "composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box",
+              "x-help-path": "node.composition",
+              "x-source": "END-STATE-API §7"
+            },
+            "content": {
+              "$ref": "#/$defs/Content",
+              "x-help": "string|run[]; position by the text box's top-left; switch content with STEP keys; runs set font and paint; white-space controls newlines",
+              "x-help-path": "node.content (text)",
+              "x-source": "END-STATE-API §7 (content)"
+            },
+            "direction": {
+              "$ref": "#/$defs/Direction",
+              "default": "ltr",
+              "x-help": "ltr|rtl",
+              "x-help-path": "node.direction (text)",
+              "x-source": "CSS direction"
+            },
+            "fill": {
+              "$ref": "#/$defs/Paint",
+              "default": "#000",
+              "x-help": "\"none\"|CSS colour|CSS gradient|{image, fit}",
+              "x-help-path": "node.fill (text)",
+              "x-source": "SVG 2 fill; CSS Color 4"
+            },
+            "filter": {
+              "description": "2D canvas only: CSS filter functions over the node's picture, in order.\nLayer blur refuses sigma above 100 target pixels after accumulated transforms.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses",
+              "x-help-path": "node.filter",
+              "x-source": "CSS Filter Effects filter"
+            },
+            "font": {
+              "$ref": "#/$defs/FontFiles",
+              "x-help": "file-path|file-path[]; .ttf/.otf; a list offers faces font-weight and font-style choose from",
+              "x-help-path": "node.font (text)",
+              "x-source": "END-STATE-API §7 (a font file or a list of files)"
+            },
+            "font-feature-settings": {
+              "default": "normal",
+              "type": "string",
+              "x-help": "string",
+              "x-help-path": "node.font-feature-settings (text)",
+              "x-source": "CSS font-feature-settings"
+            },
+            "font-size": {
+              "default": 16.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; px",
+              "x-help-path": "node.font-size (text)",
+              "x-source": "CSS font-size"
+            },
+            "font-style": {
+              "$ref": "#/$defs/FontStyle",
+              "default": "normal",
+              "x-help": "normal|italic|oblique",
+              "x-help-path": "node.font-style (text)",
+              "x-source": "CSS font-style"
+            },
+            "font-variation-settings": {
+              "default": "normal",
+              "type": "string",
+              "x-help": "string",
+              "x-help-path": "node.font-variation-settings (text)",
+              "x-source": "CSS font-variation-settings"
+            },
+            "font-weight": {
+              "$ref": "#/$defs/FontWeight",
+              "default": "normal",
+              "x-help": "number|normal|bold",
+              "x-help-path": "node.font-weight (text)",
+              "x-source": "CSS font-weight"
+            },
+            "is_holdout": {
+              "default": false,
+              "description": "Cycles holdout: transparent black on transparent film; opaque black otherwise.",
+              "type": "boolean",
+              "x-help": "bool; RGB 0; alpha 0 on transparent background, 1 on opaque background",
+              "x-help-path": "node.is_holdout",
+              "x-source": "Blender Cycles Object.is_holdout"
+            },
+            "is_shadow_catcher": {
+              "default": false,
+              "description": "Cycles shadow catcher. Combined treats this surface as a holdout.",
+              "type": "boolean",
+              "x-help": "bool; shadow_catcher channel is material light with CG / without CG, unclamped; zero baseline gives neutral 1; CG light on an otherwise unlit catcher cannot be represented",
+              "x-help-path": "node.is_shadow_catcher",
+              "x-source": "Blender Cycles Object.is_shadow_catcher"
+            },
+            "letter-spacing": {
+              "default": 0.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; px",
+              "x-help-path": "node.letter-spacing (text)",
+              "x-source": "CSS letter-spacing"
+            },
+            "light_link_tags": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "x-help": "string[]; matched by light illuminates/shadowed_by; inherited",
+              "x-help-path": "node.light_link_tags",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "line-break": {
+              "$ref": "#/$defs/LineBreak",
+              "default": "auto",
+              "x-help": "auto; the others are not built",
+              "x-help-path": "node.line-break (text)",
+              "x-source": "CSS line-break"
+            },
+            "line-height": {
+              "$ref": "#/$defs/LineHeight",
+              "default": "normal",
+              "x-help": "normal|number; a multiple of the font size",
+              "x-help-path": "node.line-height (text)",
+              "x-source": "CSS line-height"
+            },
+            "mask": {
+              "description": "2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's\ncoordinates (SVG mask, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself",
+              "x-help-path": "node.mask",
+              "x-source": "SVG 2 / CSS Masking mask (luminance)"
+            },
+            "name": {
+              "default": "",
+              "type": "string",
+              "x-help": "string; globally unique, including imported nodes",
+              "x-help-path": "node.name",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "opacity": {
+              "default": 1.0,
+              "description": "2D canvas only: the node's whole picture, children included, placed once (CSS opacity).",
+              "format": "float",
+              "type": "number",
+              "x-help": "number; 2D; 0..1; the node's picture, children included, placed once",
+              "x-help-path": "node.opacity",
+              "x-source": "CSS opacity"
+            },
+            "pass_index": {
+              "format": "uint32",
+              "maximum": 65535,
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "x-help": "u32|null; 1..65535; object ID",
+              "x-help-path": "node.pass_index",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "rotation": {
+              "$ref": "#/$defs/Rotation",
+              "default": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ],
+              "x-help": "[x,y,z,w] quaternion | {euler:[x,y,z]} (Blender XYZ)",
+              "x-help-path": "node.rotation",
+              "x-source": "glTF 2.0 (quaternion); Blender XYZ Euler"
+            },
+            "scale": {
+              "default": [
+                1.0,
+                1.0,
+                1.0
+              ],
+              "items": {
+                "format": "float",
+                "type": "number"
+              },
+              "maxItems": 3,
+              "minItems": 3,
+              "type": "array",
+              "x-help": "[x,y,z]; any zero world-scale component hides geometry, including children",
+              "x-help-path": "node.scale",
+              "x-source": "glTF 2.0"
+            },
+            "stroke": {
+              "$ref": "#/$defs/Paint",
+              "default": "none",
+              "x-help": "\"none\"|CSS colour|CSS gradient|{image, fit}; the glyph outlines",
+              "x-help-path": "node.stroke (text)",
+              "x-source": "SVG 2 stroke; CSS Color 4"
+            },
+            "stroke-width": {
+              "default": 1.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; px",
+              "x-help-path": "node.stroke-width (text)",
+              "x-source": "SVG 2 stroke-width"
+            },
+            "target": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AimTarget"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "x-help": "node-name|[x,y,z]|null; aims -Z, world Y up; rotation is an offset on top; structural, not animatable: aim at a named node and animate its translation",
+              "x-help-path": "node.target",
+              "x-source": "Blender Track To constraint (vork target shorthand)"
+            },
+            "text-align": {
+              "$ref": "#/$defs/TextAlign",
+              "default": "start",
+              "x-help": "start|end|left|right|center|justify",
+              "x-help-path": "node.text-align (text)",
+              "x-source": "CSS text-align"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NodeClock"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The clock for node-owned animation and media: local = offset + (parent - start) * speed, wrapped or held in the trimmed section.",
+              "x-help": "{start,offset,duration,speed,loop}|null; node-owned animation/media clock; time-reading programs, conflicting movie clocks and scene-time tracks inside retimed compositions refuse; null inherits parent/active-window clock",
+              "x-help-path": "node.time",
+              "x-source": "vork (node clock)"
+            },
+            "translation": {
+              "default": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "items": {
+                "format": "float",
+                "type": "number"
+              },
+              "maxItems": 3,
+              "minItems": 3,
+              "type": "array",
+              "x-help": "[x,y,z]; parent frame",
+              "x-help-path": "node.translation",
+              "x-source": "glTF 2.0"
+            },
+            "type": {
+              "const": "text",
+              "type": "string"
+            },
+            "visible": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool; false hides the subtree and disables its lights; animatable (step)",
+              "x-help-path": "node.visible",
+              "x-source": "vork visibility primitive"
+            },
+            "visible_camera": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool",
+              "x-help-path": "node.visible_camera",
+              "x-source": "Blender Object.visible_camera"
+            },
+            "visible_diffuse": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool",
+              "x-help-path": "node.visible_diffuse",
+              "x-source": "Blender Object.visible_diffuse"
+            },
+            "visible_glossy": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool",
+              "x-help-path": "node.visible_glossy",
+              "x-source": "Blender Object.visible_glossy"
+            },
+            "visible_shadow": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool; lights must stay true (a light without shadows: shadowed_by [])",
+              "x-help-path": "node.visible_shadow",
+              "x-source": "Blender Object.visible_shadow"
+            },
+            "visible_transmission": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool; object visibility to transmission rays; lights must stay true",
+              "x-help-path": "node.visible_transmission",
+              "x-source": "Blender Object.visible_transmission"
+            },
+            "white-space": {
+              "$ref": "#/$defs/WhiteSpace",
+              "default": "normal",
+              "x-help": "normal|nowrap|pre-line; pre, pre-wrap and break-spaces are not built",
+              "x-help-path": "node.white-space (text)",
+              "x-source": "CSS white-space"
+            },
+            "width": {
+              "format": "float",
+              "type": [
+                "number",
+                "null"
+              ],
+              "x-help": "number|null; px; lines wrap and align in it; null = no wrapping",
+              "x-help-path": "node.width (text)",
+              "x-source": "END-STATE-API §7 (width to wrap)"
+            },
+            "word-break": {
+              "$ref": "#/$defs/WordBreak",
+              "default": "normal",
+              "x-help": "normal; the others are not built",
+              "x-help-path": "node.word-break (text)",
+              "x-source": "CSS word-break"
+            },
+            "word-spacing": {
+              "default": 0.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; px; only 0 is built",
+              "x-help-path": "node.word-spacing (text)",
+              "x-source": "CSS word-spacing"
+            }
+          },
+          "required": [
+            "type",
+            "content",
+            "font"
+          ],
+          "title": "TextNode",
+          "type": "object"
+        },
+        {
+          "description": "2D canvas only (END-STATE-API §7, path): SVG 2's path data and paint properties, with SVG's\nnames and meanings; colours are CSS colours.",
+          "properties": {
+            "active": {
+              "$ref": "#/$defs/Active",
+              "description": "When the node exists, in parent seconds. Off: no picture, no sound, no evaluation, children included.",
+              "x-help": "true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step)",
+              "x-help-path": "node.active",
+              "x-source": "vork (node existence; Unity active)"
+            },
+            "animation": {
+              "description": "Layers evaluated on this node's clock; paths start at this node.",
+              "items": {
+                "$ref": "#/$defs/NodeLayer"
+              },
+              "type": "array",
+              "x-help": "layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself",
+              "x-help-path": "node.animation",
+              "x-source": "vork (node-owned animation)"
+            },
+            "audio": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Audio"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "Sound source and gain over this node's complete subtree mix.",
+              "x-help": "{file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch",
+              "x-help-path": "node.audio",
+              "x-source": "Web Audio (gain); vork sound"
+            },
+            "children": {
+              "default": [],
+              "items": {
+                "$ref": "#/$defs/Node"
+              },
+              "type": "array",
+              "x-help": "node[]",
+              "x-help-path": "node.children",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "clip-path": {
+              "description": "2D canvas only: the named node's shape clips this node, drawn in this node's coordinates (SVG\nclip-path, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself",
+              "x-help-path": "node.clip-path",
+              "x-source": "SVG 2 / CSS Masking clip-path"
+            },
+            "composition": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Composition"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "`{space: \"2d\"}`: a canvas whose children paint to one picture; `{space: \"3d\"}`, in a canvas: a closed\n3D world rendered to one picture and placed in the canvas (END-STATE-API §7).",
+              "x-help": "composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box",
+              "x-help-path": "node.composition",
+              "x-source": "END-STATE-API §7"
+            },
+            "d": {
+              "default": "none",
+              "type": "string",
+              "x-help": "string; SVG path data, px; \"none\" or empty paints nothing",
+              "x-help-path": "node.d (path)",
+              "x-source": "SVG 2 path d"
+            },
+            "fill": {
+              "$ref": "#/$defs/Paint",
+              "default": "#000",
+              "x-help": "paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}",
+              "x-help-path": "node.fill (path)",
+              "x-source": "SVG 2 fill; CSS colour and gradient"
+            },
+            "fill-opacity": {
+              "default": 1.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; 0..1",
+              "x-help-path": "node.fill-opacity (path)",
+              "x-source": "SVG 2 fill-opacity"
+            },
+            "fill-rule": {
+              "$ref": "#/$defs/FillRule",
+              "default": "nonzero",
+              "x-help": "nonzero|evenodd",
+              "x-help-path": "node.fill-rule (path)",
+              "x-source": "SVG 2 fill-rule"
+            },
+            "filter": {
+              "description": "2D canvas only: CSS filter functions over the node's picture, in order.\nLayer blur refuses sigma above 100 target pixels after accumulated transforms.",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses",
+              "x-help-path": "node.filter",
+              "x-source": "CSS Filter Effects filter"
+            },
+            "is_holdout": {
+              "default": false,
+              "description": "Cycles holdout: transparent black on transparent film; opaque black otherwise.",
+              "type": "boolean",
+              "x-help": "bool; RGB 0; alpha 0 on transparent background, 1 on opaque background",
+              "x-help-path": "node.is_holdout",
+              "x-source": "Blender Cycles Object.is_holdout"
+            },
+            "is_shadow_catcher": {
+              "default": false,
+              "description": "Cycles shadow catcher. Combined treats this surface as a holdout.",
+              "type": "boolean",
+              "x-help": "bool; shadow_catcher channel is material light with CG / without CG, unclamped; zero baseline gives neutral 1; CG light on an otherwise unlit catcher cannot be represented",
+              "x-help-path": "node.is_shadow_catcher",
+              "x-source": "Blender Cycles Object.is_shadow_catcher"
+            },
+            "light_link_tags": {
+              "default": [],
+              "items": {
+                "type": "string"
+              },
+              "type": "array",
+              "x-help": "string[]; matched by light illuminates/shadowed_by; inherited",
+              "x-help-path": "node.light_link_tags",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "mask": {
+              "description": "2D canvas only: the named node's picture masks this node by its luminance, drawn in this node's\ncoordinates (SVG mask, userSpaceOnUse).",
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself",
+              "x-help-path": "node.mask",
+              "x-source": "SVG 2 / CSS Masking mask (luminance)"
+            },
+            "name": {
+              "default": "",
+              "type": "string",
+              "x-help": "string; globally unique, including imported nodes",
+              "x-help-path": "node.name",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "opacity": {
+              "default": 1.0,
+              "description": "2D canvas only: the node's whole picture, children included, placed once (CSS opacity).",
+              "format": "float",
+              "type": "number",
+              "x-help": "number; 2D; 0..1; the node's picture, children included, placed once",
+              "x-help-path": "node.opacity",
+              "x-source": "CSS opacity"
+            },
+            "paint-order": {
+              "default": "normal",
+              "type": "string",
+              "x-help": "string; normal, or the layers to paint first out of fill, stroke, markers (\"stroke\" puts the stroke under the fill)",
+              "x-help-path": "node.paint-order (path)",
+              "x-source": "SVG 2 paint-order"
+            },
+            "pass_index": {
+              "format": "uint32",
+              "maximum": 65535,
+              "minimum": 1,
+              "type": [
+                "integer",
+                "null"
+              ],
+              "x-help": "u32|null; 1..65535; object ID",
+              "x-help-path": "node.pass_index",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "pathLength": {
+              "format": "float",
+              "type": [
+                "number",
+                "null"
+              ],
+              "x-help": "number|null; the author's total length of d; dash lengths and offset scale by computed/pathLength",
+              "x-help-path": "node.pathLength (path)",
+              "x-source": "SVG 2 pathLength"
+            },
+            "rotation": {
+              "$ref": "#/$defs/Rotation",
+              "default": [
+                0.0,
+                0.0,
+                0.0,
+                1.0
+              ],
+              "x-help": "[x,y,z,w] quaternion | {euler:[x,y,z]} (Blender XYZ)",
+              "x-help-path": "node.rotation",
+              "x-source": "glTF 2.0 (quaternion); Blender XYZ Euler"
+            },
+            "scale": {
+              "default": [
+                1.0,
+                1.0,
+                1.0
+              ],
+              "items": {
+                "format": "float",
+                "type": "number"
+              },
+              "maxItems": 3,
+              "minItems": 3,
+              "type": "array",
+              "x-help": "[x,y,z]; any zero world-scale component hides geometry, including children",
+              "x-help-path": "node.scale",
+              "x-source": "glTF 2.0"
+            },
+            "stroke": {
+              "$ref": "#/$defs/Paint",
+              "default": "none",
+              "x-help": "paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}",
+              "x-help-path": "node.stroke (path)",
+              "x-source": "SVG 2 stroke; CSS colour and gradient"
+            },
+            "stroke-dasharray": {
+              "$ref": "#/$defs/DashArray",
+              "default": "none",
+              "x-help": "\"none\"|number[]; px; an odd count repeats; scaled by pathLength",
+              "x-help-path": "node.stroke-dasharray (path)",
+              "x-source": "SVG 2 stroke-dasharray"
+            },
+            "stroke-dashoffset": {
+              "default": 0.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; px",
+              "x-help-path": "node.stroke-dashoffset (path)",
+              "x-source": "SVG 2 stroke-dashoffset"
+            },
+            "stroke-linecap": {
+              "$ref": "#/$defs/LineCap",
+              "default": "butt",
+              "x-help": "butt|round|square",
+              "x-help-path": "node.stroke-linecap (path)",
+              "x-source": "SVG 2 stroke-linecap"
+            },
+            "stroke-linejoin": {
+              "$ref": "#/$defs/LineJoin",
+              "default": "miter",
+              "x-help": "miter|round|bevel",
+              "x-help-path": "node.stroke-linejoin (path)",
+              "x-source": "SVG 2 stroke-linejoin"
+            },
+            "stroke-miterlimit": {
+              "default": 4.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; at least 1",
+              "x-help-path": "node.stroke-miterlimit (path)",
+              "x-source": "SVG 2 stroke-miterlimit"
+            },
+            "stroke-opacity": {
+              "default": 1.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; 0..1",
+              "x-help-path": "node.stroke-opacity (path)",
+              "x-source": "SVG 2 stroke-opacity"
+            },
+            "stroke-width": {
+              "default": 1.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; px; 0 paints nothing",
+              "x-help-path": "node.stroke-width (path)",
+              "x-source": "SVG 2 stroke-width"
+            },
+            "target": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/AimTarget"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "x-help": "node-name|[x,y,z]|null; aims -Z, world Y up; rotation is an offset on top; structural, not animatable: aim at a named node and animate its translation",
+              "x-help-path": "node.target",
+              "x-source": "Blender Track To constraint (vork target shorthand)"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/NodeClock"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "description": "The clock for node-owned animation and media: local = offset + (parent - start) * speed, wrapped or held in the trimmed section.",
+              "x-help": "{start,offset,duration,speed,loop}|null; node-owned animation/media clock; time-reading programs, conflicting movie clocks and scene-time tracks inside retimed compositions refuse; null inherits parent/active-window clock",
+              "x-help-path": "node.time",
+              "x-source": "vork (node clock)"
+            },
+            "translation": {
+              "default": [
+                0.0,
+                0.0,
+                0.0
+              ],
+              "items": {
+                "format": "float",
+                "type": "number"
+              },
+              "maxItems": 3,
+              "minItems": 3,
+              "type": "array",
+              "x-help": "[x,y,z]; parent frame",
+              "x-help-path": "node.translation",
+              "x-source": "glTF 2.0"
+            },
+            "type": {
+              "const": "path",
+              "type": "string"
+            },
+            "visible": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool; false hides the subtree and disables its lights; animatable (step)",
+              "x-help-path": "node.visible",
+              "x-source": "vork visibility primitive"
+            },
+            "visible_camera": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool",
+              "x-help-path": "node.visible_camera",
+              "x-source": "Blender Object.visible_camera"
+            },
+            "visible_diffuse": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool",
+              "x-help-path": "node.visible_diffuse",
+              "x-source": "Blender Object.visible_diffuse"
+            },
+            "visible_glossy": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool",
+              "x-help-path": "node.visible_glossy",
+              "x-source": "Blender Object.visible_glossy"
+            },
+            "visible_shadow": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool; lights must stay true (a light without shadows: shadowed_by [])",
+              "x-help-path": "node.visible_shadow",
+              "x-source": "Blender Object.visible_shadow"
+            },
+            "visible_transmission": {
+              "default": true,
+              "type": "boolean",
+              "x-help": "bool; object visibility to transmission rays; lights must stay true",
+              "x-help-path": "node.visible_transmission",
+              "x-source": "Blender Object.visible_transmission"
+            }
+          },
+          "required": [
+            "type"
+          ],
+          "title": "PathNode",
+          "type": "object"
         }
       ],
       "unevaluatedProperties": false,
-      "x-help-extra": "node.type: node|mesh|asset|camera|light; default \"node\"\nasset (glTF cameras): addressed as <asset>/<node-name|#index>",
+      "x-help-extra": "node.type: node|mesh|asset|camera|light|text|path; default \"node\"\nasset (glTF cameras): addressed as <asset>/<node-name|#index>",
       "x-help-path": "node"
     },
-    "NodeBinding": {
+    "NodeClock": {
       "additionalProperties": false,
-      "description": "An earlier named compositor entry, local to this graph.",
+      "description": "The node clock: where in the content to begin, how much to use, how fast,\nwhether to repeat, and when on the parent's clock it starts.",
       "properties": {
-        "node": {
-          "type": "string",
-          "x-help": "earlier compositor entry name; clamped bilinear image sampling",
-          "x-help-path": "material.node.node",
-          "x-source": "vork"
+        "duration": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Clock"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Content seconds used; omitted: the rest of the one source after `offset`.",
+          "x-help": "number|rational string|null; content seconds used from offset; > 0; null = the rest of the one source; only active ends the node",
+          "x-help-path": "node.time.duration",
+          "x-source": "vork (node clock)"
+        },
+        "loop": {
+          "default": false,
+          "type": "boolean",
+          "x-help": "bool; wraps inside [offset, offset+duration); needs an end",
+          "x-help-path": "node.time.loop",
+          "x-source": "vork (node clock)"
+        },
+        "offset": {
+          "$ref": "#/$defs/Clock",
+          "default": 0,
+          "x-help": "number|rational string; content seconds where the clip begins; >= 0",
+          "x-help-path": "node.time.offset",
+          "x-source": "vork (node clock)"
+        },
+        "pitch": {
+          "$ref": "#/$defs/Pitch",
+          "default": "follow",
+          "x-help": "follow|keep; keep holds sound pitch when speed changes; keep is not built yet",
+          "x-help-path": "node.time.pitch",
+          "x-source": "vork (node clock)"
+        },
+        "speed": {
+          "$ref": "#/$defs/Clock",
+          "default": 1,
+          "x-help": "number|rational string; keyable >= 0 and integrated; a constant < 0 plays the trimmed section backwards from its end",
+          "x-help-path": "node.time.speed",
+          "x-source": "vork (node clock)"
+        },
+        "start": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Clock"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "description": "Parent seconds at which local time is `offset`; omitted: the window's start, else 0.",
+          "x-help": "number|rational string|null; parent seconds where local = offset; null = active window start, else 0; shifts loop phase",
+          "x-help-path": "node.time.start",
+          "x-source": "vork (node clock)"
         }
       },
-      "required": [
-        "node"
-      ],
       "type": "object"
+    },
+    "NodeLayer": {
+      "description": "An animation layer owned by a node: tracks on this node's clock, paths starting at the node.\nLike a scene layer it keeps its own clock: source time = offset + node time * speed.",
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "blend": {
+              "$ref": "#/$defs/Blend",
+              "default": "replace",
+              "x-help": "replace|combine",
+              "x-help-path": "node.animation.layer.blend",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "clip": {
+              "type": "null"
+            },
+            "loop": {
+              "default": false,
+              "type": "boolean",
+              "x-help": "bool",
+              "x-help-path": "node.animation.layer.loop",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "string|null",
+              "x-help-path": "node.animation.layer.name",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "offset": {
+              "default": 0.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; source time = offset + node time*speed",
+              "x-help-path": "node.animation.layer.offset",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "speed": {
+              "default": 1.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number",
+              "x-help-path": "node.animation.layer.speed",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "tracks": {
+              "items": {
+                "$ref": "#/$defs/Track"
+              },
+              "type": [
+                "array"
+              ],
+              "x-help": "track[]|null; XOR clip; paths start at this node: [\"translation\"], [\"children\",name,...]; keys in this node's seconds",
+              "x-help-path": "node.animation.layer.tracks",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "weight": {
+              "default": 1.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number",
+              "x-help-path": "node.animation.layer.weight",
+              "x-source": "vork (explicit contract/technique choice)"
+            }
+          },
+          "required": [
+            "tracks"
+          ],
+          "title": "NodeTrackLayer",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "blend": {
+              "$ref": "#/$defs/Blend",
+              "default": "replace",
+              "x-help": "replace|combine",
+              "x-help-path": "node.animation.layer.blend",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "clip": {
+              "anyOf": [
+                {
+                  "$ref": "#/$defs/Clip"
+                }
+              ],
+              "x-help": "clip|null; XOR tracks; target = this node or a descendant asset",
+              "x-help-path": "node.animation.layer.clip",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "loop": {
+              "default": false,
+              "type": "boolean",
+              "x-help": "bool",
+              "x-help-path": "node.animation.layer.loop",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "name": {
+              "type": [
+                "string",
+                "null"
+              ],
+              "x-help": "string|null",
+              "x-help-path": "node.animation.layer.name",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "offset": {
+              "default": 0.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number; source time = offset + node time*speed",
+              "x-help-path": "node.animation.layer.offset",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "speed": {
+              "default": 1.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number",
+              "x-help-path": "node.animation.layer.speed",
+              "x-source": "vork (explicit contract/technique choice)"
+            },
+            "tracks": {
+              "type": "null"
+            },
+            "weight": {
+              "default": 1.0,
+              "format": "float",
+              "type": "number",
+              "x-help": "number",
+              "x-help-path": "node.animation.layer.weight",
+              "x-source": "vork (explicit contract/technique choice)"
+            }
+          },
+          "required": [
+            "clip"
+          ],
+          "title": "NodeClipLayer",
+          "type": "object"
+        }
+      ]
     },
     "Opacity": {
       "enum": [
         "coverage",
         "transmittance"
+      ],
+      "type": "string"
+    },
+    "OutputDestination": {
+      "additionalProperties": false,
+      "description": "A render-call destination. Raw destinations bypass the view and have no default display.",
+      "properties": {
+        "color_space": {
+          "$ref": "#/$defs/WorkingColorSpace",
+          "x-help": "EXR storage space; omitted: the composition's working space; a world takes the linear spaces, a canvas any; excludes display and luminance fields",
+          "x-help-path": "output.color_space",
+          "x-source": "vork colour contract (docs/design/colour.md)"
+        },
+        "display": {
+          "$ref": "#/$defs/OutputDisplay",
+          "x-help": "sRGB|Display P3|Rec.2100-PQ|Rec.2100-HLG; omitted: sRGB for viewed outputs; raw outputs bypass the view",
+          "x-help-path": "output.display",
+          "x-source": "vork output target"
+        },
+        "file": {
+          "type": "string",
+          "x-help": "path; format follows extension",
+          "x-help-path": "output.file",
+          "x-source": "vork render-call destination"
+        },
+        "peak_luminance": {
+          "format": "float",
+          "type": "number",
+          "x-help": "positive cd/m²; omitted: SDR 100, HDR 1000",
+          "x-help-path": "output.peak_luminance",
+          "x-source": "vork colour contract (docs/design/colour.md)"
+        },
+        "reference_white": {
+          "format": "float",
+          "type": "number",
+          "x-help": "positive cd/m², at most peak_luminance; omitted: SDR 100, HDR 203",
+          "x-help-path": "output.reference_white",
+          "x-source": "vork colour contract (docs/design/colour.md)"
+        }
+      },
+      "required": [
+        "file"
+      ],
+      "title": "OutputDestination",
+      "type": "object"
+    },
+    "OutputDisplay": {
+      "description": "Display encoding owned by a destination, resolved together with composition.view.",
+      "enum": [
+        "sRGB",
+        "Display P3",
+        "Rec.2100-PQ",
+        "Rec.2100-HLG"
+      ],
+      "type": "string"
+    },
+    "Paint": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/NoPaint"
+        },
+        {
+          "description": "A CSS colour (`\"#fff\"`, `\"rgb(255 0 0)\"`, `\"white\"`) or a CSS `linear-gradient()`,\n`radial-gradient()` or `conic-gradient()` over the shape's bounding box.",
+          "type": "string"
+        },
+        {
+          "$ref": "#/$defs/ImagePaint"
+        }
+      ],
+      "description": "`fill` and `stroke` (§7): `\"none\"`, a CSS colour, a CSS gradient function, or an image."
+    },
+    "PathSegment": {
+      "anyOf": [
+        {
+          "type": "string"
+        },
+        {
+          "format": "uint32",
+          "minimum": 0,
+          "type": "integer"
+        }
+      ],
+      "description": "A track path segment: a name, or a zero-based index (`[\"nodes\", \"title\", \"glyphs\", 3, \"opacity\"]`)."
+    },
+    "Pitch": {
+      "description": "How sound follows this node's clock speed.",
+      "enum": [
+        "follow",
+        "keep"
       ],
       "type": "string"
     },
@@ -3004,7 +4879,7 @@
         "background": {
           "$ref": "#/$defs/Background",
           "default": "environment",
-          "x-help": "environment|transparent|RGB; RGB and transparent apply to camera escapes and opacity passthrough; path glass transmission sees the World",
+          "x-help": "environment|transparent|RGB|CSS colour; RGB and transparent apply to camera escapes and opacity passthrough; path glass transmission sees the World; a 2D canvas takes transparent or a CSS colour",
           "x-help-path": "render.background",
           "x-source": "vork (Blender RenderSettings.film_transparent plus a constant RGB)"
         },
@@ -3017,29 +4892,6 @@
           "x-help": "camera-node-name|null; null = the only authored camera, else first imported; a camera cut track may select",
           "x-help-path": "render.camera",
           "x-source": "vork (explicit contract/technique choice)"
-        },
-        "compositor": {
-          "default": [],
-          "items": {
-            "$ref": "#/$defs/CompositeEntry"
-          },
-          "type": "array",
-          "x-help": "(material-name|{material,name?,resolution?})[]; ordered image graph, last output; material may be inline",
-          "x-help-path": "render.compositor",
-          "x-source": "vork"
-        },
-        "display": {
-          "$ref": "#/$defs/NameOr",
-          "default": {
-            "double_sided": true,
-            "inputs": {},
-            "opacity": null,
-            "priority": 0,
-            "program": "std/agx"
-          },
-          "x-help": "material-name|inline material; display program; EXR stays scene-linear",
-          "x-help-path": "render.display",
-          "x-source": "Blender 5.2.1 AgX; display program: vork"
         },
         "duration": {
           "$ref": "#/$defs/Clock",
@@ -3131,6 +4983,125 @@
         }
       ],
       "description": "An authored rotation: a glTF quaternion or a tagged Euler triple."
+    },
+    "Run": {
+      "additionalProperties": false,
+      "description": "One styled run of `content`: its text and the CSS and SVG properties it sets; where it sets none, the\nnode's apply.",
+      "properties": {
+        "content": {
+          "type": "string",
+          "x-help": "string",
+          "x-help-path": "run.content",
+          "x-source": "END-STATE-API §7 (content is a string or styled runs)"
+        },
+        "fill": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Paint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-help": "\"none\"|CSS colour|CSS gradient|{image, fit}; default the node's",
+          "x-help-path": "run.fill",
+          "x-source": "SVG 2 fill; CSS Color 4"
+        },
+        "font": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FontFiles"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-help": "file-path|file-path[]; default the node's",
+          "x-help-path": "run.font",
+          "x-source": "END-STATE-API §7 (a font file or a list of files)"
+        },
+        "font-feature-settings": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-help": "string; default the node's",
+          "x-help-path": "run.font-feature-settings",
+          "x-source": "CSS font-feature-settings"
+        },
+        "font-size": {
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-help": "number; px; default the node's",
+          "x-help-path": "run.font-size",
+          "x-source": "CSS font-size"
+        },
+        "font-style": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FontStyle"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-help": "normal|italic|oblique; default the node's",
+          "x-help-path": "run.font-style",
+          "x-source": "CSS font-style"
+        },
+        "font-variation-settings": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "x-help": "string; default the node's",
+          "x-help-path": "run.font-variation-settings",
+          "x-source": "CSS font-variation-settings"
+        },
+        "font-weight": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/FontWeight"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-help": "number|normal|bold; default the node's",
+          "x-help-path": "run.font-weight",
+          "x-source": "CSS font-weight"
+        },
+        "letter-spacing": {
+          "format": "float",
+          "type": [
+            "number",
+            "null"
+          ],
+          "x-help": "number; px; default the node's",
+          "x-help-path": "run.letter-spacing",
+          "x-source": "CSS letter-spacing"
+        },
+        "stroke": {
+          "anyOf": [
+            {
+              "$ref": "#/$defs/Paint"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "x-help": "\"none\"|CSS colour|CSS gradient|{image, fit}; default the node's",
+          "x-help-path": "run.stroke",
+          "x-source": "SVG 2 stroke; CSS Color 4"
+        }
+      },
+      "required": [
+        "content"
+      ],
+      "type": "object"
     },
     "Settings": {
       "additionalProperties": false,
@@ -3260,6 +5231,30 @@
       ],
       "type": "object"
     },
+    "Space": {
+      "description": "`2d`: a canvas. `3d`: a closed world (on a node in a canvas).",
+      "enum": [
+        "2d",
+        "3d"
+      ],
+      "type": "string"
+    },
+    "StepBinding": {
+      "additionalProperties": false,
+      "description": "An earlier named compositor entry, local to this graph.",
+      "properties": {
+        "step": {
+          "type": "string",
+          "x-help": "earlier compositor entry name; clamped bilinear image sampling",
+          "x-help-path": "material.step.step",
+          "x-source": "vork"
+        }
+      },
+      "required": [
+        "step"
+      ],
+      "type": "object"
+    },
     "SubdivisionSurface": {
       "additionalProperties": false,
       "properties": {
@@ -3293,6 +5288,18 @@
       "enum": [
         "catmull_clark",
         "simple"
+      ],
+      "type": "string"
+    },
+    "TextAlign": {
+      "description": "CSS `text-align`.",
+      "enum": [
+        "start",
+        "end",
+        "left",
+        "right",
+        "center",
+        "justify"
       ],
       "type": "string"
     },
@@ -3357,7 +5364,7 @@
             }
           ],
           "default": null,
-          "x-help": "STEP|LINEAR|CUBICSPLINE; omitted: STEP for strings/bools, else LINEAR",
+          "x-help": "STEP|LINEAR|CUBICSPLINE; omitted: LINEAR for numeric and CSS/SVG fields; STEP for bools and resource tokens",
           "x-help-path": "animation.track.interpolation",
           "x-source": "glTF 2.0 LINEAR"
         },
@@ -3370,11 +5377,11 @@
         "path": {
           "description": "Segments naming the keyed property, e.g. [\"nodes\",\"Bone.001\",\"rotation\"].",
           "items": {
-            "type": "string"
+            "$ref": "#/$defs/PathSegment"
           },
           "type": "array",
-          "x-help": "string[]; [\"nodes\",node,property...] | [\"nodes\",asset,\"nodes\",imported-name|#index,property...] | [\"materials\",material,\"inputs\",input] | [\"animation\",layer,\"weight\"] | [\"render\",property...]",
-          "x-help-extra": "animation.track.path properties: node translation|rotation|scale|visible|visible_camera|visible_shadow|visible_diffuse|visible_glossy|visible_transmission|morph_weights,<morph>, camera/light numeric fields (camera optics are material inputs); imported nodes: translation|rotation|scale|morph_weights|visible\nanimation.track.path render properties: camera|background (RGB)|motion_blur,shutter",
+          "x-help": "(string|index)[]; [\"nodes\",node,property...] | [\"nodes\",asset,\"nodes\",imported-name|#index,property...] | [\"materials\",material,\"inputs\",input] | [\"animation\",layer,\"weight\"] | [\"render\",property...] | [\"nodes\",text-node,\"glyphs\"|\"words\"|\"lines\",index,translation|rotation|scale|opacity|fill|stroke|transform-origin]",
+          "x-help-extra": "animation.track.path properties: node translation|rotation|scale|visible|visible_camera|visible_shadow|visible_diffuse|visible_glossy|visible_transmission|morph_weights,<morph>, camera/light numeric fields (camera optics are material inputs); canvas: filter, clip-path, mask, all path/text style fields; imported nodes: translation|rotation|scale|morph_weights|visible\nanimation.track.path render properties: camera|background (RGB; CSS colour on a canvas)|motion_blur,shutter\nanimation.track.path text pieces: fill and stroke [r,g,b,a] 0..1 or CSS colour/gradient or image paint; transform-origin CSS, default the ink box centre",
           "x-help-path": "animation.track.path",
           "x-source": "vork (explicit contract/technique choice)"
         }
@@ -3386,6 +5393,39 @@
       "title": "Track",
       "type": "object"
     },
+    "WhiteSpace": {
+      "description": "CSS `white-space`.",
+      "enum": [
+        "normal",
+        "nowrap",
+        "pre",
+        "pre-wrap",
+        "pre-line",
+        "break-spaces"
+      ],
+      "type": "string"
+    },
+    "WordBreak": {
+      "description": "CSS `word-break`.",
+      "enum": [
+        "normal",
+        "break-all",
+        "keep-all",
+        "break-word"
+      ],
+      "type": "string"
+    },
+    "WorkingColorSpace": {
+      "description": "RGB encodings with pinned primaries and white points.",
+      "enum": [
+        "Linear Rec.709",
+        "Linear Rec.2020",
+        "ACEScg",
+        "sRGB",
+        "Display P3"
+      ],
+      "type": "string"
+    },
     "Wrap": {
       "enum": [
         "repeat",
@@ -3395,7 +5435,7 @@
       "type": "string"
     }
   },
-  "$id": "https://raw.githubusercontent.com/voyager-so/vork/v0.5.1/packages/ts/scene.schema.json",
+  "$id": "https://raw.githubusercontent.com/voyager-so/vork/v0.6.0/packages/ts/scene.schema.json",
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "additionalProperties": false,
   "properties": {
@@ -3427,6 +5467,20 @@
       "x-help": "{name:buffer}",
       "x-help-path": "scene.buffers",
       "x-source": "vork (explicit contract/technique choice)"
+    },
+    "composition": {
+      "anyOf": [
+        {
+          "$ref": "#/$defs/Composition"
+        },
+        {
+          "type": "null"
+        }
+      ],
+      "description": "`{space: \"2d\"}`: the document is a 2D canvas. Absent: a 3D world.",
+      "x-help": "composition|null; space 2d = canvas, 3d = world; null = 3D world",
+      "x-help-path": "scene.composition",
+      "x-source": "END-STATE-API §7"
     },
     "geometry": {
       "additionalProperties": {
@@ -3512,14 +5566,6 @@
         "aovs": [],
         "background": "environment",
         "camera": null,
-        "compositor": [],
-        "display": {
-          "double_sided": true,
-          "inputs": {},
-          "opacity": null,
-          "priority": 0,
-          "program": "std/agx"
-        },
         "duration": "125/12",
         "fps": 24,
         "motion_blur": null,
@@ -3568,11 +5614,11 @@
     "animation": "glTF 2.0 interpolation",
     "assets": "glTF 2.0",
     "camera JSON": "OpenCV",
-    "cameras": "Blender physical camera (Blender 5.2.1)",
+    "cameras": "Blender 5.2.1 physical camera, except the names fit, shift, projection",
     "colour": "AgX as Blender 5.2.1",
     "geometry": "glTF 2.0 topology and attribute semantics",
     "hair": "Blender 5.2.1 Principled Hair; Chiang scattering in raster and path",
-    "lights": "Blender 5.2.1 normalized lights",
+    "lights": "Blender 5.2.1 lights, except radius (Blender: shadow_soft_size)",
     "materials": "OpenPBR Surface 1.1.1",
     "textures": "glTF 2.0 samplers; KHR_texture_transform lowered on import"
   },
@@ -3581,7 +5627,7 @@
     "animation.clip.index: u32|null; XOR name",
     "animation.clip.name: string|null; XOR index",
     "animation.clip.target: asset-node-name",
-    "animation.layer.blend: replace|add; default replace",
+    "animation.layer.blend: replace|combine; default replace",
     "animation.layer.clip: clip|null; XOR tracks",
     "animation.layer.loop: bool; default false",
     "animation.layer.name: string|null",
@@ -3589,9 +5635,9 @@
     "animation.layer.speed: number; default 1",
     "animation.layer.tracks: track[]|null; XOR clip",
     "animation.layer.weight: number; default 1",
-    "animation.track.interpolation: STEP|LINEAR|CUBICSPLINE; omitted: STEP for strings/bools, else LINEAR; default null",
+    "animation.track.interpolation: STEP|LINEAR|CUBICSPLINE; omitted: LINEAR for numeric and CSS/SVG fields; STEP for bools and resource tokens; default null",
     "animation.track.keys: [[time, value], ...] | {times: buffer, values: buffer}; time increasing; CUBICSPLINE [time, value, in_tangent, out_tangent] (tangents per second) or [time, value] (zero tangents); rotation values as in node.rotation",
-    "animation.track.path: string[]; [\"nodes\",node,property...] | [\"nodes\",asset,\"nodes\",imported-name|#index,property...] | [\"materials\",material,\"inputs\",input] | [\"animation\",layer,\"weight\"] | [\"render\",property...]",
+    "animation.track.path: (string|index)[]; [\"nodes\",node,property...] | [\"nodes\",asset,\"nodes\",imported-name|#index,property...] | [\"materials\",material,\"inputs\",input] | [\"animation\",layer,\"weight\"] | [\"render\",property...] | [\"nodes\",text-node,\"glyphs\"|\"words\"|\"lines\",index,translation|rotation|scale|opacity|fill|stroke|transform-origin]",
     "buffer.count: u32|null; file only",
     "buffer.data: number[]|number[][]; XOR file; one typed element per outer entry; vector/matrix entries contain 2/3/4/16 scalar components, not a flat scalar stream; mat4 column-major",
     "buffer.dims: [u32,u32,u32]|null; positive dense typed array dimensions; data or binary file optional; file count defaults to dims product and must match it; x contiguous; field cell centres span local [-1,1]³",
@@ -3601,6 +5647,12 @@
     "buffer.type: f32|i32|u32|vec2|vec3|vec4|uvec4|mat4",
     "node.focus_object (camera): node-name|null; camera-axis depth supplied to the program at sample time; default null",
     "node.material (camera): material-name|inline material|null; omitted = std/camera; optics are program inputs; default null",
+    "composition.color_space: Linear Rec.709|Linear Rec.2020|ACEScg|sRGB|Display P3; omitted: worlds Linear Rec.709, canvases sRGB",
+    "composition.compositor: (material-name|{material,name?,resolution?})[]; ordered image graph in the working space, before the view; last is the output; material may be inline; a canvas's graph works in the canvas's working encoding (sRGB code values by default)",
+    "composition.preserveAspectRatio: string|null; none, or x(Min|Mid|Max)Y(Min|Mid|Max) then meet|slice; null = xMidYMid meet; unsupported on a canvas inside a canvas",
+    "composition.space: 2d|3d; 2d: a canvas, top-left origin, y down, painted in node order; 3d: a standalone or nested closed world",
+    "composition.view: material-name|inline material; local default: worlds std/agx, canvases std/standard; never inherited",
+    "composition.viewBox: [min-x,min-y,width,height]|null; the canvas's own coordinates, placed in render.resolution; null = render.resolution px; unsupported on a canvas inside a canvas",
     "compositor.resolution: [width,height] pixels or positive output scale; floor, minimum 1; null = output; last image resampled to output",
     "geometry.attributes: {name: buffer-name|inline buffer}; POSITION required (glTF names and types; COLOR_n: linear vec3/vec4, alpha defaults to 1); implicit: exactly one f32 dense grid, zero threshold; custom f32/vec2/vec3/vec4 bind to material inputs",
     "geometry.count: one-element u32 buffer|null; points only; overflow rejects the exposure",
@@ -3627,14 +5679,15 @@
     "geometry.subdivision.use_limit_surface: bool; default true",
     "geometry.topology: triangles|points|curves|implicit; points render as spheres; default triangles",
     "geometry.widths: f32 buffer; diameter per point; curves and points; required",
-    "image.color_space: sRGB|Linear Rec.709|Non-Color|null; null: hdr/exr/ies linear, others sRGB; default null",
+    "image.color_space: sRGB|Display P3|Linear Rec.709|Linear Rec.2020|ACEScg|Non-Color|null; omitted/null: embedded colour description, else hdr/exr/ies linear Rec.709 and other files sRGB; default null",
+    "image.composition: {compositor}|null; a rendered image's image graph; requires render",
+    "image.composition.compositor: same ordered image graph as composition.compositor; names local to this capture",
     "image.file: file-path; XOR render; png jpg tif hdr exr ies mov mp4 mkv or %04d frame pattern; 8-bit may be block-compressed; 16-bit integer and floating-point inputs use uncompressed half-float precision, not exact source integer codes; ies: LM-63 Type C",
     "image.mag_filter: nearest|linear; default linear",
     "image.min_filter: nearest|linear|nearest_mipmap_nearest|linear_mipmap_nearest|nearest_mipmap_linear|linear_mipmap_linear; default linear_mipmap_linear",
     "image.render: ImageRender; renders a camera view into the texture; inherits integrator, fps, AOVs; sampling budget follows quality/cost level; closed shutter; scene-linear premultiplied RGBA; default null",
     "image.render.background: environment|transparent|RGB; default environment",
     "image.render.camera: camera-node-name|null; null = the only authored camera, else first imported; default null",
-    "image.render.compositor: same image graph as render.compositor; names local to this capture; default []",
     "image.render.resolution: uvec2; default [1920,1080]",
     "image.render.root: node-name|null; only this subtree draws and is lit; objects outside still cast shadows; null = whole scene; default null",
     "image.time: number|rational string|null; seconds from first displayed frame; null follows scene time; animatable; subframes hold; out-of-range holds ends; default null",
@@ -3663,8 +5716,8 @@
     "material.double_sided: bool; false culls back faces; default true",
     "material.geometry.geometry: mesh-node name; read-only geometry at the program's canonical sample time",
     "material.grid.grid: buffer-name|inline buffer; buffer with a grid",
-    "material.inputs: {name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{node}|{channel}|{geometry}}; default {}",
-    "material.inputs (std/openpbr): OpenPBR Surface; shaded inputs: base_weight base_color base_metalness specular_weight specular_color specular_roughness specular_roughness_anisotropy specular_ior transmission_weight transmission_color transmission_depth subsurface_weight subsurface_color subsurface_radius subsurface_radius_scale subsurface_scatter_anisotropy coat_weight coat_color coat_roughness coat_ior coat_darkening fuzz_weight fuzz_color fuzz_roughness emission_luminance emission_color thin_film_weight thin_film_thickness thin_film_ior geometry_opacity geometry_thin_walled geometry_normal geometry_tangent geometry_coat_normal transmission_dispersion_scale transmission_dispersion_abbe_number alpha_cutoff",
+    "material.inputs: {name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{step}|{channel}|{geometry}}; default {}",
+    "material.inputs (std/openpbr): OpenPBR Surface; shaded inputs: base_weight base_color base_metalness specular_weight specular_color specular_roughness specular_roughness_anisotropy specular_ior transmission_weight transmission_color transmission_depth subsurface_weight subsurface_color subsurface_radius subsurface_radius_scale subsurface_scatter_anisotropy coat_weight coat_color coat_roughness coat_roughness_anisotropy coat_ior coat_darkening fuzz_weight fuzz_color fuzz_roughness emission_luminance emission_color thin_film_weight thin_film_thickness thin_film_ior geometry_opacity geometry_thin_walled geometry_normal geometry_tangent geometry_coat_normal geometry_coat_tangent transmission_dispersion_scale transmission_dispersion_abbe_number alpha_cutoff",
     "material.inputs.alpha_cutoff: number; Negative disables threshold; otherwise geometry_opacity >= alpha_cutoff produces 1, else 0; range [-1,1]; units dimensionless; constant|texture|attribute; animatable; default -1",
     "material.inputs.base_color: color3; Base reflection albedo (dielectric); F0 colour at normal incidence (metal); range [0,1] per channel; units dimensionless; constant|texture|attribute; animatable; default (0.8, 0.8, 0.8)",
     "material.inputs.base_metalness: number; Fraction of the microsurface that is metallic; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
@@ -3673,6 +5726,7 @@
     "material.inputs.coat_darkening: number; Modulates the physical coat darkening effect; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 1",
     "material.inputs.coat_ior: number; Refractive index of the coat; range (0,inf); units dimensionless; constant|texture|attribute; animatable; default 1.6",
     "material.inputs.coat_roughness: number; Roughness of the coat NDF; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
+    "material.inputs.coat_roughness_anisotropy: number; Anisotropy of NDF of coat BSDF; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
     "material.inputs.coat_weight: number; Coverage weight of the coat slab; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
     "material.inputs.emission_color: color3; Emission colour multiplier (emitted = `emission_color` × `emission_luminance`); range [0,inf) per channel; units dimensionless; constant|texture|attribute; animatable; default (1, 1, 1)",
     "material.inputs.emission_luminance: number; Emission luminance with `emission_color` = (1,1,1), before coat and fuzz; range [0,inf); units cd/m² (nits); constant|texture|attribute; animatable; default 0",
@@ -3680,6 +5734,7 @@
     "material.inputs.fuzz_roughness: number; Reflection roughness of the fuzz; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0.5",
     "material.inputs.fuzz_weight: number; Coverage weight of the fuzz slab; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
     "material.inputs.geometry_coat_normal: vector3; Shading normal of the coat; linear tangent-space RGB; factor scales XY; independent of base normal; range N/A; units dimensionless; constant or texture; animatable; default unperturbed normal",
+    "material.inputs.geometry_coat_tangent: vector3; Reference tangent for coat anisotropy; range N/A; units dimensionless; constant or texture; animatable; default unperturbed tangent",
     "material.inputs.geometry_normal: vector3; Shading normal of the base; range N/A; units dimensionless; constant or texture; animatable; default unperturbed normal",
     "material.inputs.geometry_opacity: number; Opacity (presence) of the surface; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 1",
     "material.inputs.geometry_tangent: vector3; Reference tangent for specular anisotropy; range N/A; units dimensionless; constant or texture; animatable; default unperturbed tangent",
@@ -3702,20 +5757,53 @@
     "material.inputs.transmission_dispersion_abbe_number: number; Physical Abbe number of the base dielectric medium; range (0,inf); units dimensionless; constant|texture|attribute; animatable; default 20",
     "material.inputs.transmission_dispersion_scale: number; Linearly scales the amount of dispersion; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
     "material.inputs.transmission_weight: number; Mix weight between translucent base and opaque base slabs; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
-    "material.node.node: earlier compositor entry name; clamped bilinear image sampling",
     "material.opacity: coverage|transmittance|null; null = coverage, transmittance for transmitting surfaces; coverage = occupied area fraction; transmittance = continuous attenuation by 1 - geometry_opacity; renderer chooses integration; default null",
     "material.priority: integer; highest owns overlapping solid media; equal priorities: last entered wins, simultaneous entries: later solid order wins; lower-priority boundaries change membership only; default 0",
     "material.program: program-name|inline program|<library>/<module>; std/openpbr, std/hair (curves only), or custom; default std/openpbr",
+    "material.step.step: earlier compositor entry name; clamped bilinear image sampling",
     "material.texture.image: image-name|inline image; the program owns sampling and UV transforms",
+    "node.active: true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step)",
+    "node.animation: layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself",
+    "node.animation.layer.blend: replace|combine; default replace",
+    "node.animation.layer.clip: clip|null; XOR tracks; target = this node or a descendant asset",
+    "node.animation.layer.loop: bool; default false",
+    "node.animation.layer.name: string|null",
+    "node.animation.layer.offset: number; source time = offset + node time*speed; default 0",
+    "node.animation.layer.speed: number; default 1",
+    "node.animation.layer.tracks: track[]|null; XOR clip; paths start at this node: [\"translation\"], [\"children\",name,...]; keys in this node's seconds",
+    "node.animation.layer.weight: number; default 1",
     "node.file (asset): file-path",
     "node.materials (asset): {imported-name|#index|*: material-name|inline material}; #index = glTF material index; specific beats *; default {}",
     "node.nodes (asset): {imported-name|#index: overrides}; #index = glTF node index; default {}",
     "node.nodes.<name>.light_link_tags (asset): string[]|null; replaces inherited tags",
     "node.nodes.<name>.pass_index (asset): u32|null; 1..65535; object ID",
+    "node.audio: {file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch",
+    "node.audio.file: file-path|null; mono/stereo; relative to scene; omitted = children only",
+    "node.audio.gain: number; linear amplitude over source plus children; default 1; keyable; default 1",
     "node.children: node[]; default []",
+    "node.clip-path: node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself",
+    "node.composition: composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box",
+    "node.content (text): string|run[]; position by the text box's top-left; switch content with STEP keys; runs set font and paint; white-space controls newlines",
+    "node.d (path): string; SVG path data, px; \"none\" or empty paints nothing; default none",
+    "node.direction (text): ltr|rtl; default ltr",
+    "node.fill (path): paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}; default #000",
+    "node.fill (text): \"none\"|CSS colour|CSS gradient|{image, fit}; default #000",
+    "node.fill-opacity (path): number; 0..1; default 1",
+    "node.fill-rule (path): nonzero|evenodd; default nonzero",
+    "node.filter: string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses",
+    "node.font (text): file-path|file-path[]; .ttf/.otf; a list offers faces font-weight and font-style choose from",
+    "node.font-feature-settings (text): string; default normal",
+    "node.font-size (text): number; px; default 16",
+    "node.font-style (text): normal|italic|oblique; default normal",
+    "node.font-variation-settings (text): string; default normal",
+    "node.font-weight (text): number|normal|bold; default normal",
     "node.is_holdout: bool; RGB 0; alpha 0 on transparent background, 1 on opaque background; default false",
     "node.is_shadow_catcher: bool; shadow_catcher channel is material light with CG / without CG, unclamped; zero baseline gives neutral 1; CG light on an otherwise unlit catcher cannot be represented; default false",
+    "node.letter-spacing (text): number; px; default 0",
     "node.light_link_tags: string[]; matched by light illuminates/shadowed_by; inherited; default []",
+    "node.line-break (text): auto; the others are not built; default auto",
+    "node.line-height (text): normal|number; a multiple of the font size; default normal",
+    "node.mask: node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself",
     "node.geometry (mesh): geometry-name|inline geometry",
     "node.instances (mesh): instances|null",
     "node.instances.attributes (mesh): equal-length buffers: TRANSLATION vec3, ROTATION vec4 (xyzw), SCALE vec3 (omitted = identity; any zero world-scale component hides the instance), time_offset f32, pass_index u32, custom columns bind to material inputs",
@@ -3726,10 +5814,31 @@
     "node.skin.inverse_bind_matrices (mesh): mat4-buffer-name|inline buffer",
     "node.skin.joints (mesh): node-name[]",
     "node.name: string; globally unique, including imported nodes; default \"\"",
+    "node.opacity: number; 2D; 0..1; the node's picture, children included, placed once; default 1",
+    "node.paint-order (path): string; normal, or the layers to paint first out of fill, stroke, markers (\"stroke\" puts the stroke under the fill); default normal",
     "node.pass_index: u32|null; 1..65535; object ID",
+    "node.pathLength (path): number|null; the author's total length of d; dash lengths and offset scale by computed/pathLength",
     "node.rotation: [x,y,z,w] quaternion | {euler:[x,y,z]} (Blender XYZ); default [0,0,0,1]",
     "node.scale: [x,y,z]; any zero world-scale component hides geometry, including children; default [1,1,1]",
+    "node.stroke (path): paint; \"none\"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}; default none",
+    "node.stroke (text): \"none\"|CSS colour|CSS gradient|{image, fit}; the glyph outlines; default none",
+    "node.stroke-dasharray (path): \"none\"|number[]; px; an odd count repeats; scaled by pathLength; default none",
+    "node.stroke-dashoffset (path): number; px; default 0",
+    "node.stroke-linecap (path): butt|round|square; default butt",
+    "node.stroke-linejoin (path): miter|round|bevel; default miter",
+    "node.stroke-miterlimit (path): number; at least 1; default 4",
+    "node.stroke-opacity (path): number; 0..1; default 1",
+    "node.stroke-width (path): number; px; 0 paints nothing; default 1",
+    "node.stroke-width (text): number; px; default 1",
     "node.target: node-name|[x,y,z]|null; aims -Z, world Y up; rotation is an offset on top; structural, not animatable: aim at a named node and animate its translation",
+    "node.text-align (text): start|end|left|right|center|justify; default start",
+    "node.time: {start,offset,duration,speed,loop}|null; node-owned animation/media clock; time-reading programs, conflicting movie clocks and scene-time tracks inside retimed compositions refuse; null inherits parent/active-window clock",
+    "node.time.duration: number|rational string|null; content seconds used from offset; > 0; null = the rest of the one source; only active ends the node",
+    "node.time.loop: bool; wraps inside [offset, offset+duration); needs an end; default false",
+    "node.time.offset: number|rational string; content seconds where the clip begins; >= 0; default 0",
+    "node.time.pitch: follow|keep; keep holds sound pitch when speed changes; keep is not built yet; default follow",
+    "node.time.speed: number|rational string; keyable >= 0 and integrated; a constant < 0 plays the trimmed section backwards from its end; default 1",
+    "node.time.start: number|rational string|null; parent seconds where local = offset; null = active window start, else 0; shifts loop phase",
     "node.translation: [x,y,z]; parent frame; default [0,0,0]",
     "node.visible: bool; false hides the subtree and disables its lights; animatable (step); default true",
     "node.visible_camera: bool; default true",
@@ -3737,6 +5846,17 @@
     "node.visible_glossy: bool; default true",
     "node.visible_shadow: bool; lights must stay true (a light without shadows: shadowed_by []); default true",
     "node.visible_transmission: bool; object visibility to transmission rays; lights must stay true; default true",
+    "node.white-space (text): normal|nowrap|pre-line; pre, pre-wrap and break-spaces are not built; default normal",
+    "node.width (text): number|null; px; lines wrap and align in it; null = no wrapping",
+    "node.word-break (text): normal; the others are not built; default normal",
+    "node.word-spacing (text): number; px; only 0 is built; default 0",
+    "output.color_space: EXR storage space; omitted: the composition's working space; a world takes the linear spaces, a canvas any; excludes display and luminance fields",
+    "output.display: sRGB|Display P3|Rec.2100-PQ|Rec.2100-HLG; omitted: sRGB for viewed outputs; raw outputs bypass the view",
+    "output.file: path; format follows extension",
+    "output.peak_luminance: positive cd/m²; omitted: SDR 100, HDR 1000",
+    "output.reference_white: positive cd/m², at most peak_luminance; omitted: SDR 100, HDR 203",
+    "paint.fit: contain|cover|fill|none|null; centred in the shape's box; null = natural size from the box's top-left, repeated as the image's wrap_s and wrap_t say",
+    "paint.image: image-name; PNG or JPEG, sRGB; clipped by the shape",
     "profile.description: string; default \"\"",
     "profile.level: u8; 0..3; quality/cost level; 3 is previs",
     "profile.settings: Settings; seed, samples and denoise only; default {}",
@@ -3750,10 +5870,8 @@
     "render.aovs: [{name,type:value|color}]; output with --channels all or aov:<name>; default []",
     "render.aovs.name: name; EXR channels <name>.X or <name>.R/G/B",
     "render.aovs.type: value|color",
-    "render.background: environment|transparent|RGB; RGB and transparent apply to camera escapes and opacity passthrough; path glass transmission sees the World; default environment",
+    "render.background: environment|transparent|RGB|CSS colour; RGB and transparent apply to camera escapes and opacity passthrough; path glass transmission sees the World; a 2D canvas takes transparent or a CSS colour; default environment",
     "render.camera: camera-node-name|null; null = the only authored camera, else first imported; a camera cut track may select; default null",
-    "render.compositor: (material-name|{material,name?,resolution?})[]; ordered image graph, last output; material may be inline; default []",
-    "render.display: material-name|inline material; display program; EXR stays scene-linear; default {\"program\":\"std/agx\"}",
     "render.duration: number|rational string; seconds; default 125/12",
     "render.fps: number|rational string; positive output frames/second; default 24",
     "render.motion_blur: MotionBlur|null; non-null enables; shutter in frames; default null",
@@ -3761,9 +5879,20 @@
     "render.motion_blur.shutter: number; frames; default 0.5",
     "render.resolution: uvec2; default [1920,1080]",
     "render.root: node-name|null; only this subtree draws and is lit; objects outside still cast shadows; null = whole scene; default null",
+    "run.content: string",
+    "run.fill: \"none\"|CSS colour|CSS gradient|{image, fit}; default the node's",
+    "run.font: file-path|file-path[]; default the node's",
+    "run.font-feature-settings: string; default the node's",
+    "run.font-size: number; px; default the node's",
+    "run.font-style: normal|italic|oblique; default the node's",
+    "run.font-variation-settings: string; default the node's",
+    "run.font-weight: number|normal|bold; default the node's",
+    "run.letter-spacing: number; px; default the node's",
+    "run.stroke: \"none\"|CSS colour|CSS gradient|{image, fit}; default the node's",
     "scene.$schema: string; editor schema URL",
     "scene.animation: layer[]; default []",
     "scene.buffers: {name:buffer}; default {}",
+    "scene.composition: composition|null; space 2d = canvas, 3d = world; null = 3D world",
     "scene.geometry: {name:geometry}; default {}",
     "scene.geometry_stages: (deform|compute|displace)[]; ordered, each at most once; default [deform,compute,displace]; default [deform,compute,displace]",
     "scene.images: {name:image}; default {}",
@@ -3791,6 +5920,7 @@
     "std/openpbr.coat_darkening: number; Modulates the physical coat darkening effect; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 1",
     "std/openpbr.coat_ior: number; Refractive index of the coat; range (0,inf); units dimensionless; constant|texture|attribute; animatable; default 1.6",
     "std/openpbr.coat_roughness: number; Roughness of the coat NDF; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
+    "std/openpbr.coat_roughness_anisotropy: number; Anisotropy of NDF of coat BSDF; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
     "std/openpbr.coat_weight: number; Coverage weight of the coat slab; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
     "std/openpbr.emission_color: color3; Emission colour multiplier (emitted = `emission_color` × `emission_luminance`); range [0,inf) per channel; units dimensionless; constant|texture|attribute; animatable; default (1, 1, 1)",
     "std/openpbr.emission_luminance: number; Emission luminance with `emission_color` = (1,1,1), before coat and fuzz; range [0,inf); units cd/m² (nits); constant|texture|attribute; animatable; default 0",
@@ -3798,6 +5928,7 @@
     "std/openpbr.fuzz_roughness: number; Reflection roughness of the fuzz; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0.5",
     "std/openpbr.fuzz_weight: number; Coverage weight of the fuzz slab; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
     "std/openpbr.geometry_coat_normal: vector3; Shading normal of the coat; linear tangent-space RGB; factor scales XY; independent of base normal; range N/A; units dimensionless; constant or texture; animatable; default unperturbed normal",
+    "std/openpbr.geometry_coat_tangent: vector3; Reference tangent for coat anisotropy; range N/A; units dimensionless; constant or texture; animatable; default unperturbed tangent",
     "std/openpbr.geometry_normal: vector3; Shading normal of the base; range N/A; units dimensionless; constant or texture; animatable; default unperturbed normal",
     "std/openpbr.geometry_opacity: number; Opacity (presence) of the surface; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 1",
     "std/openpbr.geometry_tangent: vector3; Reference tangent for specular anisotropy; range N/A; units dimensionless; constant or texture; animatable; default unperturbed tangent",
@@ -3820,8 +5951,9 @@
     "std/openpbr.transmission_dispersion_abbe_number: number; Physical Abbe number of the base dielectric medium; range (0,inf); units dimensionless; constant|texture|attribute; animatable; default 20",
     "std/openpbr.transmission_dispersion_scale: number; Linearly scales the amount of dispersion; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
     "std/openpbr.transmission_weight: number; Mix weight between translucent base and opaque base slabs; range [0,1]; units dimensionless; constant|texture|attribute; animatable; default 0",
-    "animation.track.path properties: node translation|rotation|scale|visible|visible_camera|visible_shadow|visible_diffuse|visible_glossy|visible_transmission|morph_weights,<morph>, camera/light numeric fields (camera optics are material inputs); imported nodes: translation|rotation|scale|morph_weights|visible",
-    "animation.track.path render properties: camera|background (RGB)|motion_blur,shutter",
+    "animation.track.path properties: node translation|rotation|scale|visible|visible_camera|visible_shadow|visible_diffuse|visible_glossy|visible_transmission|morph_weights,<morph>, camera/light numeric fields (camera optics are material inputs); canvas: filter, clip-path, mask, all path/text style fields; imported nodes: translation|rotation|scale|morph_weights|visible",
+    "animation.track.path render properties: camera|background (RGB; CSS colour on a canvas)|motion_blur,shutter",
+    "animation.track.path text pieces: fill and stroke [r,g,b,a] 0..1 or CSS colour/gradient or image paint; transform-origin CSS, default the ink box centre",
     "coordinates: glTF right-handed Y-up; cameras look along local -Z",
     "image.render restrictions: shared parent pose; aperture sampling is renderer-selected; geometry_opacity/alpha_cutoff/geometry_normal/environment image inputs unsupported",
     "lights: with no environment light the world is RGB [0.05,0.05,0.05]",
@@ -3836,7 +5968,7 @@
     "node.nodes.<name>.visible_diffuse (asset): bool; default true",
     "node.nodes.<name>.visible_glossy (asset): bool; default true",
     "node.nodes.<name>.visible_transmission (asset): bool; default true",
-    "node.type: node|mesh|asset|camera|light; default \"node\"",
+    "node.type: node|mesh|asset|camera|light|text|path; default \"node\"",
     "asset (glTF cameras): addressed as <asset>/<node-name|#index>",
     "program enum inputs: lowercased Slang case-name tokens (e.g. fog_glow)",
     "program.surface emission: authoritative radiance for hits and light samples; lit output is authored shading",
@@ -3850,6 +5982,8 @@
     "node [type=\"mesh\"]: {\"type\":\"mesh\", …}; flat sibling fields: geometry, instances, materials, morph_weights, skin; no variant wrapper",
     "node [type=\"asset\"]: {\"type\":\"asset\", …}; flat sibling fields: file, materials, nodes; no variant wrapper",
     "node [type=\"camera\"]: {\"type\":\"camera\", …}; flat sibling fields: focus_object, material; no variant wrapper",
-    "node [type=\"light\"]: {\"type\":\"light\", …}; flat sibling fields: angle, color, energy, illuminates, image, material, medium, radius, shadowed_by, shape, size, size_y, spot_blend, spot_size, temperature; no variant wrapper"
+    "node [type=\"light\"]: {\"type\":\"light\", …}; flat sibling fields: angle, color, energy, illuminates, image, material, medium, radius, shadowed_by, shape, size, size_y, spot_blend, spot_size, temperature; no variant wrapper",
+    "node [type=\"text\"]: {\"type\":\"text\", …}; flat sibling fields: content, direction, fill, font, font-feature-settings, font-size, font-style, font-variation-settings, font-weight, letter-spacing, line-break, line-height, stroke, stroke-width, text-align, white-space, width, word-break, word-spacing; no variant wrapper",
+    "node [type=\"path\"]: {\"type\":\"path\", …}; flat sibling fields: d, fill, fill-opacity, fill-rule, paint-order, pathLength, stroke, stroke-dasharray, stroke-dashoffset, stroke-linecap, stroke-linejoin, stroke-miterlimit, stroke-opacity, stroke-width; no variant wrapper"
   ]
 }

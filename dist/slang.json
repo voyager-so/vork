@@ -6,12 +6,42 @@
       "sha256": "691f9341e5bec099eec97ee30a83bcbef541cee7fe3b4de68a821d42f9506c2f"
     },
     "Darwin-arm64": {
-      "name": "macos-aarch64",
-      "sha256": "c3d3c959ba3e0c8fdb6c2a5cf6a471ed097ed19c41820af9fb21625779794fb2"
+      "name": "macos-aarch64-vork",
+      "sha256": "5b7de0f5d6da4c83eb56b65b7ca04e7cff90fc784e5a1b8ae316554e9a5845fa",
+      "url": "https://github.com/voyager-so/vork/releases/download/toolchain-slang-2026.21-macos15-1/slang-2026.21-macos-aarch64-vork.tar.gz",
+      "build": {
+        "workflow": ".github/workflows/slang-macos-build.yml",
+        "commit": "2b7c3a51cad1c1039bf9fa62915a27434d5ffb4d",
+        "run_id": 43404071626
+      }
     },
     "Windows-AMD64": {
       "name": "windows-x86_64",
       "sha256": "d2f4a1547f38d050aa87168bfd7379ad71aaa0a063c317ab6f727e9d8d901628"
     }
+  },
+  "macos_source": {
+    "repository": "https://github.com/shader-slang/slang.git",
+    "commit": "e73d268973dae1a2af701277b27c2fddef98a274",
+    "deployment_target": "15.0",
+    "xcode": "Xcode 16.4\nBuild version 16F6",
+    "cmake": "3.31.6",
+    "ninja": "1.11.1.4",
+    "cmake_flags": [
+      "-DSLANG_SLANG_LLVM_FLAVOR=DISABLE",
+      "-DSLANG_ENABLE_EXAMPLES=OFF",
+      "-DSLANG_ENABLE_TESTS=OFF",
+      "-DSLANG_ENABLE_GFX=OFF",
+      "-DSLANG_ENABLE_SLANG_RHI=OFF",
+      "-DSLANG_ENABLE_SLANGD=OFF",
+      "-DSLANG_ENABLE_SLANGI=OFF",
+      "-DSLANG_ENABLE_REPLAYER=OFF",
+      "-DSLANG_ENABLE_RELEASE_LTO=ON",
+      "-DSLANG_STANDARD_MODULE_DEVELOP_BUILD=OFF"
+    ]
+  },
+  "macos_official_reference": {
+    "url": "https://github.com/shader-slang/slang/releases/download/v2026.21/slang-2026.21-macos-aarch64.tar.gz",
+    "sha256": "c3d3c959ba3e0c8fdb6c2a5cf6a471ed097ed19c41820af9fb21625779794fb2"
   }
 }

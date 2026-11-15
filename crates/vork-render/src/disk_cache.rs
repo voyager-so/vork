@@ -65,7 +65,7 @@ impl Store {
         self.root
             .join(format!("{}.{kind}-v{version}.entry", key.finalize()))
     }
-    /// Also trim on startup/shutdown, including stores left by older builds.
+    /// Opening a store trims it, including what older builds left; every publication makes its own room.
     pub fn trim(&self) {
         network_notice(&self.root);
         let _ = (|| -> std::io::Result<()> {
@@ -78,6 +78,15 @@ impl Store {
         let mut files = Vec::new();
         for entry in fs::read_dir(&self.root)?.flatten() {
             let path = entry.path();
+            // Every writer holds the store lock from creating its temporary file to renaming it, and
+            // the caller holds that lock now: a temporary file here was left by a process that
+            // ended mid-publication (a one-shot exits without waiting for a background save).
+            if path.extension().is_some_and(|ext| ext == "tmp")
+                && entry.file_name().to_string_lossy().starts_with("store-")
+            {
+                let _ = fs::remove_file(&path);
+                continue;
+            }
             if path.extension().is_none_or(|ext| ext != "entry") {
                 continue;
             }
@@ -183,10 +192,12 @@ impl PersistenceReservation {
 #[cfg(test)]
 pub(crate) fn persistence_bytes() -> usize {persistence_admission().state.lock().unwrap().bytes}
 
-/// Optional persistence owns its payload after GPU readback. One process worker
-/// serializes publication through the ordinary store lock and eviction policy.
-/// Enqueueing never waits for the filesystem; process exit may discard pending work.
-fn persist(task: impl FnOnce() + Send + 'static) {
+/// Optional persistence owns its payload after GPU readback, and the pipeline cache is saved
+/// here too (`pipelines::Compiler::save_soon`). One process worker serializes publication
+/// through the ordinary store lock and eviction policy. Enqueueing never waits for the
+/// filesystem; process exit may discard pending work, and leaves no partial entry: an
+/// unpublished temporary file is removed by the next writer (`make_room`).
+pub(crate) fn persist(task: impl FnOnce() + Send + 'static) {
     type Task = Box<dyn FnOnce() + Send>;
     static WORKER: std::sync::OnceLock<Option<std::sync::mpsc::Sender<Task>>> = std::sync::OnceLock::new();
     if let Some(sender) = WORKER.get_or_init(|| {
@@ -281,16 +292,33 @@ pub fn read(path: &Path) -> Option<Vec<u8>> {
 /// Release assets are an immutable base of the same content-addressed store.
 /// Never accept driver blobs, known-pipeline ledgers or preprocessing entries
 /// from a different machine. Missing or damaged assets compile on demand.
+/// Each asset is its store entry (digest and payload) as one XZ stream, named
+/// for the entry with `.xz` appended: the entries repeat each other little
+/// enough alone, and a render reads only the few it needs, so each is packed
+/// and expanded by itself. The digest is checked after expansion, as for a
+/// store entry. A verified asset is then published to the store like any entry
+/// this machine compiled, so it is expanded once, not at every read or probe;
+/// a store that cannot take it (read-only, over budget) just expands it again.
 fn read_with_shaders(path: &Path, shaders: Option<&Path>) -> Option<Vec<u8>> {
     read_bounded(path, usize::MAX as u64).or_else(|| {
         let name = path.file_name()?.to_str()?;
         let (key, kind) = name.split_once('.')?;
         if key.len() != 64 || !key.bytes().all(|b| b.is_ascii_hexdigit())
             || !matches!(kind, "slang-variant-v1.entry" | "slang-program-v2.entry"
-                | "slang-resolve-v2.entry" | "aov-resolve-v1.entry") {
+                | "slang-resolve-v2.entry" | "aov-resolve-v1.entry" | "slang-closed-input-v1.entry") {
             return None;
         }
-        read_bounded(&shaders?.join(name), usize::MAX as u64)
+        let packed = fs::read(shaders?.join(format!("{name}.xz"))).ok()?;
+        let mut entry = Vec::new();
+        lzma_rs::xz_decompress(&mut packed.as_slice(), &mut entry).ok()?;
+        let (digest, payload) = entry.split_at_checked(blake3::OUT_LEN)?;
+        let mut checked = entry_hasher(path);
+        checked.update(payload);
+        if checked.finalize().as_bytes() != digest {
+            return None;
+        }
+        let _ = write_entry(path, payload);
+        Some(payload.to_vec())
     })
 }
 
@@ -300,6 +328,7 @@ fn shipped_shaders() -> Option<PathBuf> {
 }
 
 /// Immutable cache entries are atomically published and never modified in place.
+/// An entry is trusted only through its digest, never because its file exists.
 /// Keep the mapping alive through decoding/upload, including after eviction.
 pub(crate) struct MappedPayload(memmap2::Mmap);
 
@@ -368,8 +397,10 @@ pub(crate) fn read_bounded(path: &Path, limit: u64) -> Option<Vec<u8>> {
 
 /// Driver blobs obey the shared store budget, just like compiler artifacts.
 /// There is no independent entry cap: a complete driver blob cannot be truncated.
-pub(crate) fn read_pipeline(path: &Path) -> Option<Vec<u8>> {
-    read(path)
+pub(crate) fn read_pipeline(path: &Path) -> Option<MappedPayload> {
+    // Keep the verified immutable blob alive through driver ingestion without
+    // allocating, zeroing and copying another full cache-sized buffer.
+    read_mapped(path)
 }
 
 /// Report whether publication committed; budget refusal is not a saved entry.
@@ -422,7 +453,12 @@ fn publish_parts(path: &Path, parts: &[&[u8]]) -> std::io::Result<bool> {
         for part in parts {
             file.write_all(part)?;
         }
-        file.sync_all()?;
+        // No fsync. Readers only ever see a whole file: the rename is atomic for every process, and
+        // the bytes survive this process ending. Only a machine that loses power can keep a renamed
+        // entry without its bytes, and the digest above turns that entry into an ordinary miss. A
+        // cache needs no more. With the flush, publishing one pipeline entry took 0.003 to 1.07 s on
+        // an L4 host, and a short render exited before its entry was published; on macOS the flush
+        // is a full device flush.
         drop(file);
         fs::rename(&temporary, path)
     })();
@@ -521,6 +557,38 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
+    /// Entries are published without a device flush, so after a power loss a renamed entry can be
+    /// empty, cut short, or its full length of zeros. Every loader reads each as a miss, never as
+    /// an error or as content, and the next publication replaces it.
+    #[test]
+    fn entry_torn_by_power_loss_is_a_miss_for_every_loader() {
+        let root = std::env::temp_dir().join(format!("vork-torn-entry-{}", std::process::id()));
+        let path = root.join("driver.entry");
+        let payload: Vec<u8> = (0..4096u32).flat_map(u32::to_le_bytes).collect();
+        let whole = blake3::OUT_LEN + payload.len();
+        let torn: [(&str, Box<dyn Fn(&Path)>); 5] = [
+            ("empty", Box::new(|path: &Path| fs::write(path, b"").unwrap())),
+            ("digest cut short", Box::new(|path: &Path| fs::OpenOptions::new().write(true).open(path).unwrap().set_len(blake3::OUT_LEN as u64 - 1).unwrap())),
+            ("digest without payload", Box::new(|path: &Path| fs::OpenOptions::new().write(true).open(path).unwrap().set_len(blake3::OUT_LEN as u64).unwrap())),
+            ("payload cut short", Box::new(move |path: &Path| fs::OpenOptions::new().write(true).open(path).unwrap().set_len(whole as u64 / 2).unwrap())),
+            ("zeros of the full length", Box::new(move |path: &Path| fs::write(path, vec![0; whole]).unwrap())),
+        ];
+        for (case, tear) in &torn {
+            assert!(write_entry(&path, &payload).unwrap());
+            assert_eq!(read_pipeline(&path).as_deref(), Some(&payload[..]));
+            tear(&path);
+            assert!(read(&path).is_none(), "{case}: read");
+            assert!(read_pipeline(&path).is_none(), "{case}: pipeline blob");
+            assert!(read_mapped(&path).is_none(), "{case}: mapped");
+            assert!(read_bounded(&path, u64::MAX).is_none(), "{case}: bounded");
+            // The known-pipeline ledger loads through the same check: no key is trusted.
+            assert!(crate::pipelines::Known::load(path.clone(), true).is_empty(), "{case}: ledger");
+        }
+        assert!(write_entry(&path, &payload).unwrap());
+        assert_eq!(read(&path).as_deref(), Some(&payload[..]));
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn portable_artifacts_share_content_across_builds_and_devices() {
         let a = Store {
@@ -553,22 +621,65 @@ mod tests {
         );
     }
 
+    /// The bundle's writer is scripts/shader_bundle.py (Python's lzma: LZMA2 at
+    /// preset 6 with CRC64), not this crate's encoder, which stores chunks
+    /// unpacked and unchecked. The fixture is that writer's output for a 3 MiB
+    /// entry, so this reads compressed chunks, a chunk boundary and the check.
+    #[test]
+    fn a_bundle_entry_written_by_the_release_exporter_is_read() {
+        const NAME: &str = "5555555555555555555555555555555555555555555555555555555555555555.slang-variant-v1.entry";
+        let payload: Vec<u8> = (0..3u64 << 20).map(|i| if i % 4096 < 4000 { ((i * i >> 7) ^ (i >> 3)) as u8 } else { 0 }).collect();
+        let root = std::env::temp_dir().join(format!("vork-exported-shader-{}", std::process::id()));
+        let (cache, shaders) = (root.join("cache"), root.join("shaders"));
+        fs::create_dir_all(&cache).unwrap();
+        fs::create_dir_all(&shaders).unwrap();
+        let packed = include_bytes!(concat!("../tests/fixtures/shipped-shader/", "5555555555555555555555555555555555555555555555555555555555555555.slang-variant-v1.entry.xz"));
+        fs::write(shaders.join(format!("{NAME}.xz")), packed).unwrap();
+        assert_eq!(read_with_shaders(&cache.join(NAME), Some(&shaders)).as_deref(), Some(payload.as_slice()));
+        // The same valid stream under another entry's name fails that entry's digest.
+        let other = NAME.replace('5', "6");
+        fs::write(shaders.join(format!("{other}.xz")), packed).unwrap();
+        assert!(read_with_shaders(&cache.join(&other), Some(&shaders)).is_none());
+        // A damaged stream is a miss.
+        let mut damaged = packed.to_vec();
+        let middle = damaged.len() / 2;
+        damaged[middle] ^= 0x55;
+        let _ = fs::remove_file(cache.join(NAME));
+        fs::write(shaders.join(format!("{NAME}.xz")), damaged).unwrap();
+        assert!(read_with_shaders(&cache.join(NAME), Some(&shaders)).is_none());
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn shipped_shader_fallback_checks_integrity_and_excludes_device_state() {
         let root = std::env::temp_dir().join(format!("vork-shipped-shaders-{}", std::process::id()));
         let store = Store::for_test(root.join("cache"));
         let shaders = root.join("shaders");
-        for kind in ["slang-variant", "slang-program", "slang-resolve", "aov-resolve", "pipeline", "pipeline-keys", "shader-warm"] {
+        for kind in ["slang-variant", "slang-program", "slang-resolve", "aov-resolve", "slang-closed-input", "slang-input", "pipeline", "pipeline-keys", "shader-warm"] {
             let version = if matches!(kind, "slang-resolve" | "slang-program") {2} else {1};
             let path = store.path(kind, version, blake3::hash(b"fixture"));
-            let shipped = shaders.join(path.file_name().unwrap());
-            write(&shipped, b"shipped").unwrap();
-            let portable = matches!(kind, "slang-variant" | "slang-program" | "slang-resolve" | "aov-resolve");
+            // A shipped asset is the store entry, packed.
+            let entry = shaders.join(path.file_name().unwrap());
+            write(&entry, b"shipped").unwrap();
+            let shipped = shaders.join(format!("{}.xz", path.file_name().unwrap().to_str().unwrap()));
+            let mut packed = Vec::new();
+            lzma_rs::xz_compress(&mut fs::read(&entry).unwrap().as_slice(), &mut packed).unwrap();
+            fs::write(&shipped, &packed).unwrap();
+            fs::remove_file(&entry).unwrap();
+            let portable = matches!(kind, "slang-variant" | "slang-program" | "slang-resolve" | "aov-resolve" | "slang-closed-input");
             assert_eq!(read_with_shaders(&path, Some(&shaders)), portable.then(|| b"shipped".to_vec()));
             write(&path, b"local").unwrap();
             assert_eq!(read_with_shaders(&path, Some(&shaders)).unwrap(), b"local");
             fs::write(&path, b"corrupt").unwrap();
             assert_eq!(read_with_shaders(&path, Some(&shaders)), portable.then(|| b"shipped".to_vec()));
+            // The asset was published to the store: the next read expands nothing.
+            assert_eq!(read_bounded(&path, u64::MAX), portable.then(|| b"shipped".to_vec()));
+            let _ = fs::remove_file(&path);
+            // A stream that expands to other bytes fails the entry's digest.
+            let mut other = Vec::new();
+            lzma_rs::xz_compress(&mut [0u8; 64].as_slice(), &mut other).unwrap();
+            fs::write(&shipped, &other).unwrap();
+            assert!(read_with_shaders(&path, Some(&shaders)).is_none());
             fs::write(&shipped, b"corrupt").unwrap();
             assert!(read_with_shaders(&path, Some(&shaders)).is_none());
         }
@@ -672,7 +783,7 @@ mod tests {
         let path = root.join("driver.entry");
         let payload = vec![7; 64 * 1024 * 1024 + 1];
         assert!(write_entry(&path, &payload).unwrap());
-        assert_eq!(read_pipeline(&path).unwrap(), payload);
+        assert_eq!(read_pipeline(&path).as_deref(), Some(payload.as_slice()));
         fs::remove_dir_all(root).unwrap();
     }
 
@@ -682,7 +793,7 @@ mod tests {
         let path = PathBuf::from(root).join("driver.entry");
         write_entry(&path, b"previous").unwrap();
         assert!(!write_entry(&path, &[0; 1024]).unwrap());
-        assert_eq!(read_pipeline(&path).unwrap(), b"previous");
+        assert_eq!(read_pipeline(&path).as_deref(), Some(&b"previous"[..]));
     }
 
     #[test]
@@ -746,6 +857,8 @@ mod tests {
         // Process exit during a background publication leaves only an ignored
         // reservation. The next writer recovers it under the store lock.
         fs::write(root.join("store.tmp"), b"partial background artifact").unwrap();
+        // So does a writer that ended between creating its temporary file and renaming it.
+        fs::write(root.join("store-1-2-3.tmp"), b"partial background artifact").unwrap();
         assert!(read(&path).is_none());
         write(&path, b"recomputed").unwrap();
         assert_eq!(read(&path).unwrap(), b"recomputed");

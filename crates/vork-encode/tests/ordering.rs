@@ -60,6 +60,7 @@ fn rejects_bad_sequences_and_finalizes_ordered_ring_entries() {
                 vork_encode::Time::integer(24),
                 EncodeSettings::default(),
                 root.join("odd.mp4"),
+                1,
                 3
             )
             .is_err()
@@ -79,7 +80,7 @@ fn rejects_bad_sequences_and_finalizes_ordered_ring_entries() {
             std::fs::read(&limits_path).unwrap(),
             b"keep existing output"
         );
-        assert!(prepared.open(device.clone(), queue.clone(), 3).is_err());
+        assert!(prepared.open(device.clone(), queue.clone(), 1, 3).is_err());
         assert_eq!(
             std::fs::read(&limits_path).unwrap(),
             b"keep existing output"
@@ -91,6 +92,7 @@ fn rejects_bad_sequences_and_finalizes_ordered_ring_entries() {
             vork_encode::Time::integer(24),
             EncodeSettings::default(),
             root.join("empty.mp4"),
+            1,
             3,
         )
         .unwrap();
@@ -102,6 +104,7 @@ fn rejects_bad_sequences_and_finalizes_ordered_ring_entries() {
             vork_encode::Time::integer(24),
             EncodeSettings::default(),
             root.join("missing.mp4"),
+            1,
             3,
         )
         .unwrap();
@@ -119,7 +122,7 @@ fn rejects_bad_sequences_and_finalizes_ordered_ring_entries() {
         .join()
         .unwrap()
         .unwrap();
-        let mut full = prepared.open(device.clone(), queue.clone(), 3).unwrap();
+        let mut full = prepared.open(device.clone(), queue.clone(), 33, 3).unwrap();
         #[cfg(target_os = "macos")]
         if extension == "mov"
             && matches!(backend, Backend::Auto)
@@ -155,6 +158,15 @@ fn rejects_bad_sequences_and_finalizes_ordered_ring_entries() {
         }
         assert!(full.push(0, texture(), &mut surfaces[0], &idle).is_err());
         let path = full.finish().unwrap();
+        #[cfg(unix)]
+        if matches!(backend, Backend::Readback) {
+            use std::os::unix::fs::PermissionsExt;
+            let ordinary = root.join("ordinary-output");
+            std::fs::write(&ordinary, b"normal file creation under this umask").unwrap();
+            assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                std::fs::metadata(ordinary).unwrap().permissions().mode() & 0o777,
+                "published movies must retain ordinary output permissions");
+        }
         assert!(full.finish().is_err());
         assert!(full.push(33, texture(), &mut surfaces[0], &idle).is_err());
         assert!(full.create_surface().is_err());
@@ -241,26 +253,15 @@ fn rejects_bad_sequences_and_finalizes_ordered_ring_entries() {
         backend: Backend::Readback,
     };
     let bad_path = root.join("missing-parent/failed.mov");
-    let mut failed =
-        Encoder::open(gpu(), 64, 32, vork_encode::Time::integer(24), EncodeSettings::default(), &bad_path, 3).unwrap();
-    // A short stream can queue all its pixels before ffmpeg rejects the destination.
-    let mut failed_surface = failed.create_surface().unwrap();
-    let source = texture();
-    let submission = copy(&failed_surface, &source);
-    let error = match failed.push(0, source, &mut failed_surface, &submission) {
+    // Staging validates the destination directory before streaming any frames.
+    let error = match Encoder::open(gpu(), 64, 32, vork_encode::Time::integer(24), EncodeSettings::default(), &bad_path, 1, 3) {
         Err(error) => error,
-        Ok(()) => failed.finish().unwrap_err(),
+        Ok(_) => panic!("missing output directory must refuse before streaming"),
     };
     let diagnosis = format!("{error:#}");
-    assert!(diagnosis.contains("ffmpeg failed"), "{diagnosis}");
-    assert!(
-        diagnosis.contains("failed.mov"),
-        "stderr missing from: {diagnosis}"
-    );
-    assert!(
-        diagnosis.contains("video encoding needs ffmpeg"),
-        "{diagnosis}"
-    );
+    assert!(diagnosis.contains("prepare video output"), "{diagnosis}");
+    assert!(diagnosis.contains("failed.mov"), "{diagnosis}");
+    assert!(!bad_path.exists());
     let hardware = DeviceInfo {
         device: device.clone(),
         queue: queue.clone(),
@@ -274,10 +275,30 @@ fn rejects_bad_sequences_and_finalizes_ordered_ring_entries() {
             vork_encode::Time::integer(24),
             EncodeSettings::default(),
             root.join("hardware.mov"),
+            1,
             3
         )
         .is_err()
     );
+    // Linux hardware H.264 follows the rendering adapter, and only NVIDIA has one: any other
+    // adapter's MP4 is software at its quality target, so explicit hardware readback refuses.
+    #[cfg(target_os = "linux")]
+    if adapter.get_info().vendor != 0x10de {
+        let error = Encoder::open(
+            DeviceInfo { device: device.clone(), queue: queue.clone(), backend: Backend::HardwareReadback },
+            64,
+            32,
+            vork_encode::Time::integer(24),
+            EncodeSettings::default(),
+            root.join("hardware.mp4"),
+            1,
+            3,
+        )
+        .err()
+        .expect("hardware readback needs an NVIDIA rendering adapter");
+        assert!(format!("{error:#}").contains("needs an NVIDIA rendering adapter"), "{error:#}");
+        assert!(!root.join("hardware.mp4").exists());
+    }
     std::fs::remove_dir_all(root).unwrap();
 }
 

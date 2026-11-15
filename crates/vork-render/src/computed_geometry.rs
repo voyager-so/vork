@@ -153,7 +153,7 @@ impl Mesh {
         let limit = u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
         ensure!(
             bytes <= limit && attributes <= limit,
-            "{}", crate::gpu_memory::limit_message("computed geometry", format_args!("{bytes} motion bytes and {attributes} attribute bytes"), format_args!("{limit} bytes per binding"), "reduce geometry density or point pool size")
+            crate::gpu_memory::device_limit("computed geometry", format_args!("{bytes} motion bytes and {attributes} attribute bytes"), format_args!("{limit} bytes per binding"), "reduce geometry density or point pool size")
         );
         let topology = draw
             .exit_geometry
@@ -253,9 +253,10 @@ impl Mesh {
                 base + i
             )?;
         }
+        let storage_limit=crate::pipelines::scalar_storage_limit(&r.device.limits(),r.adapter_info.backend==wgpu::Backend::Metal,0);
         ensure!(
-            base + 7 + usize::from(identities) + usize::from(historical_attributes) + usize::from(points) <= r.device.limits().max_storage_buffers_per_shader_stage as usize,
-            "{}", crate::gpu_memory::limit_message("computed geometry", format_args!("{} storage bindings",base+7+usize::from(identities)+usize::from(historical_attributes)+usize::from(points)), format_args!("{} storage bindings",r.device.limits().max_storage_buffers_per_shader_stage), "reduce geometry attribute buffer inputs")
+            base + 7 + usize::from(identities) + usize::from(historical_attributes) + usize::from(points) <= storage_limit as usize,
+            crate::gpu_memory::device_limit("computed geometry", format_args!("{} storage bindings",base+7+usize::from(identities)+usize::from(historical_attributes)+usize::from(points)), format_args!("{} storage bindings",storage_limit), "reduce geometry attribute buffer inputs")
         );
         code.push_str("fn ordered(v:f32)->u32 {let b=bitcast<u32>(v);return select(b^0x80000000u,~b,(b&0x80000000u)!=0u);}\n");
         let position = &g.attributes["POSITION"];
@@ -441,10 +442,10 @@ impl Mesh {
             }
         }
         let history_code = history_code.replace("historical_page_", "page_");
-        let history_module = r.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let history_module = crate::timing::shader_module(&r.device, wgpu::ShaderModuleDescriptor {
             label: Some("historical geometry gather"), source: wgpu::ShaderSource::Wgsl(history_code.into()),
         });
-        let module = r.device.create_shader_module(wgpu::ShaderModuleDescriptor {
+        let module = crate::timing::shader_module(&r.device, wgpu::ShaderModuleDescriptor {
             label: Some("typed geometry gather"),
             source: wgpu::ShaderSource::Wgsl(code.into()),
         });
@@ -930,10 +931,9 @@ mod tests {
         value
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn computed_mesh_and_live_points_match_authored_raster_and_rays() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let r = crate::test_renderer()?;
         let rays = r
             .device
             .features()
@@ -994,10 +994,9 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn simulation_geometry_holds_subframes_and_replays() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let r = crate::test_renderer()?;
         let mut value = scene(false);
         value["programs"]["move"]["schedule"] = json!("simulation");
         value["programs"]["initialize"] = value["programs"]["move"].clone();
@@ -1021,8 +1020,9 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn point_identities_preserve_motion_through_death_compaction_and_rebirth() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let mut value=scene(true);
         value["buffers"]["identity"]=json!({"type":"u32","data":[10,20,30]});
         value["geometry"]["g"]["ids"]=json!("identity");
@@ -1059,8 +1059,9 @@ void compute(ComputeContext ctx,Inputs inputs) {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn historical_columns_exclude_scratch_and_do_not_replay_previous_poses() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let mut value=scene(false);
         value["buffers"]["padding"]=json!({"type":"u32","dims":[65536,1,1]});
         value["programs"]["move"]["bindings"]["padding"]=json!("padding");
@@ -1094,10 +1095,9 @@ void compute(ComputeContext ctx,Inputs inputs) {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn shading_only_stream_updates_retain_acceleration_structures() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let r = crate::test_renderer()?;
         if !r
             .device
             .features()
@@ -1128,10 +1128,9 @@ void compute(ComputeContext ctx,Inputs inputs) {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn rejected_geometry_requires_reinstall_before_recovery() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let r = crate::test_renderer()?;
         let mut value = scene(true);
         let source = value["programs"]["move"]["source"]
             .as_str()
@@ -1171,8 +1170,9 @@ void compute(ComputeContext ctx,Inputs inputs) {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn solver_status_reports_authored_failure_without_nonfinite_geometry() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         for points in [false,true] {
             let mut value = scene(points);
             if points {value["buffers"]["live"]["data"]=json!([0]);}
@@ -1185,7 +1185,7 @@ void compute(ComputeContext ctx,Inputs inputs) {
             frame.submit(&s, &r, 0.)?; frame.collect(&r)?;
             for time in [0.5,0.75] {
                 let error = frame.submit(&s, &r, time).and_then(|()|frame.collect(&r).map(|_|())).unwrap_err();
-                if time==0.5 {ensure!(error.is::<crate::failure::FailureKind>(),"solver failure must remain a scene error");}
+                if time==0.5 {ensure!(crate::failure::exit_code(&error)==3,"solver failure must remain a scene error");}
                 let message = format!("{error:#}");
                 for part in ["cloth node shirt", "self-contact capacity 512", "513", "reduce collision_margin"] {
                     ensure!(message.contains(part), "{message}");
@@ -1200,10 +1200,9 @@ void compute(ComputeContext ctx,Inputs inputs) {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn point_overflow_and_bad_width_refuse_output() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let r = crate::test_renderer()?;
         for (source, message) in [
             ("if(i==0u) live_store(0u,4u);", "capacity"),
             ("if(i==0u) live_store(0u,0xffffffffu);", "capacity"),

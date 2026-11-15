@@ -229,9 +229,8 @@ fn scene_batch() -> Result<()> {
     }
     let jobs: Vec<Input> =
         serde_json::from_slice(&std::fs::read(std::env::var("VORK_ASTC_JOBS")?)?)?;
-    let rows: Vec<serde_json::Value> = serde_json::from_slice(&std::fs::read(std::env::var(
-        "VORK_ASTC_CORPUS_RESULTS",
-    )?)?)?;
+    let rows: Vec<serde_json::Value> =
+        serde_json::from_slice(&std::fs::read(std::env::var("VORK_ASTC_CORPUS_RESULTS")?)?)?;
     let mut measured = std::collections::HashMap::new();
     for row in rows {
         let im = image::open(row["path"].as_str().unwrap())?.to_rgba8();
@@ -302,6 +301,241 @@ fn scene_batch() -> Result<()> {
     eprintln!("{row}");
     if let Ok(output) = std::env::var("VORK_ASTC_RESULTS") {
         std::fs::write(output, serde_json::to_vec_pretty(&row)?)?;
+    }
+    Ok(())
+}
+
+/// Exercise endpoint parity with solid, correlated, and unrelated RGB values.
+/// A mixed image keeps opaque blocks next to nonconstant-alpha blocks.
+pub(crate) fn opacity_pixels(w: u32, h: u32, seed: u32, mixed: bool) -> Vec<u8> {
+    let mut state = seed + 1;
+    (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .flat_map(|(x, y)| {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            let v = ((x + y * 4) * 13 + seed * 29) as u8;
+            let rgb = match (x / 4 + y / 4 + seed) % 3 {
+                0 => [v, v.wrapping_add(16), v.wrapping_add(32)],
+                1 => [state as u8, (state >> 8) as u8, (state >> 16) as u8],
+                _ => [seed as u8 * 2, 180, 156],
+            };
+            [
+                rgb[0],
+                rgb[1],
+                rgb[2],
+                if mixed && x >= w / 2 { v } else { 255 },
+            ]
+        })
+        .collect()
+}
+
+pub(crate) fn assert_opaque_blocks(input: &[u8], w: u32, h: u32, data: &[u8], astc: bool) -> usize {
+    let mut checked = 0;
+    for by in 0..h.div_ceil(4) {
+        for bx in 0..w.div_ceil(4) {
+            let opaque = (0..4).all(|y| {
+                (0..4).all(|x| {
+                    input
+                        [(((by * 4 + y).min(h - 1) * w + (bx * 4 + x).min(w - 1)) * 4 + 3) as usize]
+                        == 255
+                })
+            });
+            if !opaque {
+                continue;
+            }
+            let at = ((by * w.div_ceil(4) + bx) * 16) as usize;
+            let mut decoded = [0; 16];
+            if astc {
+                texture2ddecoder::decode_astc_block(&data[at..at + 16], 4, 4, &mut decoded);
+            } else {
+                texture2ddecoder::decode_bc7_block(&data[at..at + 16], &mut decoded);
+            }
+            for (i, pixel) in decoded.into_iter().enumerate() {
+                assert_eq!(
+                    pixel >> 24,
+                    255,
+                    "astc={astc}, {w}x{h}, block=({bx},{by}), texel={i}, bytes={:02x?}",
+                    &data[at..at + 16]
+                );
+            }
+            checked += 1;
+        }
+    }
+    checked
+}
+
+#[test]
+fn opaque_alpha_native_codecs_and_mips() -> Result<()> {
+    let mut checked = 0;
+    for (w, h) in [(4u32, 4u32), (12, 28), (64, 32)] {
+        for seed in 0..8 {
+            for mixed in [false, true] {
+                let pixels = opacity_pixels(w, h, seed, mixed);
+                for srgb in [false, true] {
+                    // Basis generates its own filtered mip chain. Opaque images
+                    // must stay opaque throughout; mixed images check base blocks.
+                    for astc in [false, true] {
+                        let encoded = encode_basis(&pixels, w, h, srgb, astc, true)?;
+                        checked += assert_opaque_blocks(&pixels, w, h, &encoded, astc);
+                        if !mixed {
+                            let (mut mw, mut mh, mut offset) = (w, h, 0);
+                            loop {
+                                let length = (mw.div_ceil(4) * mh.div_ceil(4) * 16) as usize;
+                                checked += assert_opaque_blocks(
+                                    &[0, 0, 0, 255].repeat((mw * mh) as usize),
+                                    mw,
+                                    mh,
+                                    &encoded[offset..offset + length],
+                                    astc,
+                                );
+                                offset += length;
+                                if mw == 1 && mh == 1 {
+                                    break;
+                                }
+                                mw = (mw / 2).max(1);
+                                mh = (mh / 2).max(1);
+                            }
+                            assert_eq!(offset, encoded.len());
+                        }
+                    }
+                    #[cfg(target_arch = "x86_64")]
+                    {
+                        let encoded = native_bc7(&pixels, w, h, srgb);
+                        let mut offset = 0;
+                        visit_native_mips(&pixels, w, h, srgb, |input, pw, ph| {
+                            let length = (pw / 4 * (ph / 4) * 16) as usize;
+                            checked += assert_opaque_blocks(
+                                input,
+                                pw,
+                                ph,
+                                &encoded[offset..offset + length],
+                                false,
+                            );
+                            offset += length;
+                        });
+                        assert_eq!(offset, encoded.len());
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 1000);
+    eprintln!(
+        "exact alpha 255: {checked} opaque blocks, native BC7 and Basis BC7/ASTC, linear/sRGB and mips"
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+fn opaque_alpha_gpu_codecs_and_mips() -> Result<()> {
+    let r = crate::test_renderer()?;
+    let bc = r
+        .device
+        .features()
+        .contains(wgpu::Features::TEXTURE_COMPRESSION_BC);
+    if !bc {
+        return Ok(());
+    }
+    let ctx = crate::gpu_bc7::Context::new(&r)?;
+    let mut scratch = crate::gpu_bc7::Scratch::default();
+    let mut checked = 0;
+    for (w, h) in [(4u32, 4u32), (12, 28), (64, 32)] {
+        for seed in 0..8 {
+            for mixed in [false, true] {
+                let pixels = opacity_pixels(w, h, seed, mixed);
+                for srgb in [false, true] {
+                    let levels = 32 - w.max(h).leading_zeros();
+                    let bytes = (0..levels)
+                        .map(|m| (w >> m).max(1).div_ceil(4) * (h >> m).max(1).div_ceil(4) * 16)
+                        .sum::<u32>() as usize;
+                    let format = if srgb {
+                        wgpu::TextureFormat::Bc7RgbaUnormSrgb
+                    } else {
+                        wgpu::TextureFormat::Bc7RgbaUnorm
+                    };
+                    let tex = crate::gpu_bc7::texture(&r.device, w, h, levels, format);
+                    let (_, encoded) = scratch
+                        .submit(&ctx, tex, pixels.clone(), w, h, format, bytes, true)?
+                        .finish(&ctx, &mut scratch)?;
+                    checked += assert_opaque_blocks(&pixels, w, h, &encoded, false);
+                    // Power-of-two mips use the same texel-centre filter on CPU/GPU.
+                    #[cfg(target_arch = "x86_64")]
+                    if !mixed || w.is_power_of_two() && h.is_power_of_two() {
+                        let mut offset = 0;
+                        visit_native_mips(&pixels, w, h, srgb, |input, pw, ph| {
+                            let length = (pw / 4 * (ph / 4) * 16) as usize;
+                            checked += assert_opaque_blocks(
+                                input,
+                                pw,
+                                ph,
+                                &encoded[offset..offset + length],
+                                false,
+                            );
+                            offset += length;
+                        });
+                        assert_eq!(offset, encoded.len());
+                    }
+                }
+            }
+        }
+    }
+    assert!(checked > 1000);
+    eprintln!(
+        "exact alpha 255: {checked} opaque blocks, GPU BC7, linear/sRGB and mips; adapter={:?}",
+        r.adapter_info
+    );
+    Ok(())
+}
+
+#[test]
+#[ignore = "file reproduction; set VORK_TEXTURE_OPACITY_IMAGE and VORK_TEXTURE_OPACITY_OUT"]
+fn opaque_file_encoders() -> Result<()> {
+    let image = image::open(std::env::var("VORK_TEXTURE_OPACITY_IMAGE")?)?.to_rgba8();
+    ensure!(image.pixels().all(|p| p[3] == 255), "source must be opaque");
+    let out = std::path::PathBuf::from(std::env::var("VORK_TEXTURE_OPACITY_OUT")?);
+    std::fs::create_dir_all(&out)?;
+    let (w, h) = image.dimensions();
+    for srgb in [false, true] {
+        let mut encodings = vec![
+            (
+                "basis-bc7",
+                false,
+                encode_basis(&image, w, h, srgb, false, true)?,
+            ),
+            (
+                "basis-astc",
+                true,
+                encode_basis(&image, w, h, srgb, true, true)?,
+            ),
+        ];
+        #[cfg(target_arch = "x86_64")]
+        encodings.push(("native-bc7", false, native_bc7(&image, w, h, srgb)));
+        for (name, astc, encoded) in encodings {
+            let (mut mw, mut mh, mut offset) = (w, h, 0);
+            loop {
+                let length = (mw.div_ceil(4) * mh.div_ceil(4) * 16) as usize;
+                assert_opaque_blocks(
+                    &[0, 0, 0, 255].repeat((mw * mh) as usize),
+                    mw,
+                    mh,
+                    &encoded[offset..offset + length],
+                    astc,
+                );
+                offset += length;
+                if mw == 1 && mh == 1 {
+                    break;
+                }
+                mw = (mw / 2).max(1);
+                mh = (mh / 2).max(1);
+            }
+            assert_eq!(offset, encoded.len());
+            std::fs::write(out.join(format!("{name}-srgb-{srgb}.blocks")), &encoded)?;
+            eprintln!(
+                "{name} srgb={srgb}: exact alpha 255 in every mip; {} bytes",
+                encoded.len()
+            );
+        }
     }
     Ok(())
 }

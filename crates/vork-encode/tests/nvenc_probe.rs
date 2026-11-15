@@ -1,6 +1,10 @@
 //! A compiled-in encoder can still be incompatible with the installed driver.
 #![cfg(unix)]
-use std::{os::unix::fs::PermissionsExt, process::Command};
+#[cfg(unix)]
+#[path = "../../test_support.rs"]
+mod test_support;
+
+use std::process::Command;
 
 #[test]
 fn nvenc_probe_preserves_driver_diagnosis() {
@@ -15,8 +19,7 @@ fn nvenc_probe_preserves_driver_diagnosis() {
     let root = std::env::temp_dir().join(format!("vork-probe-{}", std::process::id()));
     std::fs::create_dir_all(&root).unwrap();
     let ffmpeg = root.join("ffmpeg");
-    std::fs::write(&ffmpeg, b"#!/bin/sh\nprintf '%s\\n' 'Driver does not support the required nvenc API version. Required: 13.0 Found: 12.2' >&2\nexit 1\n").unwrap();
-    std::fs::set_permissions(&ffmpeg, std::fs::Permissions::from_mode(0o755)).unwrap();
+    test_support::write_executable(&ffmpeg, b"#!/bin/sh\nprintf '%s\\n' 'Driver does not support the required nvenc API version. Required: 13.0 Found: 12.2' >&2\nexit 1\n").unwrap();
     let result = Command::new(std::env::current_exe().unwrap())
         .args(["--exact", "nvenc_probe_preserves_driver_diagnosis", "--nocapture"])
         .env(CHILD, "1").env("PATH", &root).output().unwrap();

@@ -529,10 +529,9 @@ impl Resources {
 
 #[cfg(test)]
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn single_instance_draws_follow_each_camera_view() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     // Distinct geometry keeps these as single-instance draws. Neither draw
     // may depend on an unrelated instanced group to enable camera rejection.
     let scene: Scene = serde_json::from_value(serde_json::json!({"version":2,
@@ -559,10 +558,9 @@ fn single_instance_draws_follow_each_camera_view() -> Result<()> {
 
 #[cfg(test)]
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn compaction_preserves_order_across_blocks_views_and_subsets() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     let count = vork_slang::registry::CAMERA_CULL_GROUP.pow(2) + 1;
     let matrices: Vec<_> = (0..count)
         .map(|i| {
@@ -760,10 +758,9 @@ fn compaction_preserves_order_across_blocks_views_and_subsets() -> Result<()> {
 
 #[cfg(test)]
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn remapped_first_visible_instance_rasterizes() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else {
-        return Ok(());
-    };
+    let r = crate::test_renderer()?;
     let scene: Scene = serde_json::from_value(
         serde_json::json!({"version":2,
         "nodes":[{"type":"camera"},

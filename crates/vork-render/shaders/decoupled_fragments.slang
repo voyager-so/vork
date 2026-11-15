@@ -12,10 +12,13 @@ import camera_ray;
 import implicit_camera;
 import hit;
 import variant;
+#ifdef VORK_SOFTWARE_RASTER
+import software_surface;
+#endif
 
-// Shared by table and authored visibility: globals/materials occupy slots 0..9.
+// Shared by table and authored visibility: globals/materials occupy slots 0..10.
 #ifdef VORK_METAL
-[[vk::binding(0,2)]] public RWStructuredBuffer<uint> fragments : register(u10);
+[[vk::binding(0,2)]] public RWStructuredBuffer<uint> fragments : register(u11);
 #else
 [[vk::binding(0,2)]] public RWStructuredBuffer<uint> fragments;
 #endif
@@ -44,7 +47,10 @@ public float field_depth(uint object,FieldHit hit) {
 public struct VisibilityOutput {public uint2 key:SV_Target0;public float depth:SV_Depth;};
 
 public void opaque_depth(uint sample,float4 position) {
-    if(fragments[2]==0u || frame.field_geometry.z==0u) return;
+    if(fragments[2]==0u) return;
+#ifndef VORK_SOFTWARE_RASTER
+    if(frame.field_geometry.z==0u) return;
+#endif
     let list=FragmentLayout(fragments[2],fragments[3],fragments[4]);
     InterlockedMax(fragments[list.depth(sample,uint2(position.xy),max(frame.sampling.w,1u))],~asuint(position.z));
 }
@@ -62,6 +68,9 @@ public VisibilityOutput masked_visibility<P:IProgram>(Varying v, bool front, uin
         opaque_depth(v.sample,point.v.position);
         return VisibilityOutput(visibility_key(v.object,~crossing),point.v.position.z);
     }
+#ifdef VORK_SOFTWARE_RASTER
+    v=software_visibility_surface(v.object,primitive,v.position,v.sample);
+#endif
     v.primitive=primitive;
     let c=visibility_coverage(v.sample,frame.sampling.w,frame.temporal.xy);
     if (P.coverage ? !program_covers<P>(v,front,c.x,c.y) : !masked_covers(v,front,c.x,c.y)) {discard;}

@@ -1,6 +1,6 @@
 //! Structural validation shared by file loading and programmatic authoring.
 use super::*;
-use anyhow::{Context, Result, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 impl BufferType {
     pub fn width(&self) -> usize {
@@ -15,9 +15,11 @@ impl BufferType {
 }
 impl Scene {
     pub(super) fn validate_resources(&self, nodes_by_name: &BTreeMap<&str, &Node>, require_camera:bool) -> Result<()> {
-        for (index,stage) in self.geometry_stages.iter().enumerate() {
+        let mut errors = Vec::new();
+        errors.extend(self.geometry_stages.iter().enumerate().map(|(index,stage)| -> Result<()> {
             ensure!(!self.geometry_stages[..index].contains(stage),"geometry_stages[{index}] repeats {}; remove the duplicate stage",stage.name());
-        }
+            Ok(())
+        }).filter_map(Result::err));
         let lookup = |name: &str| -> Result<&Buffer> {
             let buffer=self.buffers.get(name).with_context(|| {
                 diagnostics::unknown("buffer", name, self.buffers.keys().map(String::as_str))
@@ -25,7 +27,7 @@ impl Scene {
             ensure!(buffer.grid.is_none(), "grid buffer {name} cannot be used as numeric data");
             Ok(buffer)
         };
-        for (name, b) in &self.buffers {
+        errors.extend(self.buffers.iter().map(|(name,b)| -> Result<()> {
             if let Some(dims) = b.dims {
                 ensure!(dims.iter().all(|&n| n > 0), "buffer {name}: dims must be positive");
                 let count = dims.into_iter().try_fold(1u32, |n, d| n.checked_mul(d)).context("dense grid dimensions overflow")?;
@@ -79,8 +81,9 @@ impl Scene {
                     }
                 }
             }
-        }
-        for (name, p) in &self.programs {
+            Ok(())
+        }).filter_map(Result::err));
+        errors.extend(self.programs.iter().map(|(name,p)| -> Result<()> {
             ensure!(p.source_origin.is_none() || p.source.is_some(),"program {name}: source_origin requires inline source");
             ensure!(p.source_origin.as_ref().is_none_or(|origin|!origin.is_empty() && Path::new(origin).file_name().is_some()),"program {name}: source_origin must name a virtual source file");
             if p.is_compute() {
@@ -112,7 +115,9 @@ impl Scene {
                     "program {name}: compute bindings/dispatch require a schedule"
                 );
             }
-        }
+            Ok(())
+        }).filter_map(Result::err));
+        let result = (|| -> Result<()> {
         if let Some(sim) = &self.simulation {
             ensure!(sim.t0.as_f32().is_finite() && sim.dt.as_f64().is_finite() && sim.dt.as_f64() > 0. && sim.dt.as_f32().is_finite() && sim.dt.as_f32() > 0. && sim.t0.as_f32().is_finite(), "simulation: finite t0 and positive finite dt required");
             ensure!(!sim.state.is_empty() && !sim.init.is_empty() && !sim.steps.is_empty(), "simulation: state, init and steps must be nonempty");
@@ -135,6 +140,9 @@ impl Scene {
         } else {
             ensure!(self.programs.values().all(|p| p.schedule != Some(ComputeSchedule::Simulation)), "simulation programs require scene.simulation");
         }
+        Ok(())
+        })();
+        if let Err(error) = result {errors.push(error);}
         let computed: std::collections::BTreeSet<&str> = self
             .programs
             .values()
@@ -149,7 +157,7 @@ impl Scene {
             );
             Ok(())
         };
-        for geometry in self.geometry.values() {
+        errors.extend(self.geometry.values().map(|geometry| -> Result<()> {
             let dynamic = !matches!(geometry.topology, Topology::Volume | Topology::Implicit) && (geometry.attributes.values().chain(geometry.widths.iter()).chain(geometry.ids.iter()).any(|b| computed.contains(b.as_str())) || geometry.count.is_some() || geometry.status.is_some());
             if dynamic {
                 ensure!(matches!(geometry.topology, Topology::Triangles | Topology::Points), "computed geometry requires triangles or points");
@@ -189,9 +197,11 @@ impl Scene {
                     ensure!(lookup(buffer)?.grid.is_none(), "morph deltas cannot use grid buffers");
                 }
             }
-        }
+            Ok(())
+        }).filter_map(Result::err));
         let mut pending: Vec<&Node> = self.nodes.iter().collect();
         while let Some(node) = pending.pop() {
+            let result = (|| -> Result<()> {
             pending.extend(node.children.iter());
             if let NodeKind::Mesh {
                 instances, skin, ..
@@ -209,8 +219,11 @@ impl Scene {
                     }
                 }
             }
+            Ok(())
+            })();
+            if let Err(error) = result {errors.push(error);}
         }
-        for layer in &self.animation {
+        errors.extend(self.animation.iter().map(|layer| -> Result<()> {
             for track in layer.tracks.iter().flatten() {
                 if let Times::Buffer(buffer) = &track.times {
                     immutable(buffer, "track times")?;
@@ -221,13 +234,14 @@ impl Scene {
                     ensure!(lookup(buffer)?.grid.is_none(), "track values cannot use grid buffers");
                 }
             }
-        }
-        for (name, g) in &self.geometry {
+            Ok(())
+        }).filter_map(Result::err));
+        errors.extend(self.geometry.iter().map(|(name,g)| -> Result<()> {
             if matches!(g.topology, Topology::Implicit) {
                 ensure!(g.attributes.len()==1 && g.indices.is_none() && g.material_ranges.is_empty() && g.morphs.is_empty() && g.subdivision.is_none() && g.face_vertex_counts.is_none() && g.crease_edge.is_empty() && g.widths.is_none() && g.curve_vertex_counts.is_none(), "geometry {name}: implicit requires exactly one grid and no mesh modifiers");
                 let b=lookup(g.attributes.values().next().unwrap())?;
                 ensure!(b.element_type==BufferType::F32 && b.dims.is_some_and(|d|d.iter().all(|&v|v>=2)), "geometry {name}: implicit requires f32 dims >= 2");
-                continue;
+                return Ok(());
             }
             if matches!(g.topology, Topology::Volume) {
                 ensure!(!g.attributes.is_empty(), "geometry {name}: volume requires named grid fields");
@@ -239,7 +253,7 @@ impl Scene {
                 for buffer in g.attributes.values() {
                     ensure!(self.buffers.get(buffer).is_some_and(|b|b.is_volume_grid()), "geometry {name}: volume fields require grid buffers");
                 }
-                continue;
+                return Ok(());
             }
             for buffer in g.attributes.values().chain(g.indices.iter()) {
                 ensure!(lookup(buffer)?.grid.is_none() && lookup(buffer)?.dims.is_none(), "geometry {name}: grid buffers require volume topology");
@@ -389,33 +403,31 @@ impl Scene {
                     );
                 }
             }
-        }
+            Ok(())
+        }).filter_map(Result::err));
         // Camera materials must opt into a ray program before surface-input validation.
         let mut camera_nodes: Vec<_> = self.nodes.iter().collect();
+        let mut camera_materials = std::collections::BTreeSet::new();
         while let Some(node) = camera_nodes.pop() {
+            let result = (|| -> Result<()> {
             camera_nodes.extend(&node.children);
             if let NodeKind::Camera { material: Some(name), .. } = &node.kind {
+                camera_materials.insert(name.as_str());
                 if let Some(material) = self.materials.get(name) {
                     ensure!(material.program != "std/openpbr",
                         "camera {:?}: material {name} selects std/openpbr; camera materials require a camera program. Set program:\"std/camera\" beside inputs (e.g. lens), or omit camera.material for default optics. See `vork help cameras`", node.name);
                 }
             }
+            Ok(())
+            })();
+            if let Err(error) = result {errors.push(error);}
         }
-        // Report every misnamed OpenPBR input at once; authors guess several together.
-        diagnostics::joined(
-            self.materials
-                .iter()
-                .filter(|(_, m)| m.program == "std/openpbr")
-                .flat_map(|(name, m)| {
-                    m.inputs.keys().filter_map(move |key| {
-                        validate_openpbr_input(key)
-                            .err()
-                            .map(|e| anyhow::anyhow!("material {name}: {e:#}"))
-                    })
-                })
-                .collect(),
-        )?;
         for (name, m) in &self.materials {
+            if !self.programs.contains_key(&m.program)
+                && let Some(message) = crate::libraries::removed_module(&m.program) {
+                bail!("{message}");
+            }
+            let result = (|| -> Result<()> {
             if let Some(module) = crate::libraries::modules().find(|module| module.name == m.program) {
                 ensure!(module.material, "material {name}: {} is a library-only module, not a material program", m.program);
             }
@@ -429,8 +441,13 @@ impl Scene {
                     self.programs.keys().map(String::as_str).chain(crate::libraries::material_programs())
                 )
             );
+            Ok(())
+            })();
+            if let Err(error) = result { errors.push(anyhow::anyhow!("{error:#}; material {name}: choose a material program (vork help programs --all)")); }
             for (key, value) in &m.inputs {
-                if m.program == "std/openpbr" {
+                let result = (|| -> Result<()> {
+                // A rejected camera binding cannot interpret its inputs as a surface.
+                if m.program == "std/openpbr" && !camera_materials.contains(name.as_str()) {
                     let p =
                         validate_openpbr_input(key).with_context(|| format!("material {name}"))?;
                     validate_openpbr_value(p, value)
@@ -467,10 +484,17 @@ impl Scene {
                         )
                     );
                 }
+                Ok(())
+                })();
+                if let Err(error) = result {
+                    errors.push(error);
+                }
             }
         }
         fn nodes(scene: &Scene, list: &[Node]) -> Result<()> {
+            let mut errors = Vec::new();
             for n in list {
+                let result = (|| -> Result<()> {
                 let t = &n.transform;
                 ensure!(
                     t.translation
@@ -486,6 +510,7 @@ impl Scene {
                 if let Some(AimTarget::Point(point)) = &n.target {
                     ensure!(point.iter().all(|x|x.is_finite()), "node {:?}: target point must be finite",n.name);
                 }
+                scene.validate_node_time(n)?;
                 match &n.kind {
                     NodeKind::Mesh {
                         geometry,
@@ -761,16 +786,161 @@ impl Scene {
                     }
                     _ => {}
                 }
-                nodes(scene, &n.children)?;
+                Ok(())
+                })();
+                if let Err(error) = result {errors.push(error);}
+                if let Err(error) = nodes(scene, &n.children) {errors.push(error);}
             }
-            Ok(())
+            diagnostics::joined(errors)
         }
-        nodes(self, &self.nodes)?;
-        self.validate_targets(nodes_by_name)?;
-        self.validate_render_selection(&self.render, nodes_by_name,require_camera)
+        if let Err(error) = nodes(self, &self.nodes) {errors.push(error);}
+        if let Err(error) = self.validate_targets(nodes_by_name) {errors.push(error);}
+        // A canvas has no camera.
+        if let Err(error) = self.validate_render_selection(&self.main_render(), nodes_by_name,require_camera && !self.is_canvas()) {errors.push(error);}
+        diagnostics::joined(errors)
     }
 }
 impl Scene {
+    /// Rule 12 at open: `active` windows are ordered, `time` constants are in range,
+    /// and `loop` or a negative speed has an end to traverse (A7.4). The one
+    /// source's length is known only at install; several or none are refused here.
+    pub(super) fn validate_node_time(&self, node: &Node) -> Result<()> {
+        if matches!(
+            &node.kind,
+            NodeKind::Mesh {
+                instances: Some(_),
+                ..
+            }
+        ) {
+            ensure!(
+                self.audio_sources(node).is_empty(),
+                "node {:?}: instanced sound is not built yet",
+                node.name
+            );
+        }
+        if let Some(audio) = &node.audio {
+            ensure!(
+                audio.gain.is_finite(),
+                "node {:?}: audio.gain must be finite",
+                node.name
+            );
+            ensure!(
+                audio.file.as_ref().is_none_or(|f| !f.is_empty()),
+                "node {:?}: audio.file must not be empty",
+                node.name
+            );
+        }
+        if let Some((a, b)) = node.active.window() {
+            let Active::Window([start, end]) = &node.active else { unreachable!() };
+            ensure!(start.as_f64().is_finite() && end.as_f64().is_finite() && a < b, "node {:?}: active: [start, end) needs start < end", node.name);
+        }
+        if let Some(time) = &node.time {
+            if let Some(line) = time.refusal() { anyhow::bail!("node {:?}: {line}", node.name); }
+            if (time.looping || time.reverse()) && time.duration.is_none() {
+                let sources = self.media_sources(node);
+                ensure!(sources.len() + self.audio_sources(node).len() == 1, "node {:?}: time: {} write time.duration", node.name,
+                    if sources.is_empty() { "loop and speed < 0 need an end;" } else { "several sources have no one length;" });
+            }
+        }
+        Ok(())
+    }
+    /// Unique sound files in a subtree, for the node clock's default span.
+    pub fn audio_sources(&self, node: &Node) -> std::collections::BTreeSet<String> {
+        fn visit(node: &Node, out: &mut std::collections::BTreeSet<String>) {
+            if let Some(file) = node.audio.as_ref().and_then(|a| a.file.as_ref()) {
+                out.insert(file.clone());
+            }
+            for child in &node.children {
+                visit(child, out);
+            }
+        }
+        let mut out = std::collections::BTreeSet::new();
+        visit(node, &mut out);
+        out
+    }
+    /// Movie and frame-sequence images sampled by materials or paints of `node` and its subtree.
+    pub fn media_sources(&self, node: &Node) -> std::collections::BTreeSet<String> {
+        let mut out = std::collections::BTreeSet::new();
+        fn visit(scene: &Scene, node: &Node, out: &mut std::collections::BTreeSet<String>) {
+            out.extend(scene.node_media(node));
+            for child in &node.children { visit(scene, child, out); }
+        }
+        visit(self, node, &mut out);
+        out
+    }
+    /// The movies and frame sequences `node` itself shows through its materials: a mesh's, an
+    /// asset's overrides, a camera's, an environment light's radiance and medium, or a path's paints (rule 7).
+    pub fn node_media(&self, node: &Node) -> Vec<String> {
+        let materials: Vec<&String> = match &node.kind {
+            NodeKind::Mesh { materials, .. } => materials.iter().collect(),
+            NodeKind::Asset { materials, .. } => materials.values().collect(),
+            NodeKind::Camera { material, .. } => material.iter().collect(),
+            NodeKind::Light { material, medium, .. } => material.iter().chain(medium).collect(),
+            _ => Vec::new(),
+        };
+        let mut out = Vec::new();
+        let paints: Vec<&Paint> = match &node.kind {
+            NodeKind::Path { fill, stroke, .. } => vec![fill, stroke],
+            NodeKind::Text { fill, stroke, content, .. } => {
+                let mut paints = vec![fill, stroke];
+                if let Content::Runs(runs) = content {
+                    paints.extend(runs.iter().flat_map(|run| run.fill.iter().chain(&run.stroke)));
+                }
+                paints
+            }
+            _ => Vec::new(),
+        };
+        for paint in paints {
+            if let Paint::Image(binding) = paint {
+                if self.images.get(&binding.image).and_then(|image| image.file.as_deref()).is_some_and(is_media_file) && !out.contains(&binding.image) {
+                    out.push(binding.image.clone());
+                }
+            }
+        }
+        if matches!(node.kind, NodeKind::Path { .. } | NodeKind::Text { .. })
+            && self.images.values().any(|image| image.file.as_deref().is_some_and(is_media_file)) {
+            for name in self.keyed_images(node) {
+                if self.images.get(&name).and_then(|image| image.file.as_deref()).is_some_and(is_media_file) && !out.contains(&name) {
+                    out.push(name);
+                }
+            }
+        }
+        for material in materials.into_iter().filter_map(|name| self.materials.get(name)) {
+            for input in material.inputs.values() {
+                if let Input::Texture(binding) = input {
+                    if self.images.get(&binding.image).and_then(|image| image.file.as_deref()).is_some_and(is_media_file) && !out.contains(&binding.image) {
+                        out.push(binding.image.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+    /// One image under two clocks: a movie shown under a node clock is not also read on scene
+    /// time by a compositor, the scene's or a render image's.
+    pub(super) fn validate_media_clocks(&self) -> Result<()> {
+        let mut readers = BTreeMap::new();
+        for image in self.compositor_image_reads(self.compositor()) { readers.entry(image).or_insert_with(|| "composition.compositor".to_string()); }
+        for (name, source) in &self.images {
+            for image in source.render.iter().flat_map(|_| self.compositor_image_reads(source.compositor())) {
+                readers.entry(image).or_insert_with(|| format!("images.{name}.composition.compositor"));
+            }
+        }
+        fn visit(scene: &Scene, nodes: &[Node], clock: Option<&str>, readers: &BTreeMap<String, String>) -> Result<()> {
+            for node in nodes {
+                let clock = if node.has_clock() { Some(node.name.as_str()) } else { clock };
+                if let Some(owner) = clock {
+                    if let Some((image, reader)) = scene.node_media(node).into_iter().find_map(|image| readers.get(&image).map(|reader| (image, reader))) {
+                        anyhow::bail!("image {image:?} is shown under node {owner:?}'s clock and read by {reader} on scene time; give the compositor its own image");
+                    }
+                }
+                visit(scene, &node.children, clock, readers)?;
+            }
+            Ok(())
+        }
+        if readers.is_empty() { return Ok(()); }
+        visit(self, &self.nodes, None, &readers)
+    }
     pub(super) fn validate_render(&self, r: &Render, nodes: &BTreeMap<&str, &Node>) -> Result<()> {
         self.validate_render_selection(r,nodes,true)
     }
@@ -819,26 +989,23 @@ impl Scene {
             ensure!(m.shutter.is_finite() && m.shutter >= 0., "render.motion_blur.shutter must be nonnegative frames");
 
         }
-        let display = match &r.display {
-            NameOr::Name(name) => self.materials.get(name).with_context(|| format!("render.display: unknown material {name}"))?,
-            NameOr::Inline(display) => display,
-        };
+        let (_, display) = self.view_material()?;
         ensure!(self.programs.contains_key(&display.program) || crate::libraries::material_programs().any(|name| name == display.program),
-            "render.display: {}", diagnostics::unknown("program", &display.program,
+            "composition.view: {}", diagnostics::unknown("program", &display.program,
                 self.programs.keys().map(String::as_str).chain(crate::libraries::material_programs())));
         let mut earlier = std::collections::BTreeSet::new();
         for (index, entry) in r.compositor.iter().enumerate() {
             let name = entry.material();
-            let material = self.materials.get(name).with_context(|| format!("render.compositor[{index}]: unknown material {name}"))?;
+            let material = self.materials.get(name).with_context(|| format!("composition.compositor[{index}]: unknown material {name}"))?;
             entry.extent(r.resolution)?;
 
             for input in material.inputs.values() {
-                if let Input::Node(binding) = input {
-                    ensure!(earlier.contains(binding.node.as_str()), "render.compositor[{index}]: node {} must name an earlier entry", binding.node);
+                if let Input::Step(binding) = input {
+                    ensure!(earlier.contains(binding.step.as_str()), "composition.compositor[{index}]: step {} must name an earlier entry", binding.step);
                 }
             }
             if let Some(name) = entry.name() {
-                ensure!(!name.is_empty() && earlier.insert(name), "render.compositor[{index}]: empty or duplicate node name {name}");
+                ensure!(!name.is_empty() && earlier.insert(name), "composition.compositor[{index}]: empty or duplicate step name {name}");
             }
         }
         if let Background::Color(c) = &r.background {
@@ -875,6 +1042,12 @@ pub(super) fn validate_camera(name: &str, nodes: &BTreeMap<&str, &Node>) -> Resu
 }
 /// The OpenPBR parameter a std/openpbr input or track names.
 pub fn validate_openpbr_input(name: &str) -> Result<&'static OpenPbrParam> {
+    if name == "base_diffuse_roughness" {
+        bail!("base_diffuse_roughness is not supported; remove base_diffuse_roughness.");
+    }
+    if matches!(name, "transmission_scatter" | "transmission_scatter_anisotropy") {
+        bail!("{name} is not supported; remove {name} and use a volume material.");
+    }
     let p = OpenPbrParam::find(name).with_context(|| match principled_spelling(name) {
         Some(meant) => format!(
             "unknown OpenPBR parameter {name:?}; did you mean {meant:?}? (Principled and glTF names are not inputs)"
@@ -1007,6 +1180,19 @@ fn validate_openpbr_value(p: &OpenPbrParam, value: &Input) -> std::result::Resul
 mod hemisphere_tests {
     use super::*;
 
+    #[test]
+    fn diffuse_roughness_stays_refused_until_its_brdf_is_implemented() {
+        let error=validate_openpbr_input("base_diffuse_roughness").err().expect("unshaded diffuse roughness accepted").to_string();
+        assert_eq!(error,"base_diffuse_roughness is not supported; remove base_diffuse_roughness.");
+    }
+
+    #[test]
+    fn transmission_scattering_names_are_refused_without_spelling_suggestions() {
+        for name in ["transmission_scatter", "transmission_scatter_anisotropy"] {
+            let error=validate_openpbr_input(name).err().expect("unshaded scattering parameter accepted").to_string();
+            assert_eq!(error,format!("{name} is not supported; remove {name} and use a volume material."));
+        }
+    }
 
     #[test]
     fn supported_openpbr_descriptors_accept_documented_bindings() {
@@ -1185,7 +1371,7 @@ mod hemisphere_tests {
     fn display_is_a_material_and_legacy_tracks_are_rejected() {
         let input = serde_json::json!({"version":2,"nodes":[{"type":"camera"}],
             "materials":{"grade":{"program":"std/agx","inputs":{"exposure":0}}},
-            "render":{"display":"grade"},
+            "composition":{"space":"3d","view":"grade"},
             "animation":[{"tracks":[{"path":["materials","grade","inputs","exposure"],"keys":[[0,0],[1,2]]}]}]});
         let scene: Scene = crate::v2::from_test_value(input.clone()).unwrap();
         scene.validate().unwrap();
@@ -1208,11 +1394,24 @@ mod hemisphere_tests {
         assert!(input.validate().unwrap_err().to_string().contains("target point must be finite"));
     }
     #[test]
-    fn compatibility_library_programs_keep_loading() {
-        for name in ["std/bloom","post/white_balance"] {
+    fn authored_programs_can_use_retired_dotted_names() {
+        for name in ["std.particles", "post.white_balance"] {
+            let input = serde_json::json!({"version":2,"nodes":[{"type":"camera"}],
+                "programs":{name:{"source":"import vork; struct Inputs {}; import std.view; ViewResult view(ViewContext c, Inputs i) { return finish_view(float3(1, 0, 0),c,1.); }"}},
+                "composition":{"space":"3d","view":{"program":name}}});
+            Scene::from_json(input.to_string().as_bytes()).unwrap().validate().unwrap();
+        }
+    }
+
+    #[test]
+    fn removed_library_programs_refuse_with_replacement() {
+        for (name, replacement) in [("post/white_balance", "std.white_balance"), ("post.white_balance", "std.white_balance"),
+            ("std/particles", "fluid.particles"), ("std.particles", "fluid.particles")] {
             let scene:Scene=crate::v2::from_test_value(serde_json::json!({"version":2,
                 "nodes":[{"type":"camera"}],"materials":{"unused":{"program":name}}})).unwrap();
-            scene.validate().unwrap();
+            let error = scene.validate().unwrap_err().to_string();
+            assert_eq!(error.lines().count(), 1, "{error}");
+            assert!(error.contains(replacement) && error.contains("vork help upgrade"), "{error}");
         }
     }
 
@@ -1223,6 +1422,18 @@ mod hemisphere_tests {
                 "nodes":[{"type":"camera"}],"materials":{"test":{"program":module.name}}})).unwrap();
             let error = input.validate().unwrap_err().to_string();
             assert!(error.contains("library-only module"), "{}: {error}", module.name);
+        }
+    }
+
+    #[test]
+    fn independent_buffer_and_material_errors_are_reported_together() {
+        let scene: Scene = crate::v2::from_test_value(serde_json::json!({"version":2,
+            "nodes":[{"type":"camera"}],
+            "buffers":{"empty":{"type":"f32","data":[]},"unaligned":{"type":"f32","data":[1],"offset":2}},
+            "materials":{"first":{"program":"unknown-first"},"second":{"program":"std/color"}}})).unwrap();
+        let error = scene.validate().unwrap_err().to_string();
+        for name in ["buffer empty", "buffer unaligned", "unknown-first", "library-only module"] {
+            assert!(error.contains(name), "{error}");
         }
     }
 
@@ -1328,6 +1539,26 @@ mod group_alignment_tests {
             .validate()
             .unwrap_err();
         assert!(error.to_string().contains("triangle-aligned"));
+        Ok(())
+    }
+    #[test]
+    fn a_clocked_movie_read_by_a_compositor_is_refused() -> Result<()> {
+        // Named follow-up "one image under two clocks": the compositor reads scene time.
+        let scene = |time: serde_json::Value, read: &str| -> Result<Scene> {
+            Ok(crate::v2::from_test_value(serde_json::json!({"version":2,
+                "nodes":[{"type":"camera","name":"cam","material":{"program":"std/camera","inputs":{"projection":"persp"}}},
+                    {"name":"plate","time":time,"children":[{"name":"screen","type":"mesh","geometry":"g","materials":["screen"]}]}],
+                "buffers":{"p":{"type":"vec3","data":[[0,0,0],[1,0,0],[0,1,0]]}},
+                "geometry":{"g":{"attributes":{"POSITION":"p"}}},
+                "images":{"ramp":{"file":"ramp.mp4"},"ramp_scene":{"file":"ramp.mp4"}},
+                "programs":{"overlay":{"source":"import vork; struct Inputs {Image plate;}; float4 composite(CompositeContext c, Inputs i) {return compositor_sample(i.plate,c.uv);}"}},
+                "materials":{"screen":{"inputs":{"base_color":{"image":"ramp"}}},"comp":{"program":"overlay","inputs":{"plate":{"image":read}}}},
+                "composition":{"space":"3d","compositor":["comp"]},"render":{}}))?)
+        };
+        let error = scene(serde_json::json!({"offset":1}), "ramp")?.validate().unwrap_err();
+        assert_eq!(format!("{error:#}"), "image \"ramp\" is shown under node \"plate\"'s clock and read by composition.compositor on scene time; give the compositor its own image");
+        scene(serde_json::json!({"offset":1}), "ramp_scene")?.validate()?;
+        scene(serde_json::Value::Null, "ramp")?.validate()?;
         Ok(())
     }
 }

@@ -19,6 +19,7 @@ struct Request {
     internal_media: bool,
     resolution: Option<[u32; 2]>,
     preview: Option<PathBuf>,
+    linear_rgba_output: Option<PathBuf>,
     #[serde(default = "default_at")]
     at: f32,
     reference_bounces: Option<u32>,
@@ -67,7 +68,7 @@ fn render(
         .reference_key
         .as_ref()
         .map(|key| store.path("profile-reference", 1, blake3::hash(key.as_bytes())));
-    if !request.refresh_reference
+    if !request.refresh_reference && request.linear_rgba_output.is_none()
         && let Some(reference) = cache_path
             .as_ref()
             .and_then(|path| vork_render::disk_cache::read(path))
@@ -157,6 +158,9 @@ fn render(
         pixels.iter().flatten().all(|v| v.is_finite()),
         "nonfinite frame"
     );
+    if let Some(path) = &request.linear_rgba_output {
+        std::fs::write(path, bytemuck::cast_slice(&pixels))?;
+    }
     let layer = Layer::new(
         (width as usize, height as usize),
         LayerAttributes::default(),

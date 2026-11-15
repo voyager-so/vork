@@ -144,7 +144,7 @@ def build(media):
         laptop=dict(inputs=dict(base_color=[.38,.40,.42],specular_roughness=.32,specular_weight=.5)),
         skin=dict(program='skin',inputs=dict(person=dict(image='person'))),
         combine=dict(program='combine',inputs=dict(plate=dict(image='plate'),
-            catcher=dict(node='ratio_v'),cg=dict(node='cg'),hand=dict(image='hand'))),
+            catcher=dict(step='ratio_v'),cg=dict(step='cg'),hand=dict(image='hand'))),
     )
     nodes.extend([
         dict(type='camera',name='camera',translation=camera.tolist(),rotation=solve[0]['rotation'],material='camera_optics'),
@@ -161,9 +161,9 @@ def build(media):
     tracks.append(dict(path=['materials','core','inputs','emission_luminance'],keys=pulse))
     tracks.append(dict(path=['materials','aperture','inputs','emission_luminance'],
                        keys=[[t,v*80/18] for t,v in pulse]))
-    scene=dict(version=2,render=dict(resolution=[1920,1080],fps=25,duration=8,
-                background='transparent',display=dict(program='std/standard',inputs=dict(dither_intensity=0)),
-                motion_blur=dict(shutter=0.),compositor=['combine']),
+    scene=dict(version=2,composition=dict(space='3d',view=dict(program='std/standard'),compositor=['combine']),render=dict(resolution=[1920,1080],fps=25,duration=8,
+                background='transparent',
+                motion_blur=dict(shutter=0.)),
         images=dict(plate=dict(file='plate.mp4'),person=dict(file='person.mkv',color_space='Non-Color'),hand=dict(file='hand.mkv',color_space='Non-Color'),room=dict(file='room.hdr')),
         programs=dict(combine=dict(file='combine.slang'),skin=dict(file='skin.slang')),materials=materials,
         buffers=buffers,geometry=geometry,nodes=nodes,animation=[dict(name='shot',tracks=tracks)])
@@ -171,12 +171,12 @@ def build(media):
     scene['programs'].update(halo=dict(file='halo.slang'),finish=dict(file='finish.slang'),ratio=dict(file='ratio.slang'),capture=dict(file='capture.slang'))
     materials['capture']=dict(program='capture')
     materials.update(ratio_h=dict(program='ratio',inputs=dict(source=dict(channel='shadow_catcher'),plate=dict(image='plate'),person=dict(image='person'),direction=[1,0])),
-                     ratio_v=dict(program='ratio',inputs=dict(source=dict(node='ratio_h'),plate=dict(image='plate'),person=dict(image='person'),direction=[0,1])))
-    materials.update(halo=dict(program='halo',inputs=dict(beauty=dict(node='beauty'),plate=dict(image='plate'))),
-                     finish=dict(program='finish',inputs=dict(beauty=dict(node='beauty'),halo=dict(node='halo'),
+                     ratio_v=dict(program='ratio',inputs=dict(source=dict(step='ratio_h'),plate=dict(image='plate'),person=dict(image='person'),direction=[0,1])))
+    materials.update(halo=dict(program='halo',inputs=dict(beauty=dict(step='beauty'),plate=dict(image='plate'))),
+                     finish=dict(program='finish',inputs=dict(beauty=dict(step='beauty'),halo=dict(step='halo'),
                         plate=dict(image='plate'),artifact_uv=reveal_center[0][1],reveal=1.)))
     tracks.append(dict(path=['materials','finish','inputs','artifact_uv'],keys=reveal_center))
-    scene['render']['compositor']=[dict(name='cg',material='capture'),dict(name='ratio_h',material='ratio_h',resolution=.5),dict(name='ratio_v',material='ratio_v',resolution=.5),
+    scene.setdefault('composition', {'space': '3d'})['compositor'] = [dict(name='cg',material='capture'),dict(name='ratio_h',material='ratio_h',resolution=.5),dict(name='ratio_v',material='ratio_v',resolution=.5),
                                    dict(name='beauty',material='combine'),dict(name='halo',material='halo',resolution=.25),
                                    dict(material='finish')]
     (media/'geometry.bin').write_bytes(b''.join(chunks))

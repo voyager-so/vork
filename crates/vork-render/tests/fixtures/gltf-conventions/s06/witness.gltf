@@ -1,0 +1,61 @@
+{
+  "asset": {
+    "version": "2.0",
+    "copyright": "SPDX-License-Identifier: Apache-2.0"
+  },
+  "buffers": [
+    {
+      "uri": "data:application/octet-stream;base64,mpmZv5qZGb8AAAAAzczMvZqZGb8AAAAAZmYmv5qZGT8AAAAAzczMPZqZGb8AAAAAZmYmP5qZGT8AAAAAmpmZP5qZGb8AAAAA",
+      "byteLength": 72
+    }
+  ],
+  "bufferViews": [
+    {
+      "buffer": 0,
+      "byteOffset": 0,
+      "byteLength": 72
+    }
+  ],
+  "accessors": [
+    {
+      "bufferView": 0,
+      "componentType": 5126,
+      "count": 6,
+      "type": "VEC3",
+      "min": [
+        -1.2,
+        -0.6,
+        0
+      ],
+      "max": [
+        1.2,
+        0.6,
+        0
+      ]
+    }
+  ],
+  "meshes": [
+    {
+      "primitives": [
+        {
+          "attributes": {
+            "POSITION": 0
+          }
+        }
+      ]
+    }
+  ],
+  "nodes": [
+    {
+      "mesh": 0
+    }
+  ],
+  "scenes": [
+    {
+      "nodes": [
+        0
+      ]
+    }
+  ],
+  "scene": 0
+}

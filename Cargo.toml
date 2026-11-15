@@ -1,10 +1,10 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
-exclude = ["vendor/wgpu", "vendor/wgpu-core", "vendor/wgpu-hal", "vendor/wgpu-types", "vendor/basisu_c_sys", "vendor/exr"]
+exclude = ["vendor/wgpu", "vendor/wgpu-core", "vendor/wgpu-hal", "vendor/wgpu-types", "vendor/basisu_c_sys", "vendor/exr", "vendor/harfrust", "vendor/flo_curves"]
 
 [workspace.package]
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 license = "LicenseRef-vork-Preview"
 publish = false
@@ -31,5 +31,12 @@ wgpu-types = { path = "vendor/wgpu-types" }
 # Bound DWA chunk section sizes before allocating; see vendor/exr/PROVENANCE.md.
 exr = { path = "vendor/exr" }
 
+# flo_curves 0.8.1 with collision sorts that cannot panic, as Moda builds moda-scene; see vendor/flo_curves/MODA-PATCH.md.
+flo_curves = { path = "vendor/flo_curves" }
+
 # Skip discarded Basis statistics and transcode hints for ASTC preparation.
 basisu_c_sys = { path = "vendor/basisu_c_sys" }
+
+# Moda's patch: one `would_apply` fix for Indic below-base forms in the shaper Moda's degraded text tier
+# (cosmic-text) uses; see vendor/harfrust/MODA-PATCH.md.
+harfrust = { path = "vendor/harfrust" }

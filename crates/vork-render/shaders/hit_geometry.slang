@@ -53,7 +53,7 @@ public struct HitCorner {
 public struct HitTriangle { public HitCorner c[3]; public float3 face; public uint object; public uint primitive_offset; public float3x3 normal_matrix; };
 float hit_float<G:IHitGeometry>(G g,uint buffer, uint i) {return asfloat(g.load(buffer,i));}
 public float3 hit_vec3<G:IHitGeometry>(G g,uint buffer, uint i) {return float3(hit_float<G>(g,buffer,i),hit_float<G>(g,buffer,i+1u),hit_float<G>(g,buffer,i+2u));}
-float4 hit_vec4<G:IHitGeometry>(G g,uint buffer, uint i) {return float4(hit_vec3<G>(g,buffer,i),hit_float<G>(g,buffer,i+3u));}
+public float4 hit_vec4<G:IHitGeometry>(G g,uint buffer, uint i) {return float4(hit_vec3<G>(g,buffer,i),hit_float<G>(g,buffer,i+3u));}
 // An optional attribute: 0xff offsets read the raster default stream's value.
 float2 hit_attribute2<G:IHitGeometry>(G g,uint buffer, uint vertex, uint offset) {
     return offset==0xffu ? float2(0.) : float2(hit_float<G>(g,buffer,vertex+offset),hit_float<G>(g,buffer,vertex+offset+1u));
@@ -161,7 +161,11 @@ public Varying hit_varying(HitTriangle t, float3 b) {
     o.attr7=t.c[0].attributes[7]*b.x+t.c[1].attributes[7]*b.y+t.c[2].attributes[7]*b.z;
 #endif
 #if VORK_ATTRIBUTES > 8
+#ifdef VORK_STAGE_SCALARS
+    [unroll] for(uint i=8u;i<VORK_ATTRIBUTES;i++) set_attribute_extra(o,i-8u,t.c[0].attributes[i]*b.x+t.c[1].attributes[i]*b.y+t.c[2].attributes[i]*b.z);
+#else
     [unroll] for(uint i=8u;i<VORK_ATTRIBUTES;i++) o.attr_extra[i-8u]=t.c[0].attributes[i]*b.x+t.c[1].attributes[i]*b.y+t.c[2].attributes[i]*b.z;
+#endif
 #endif
     return o;
 }

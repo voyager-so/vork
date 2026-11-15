@@ -329,6 +329,15 @@ pub const MAX_MIP_LEVELS: u32 = 16;
 /// Size of a single occlusion/timestamp query, when copied into a buffer, in bytes.
 /// cbindgen:ignore
 pub const QUERY_SIZE: wgt::BufferAddress = 8;
+/// The most native command buffers a queue keeps pending (submitted and not yet finished) before a submission waits
+/// for the oldest of them. One budget for the backends that enforce it (Vulkan, Metal).
+///
+/// Vulkan: established by the L4/gVisor deep-backlog reproducer (`vulkan::native_backlog`). Metal: every pending
+/// command buffer holds driver command storage (a 49 KB `MTLResourceList` and its backing) that the device's pool
+/// keeps at its high-water mark; a clip of 1,410 command buffers a frame whose host work outran the GPU ran three
+/// frames of them pending and held about 370 MiB more than the same clip under one frame's worth.
+#[allow(dead_code)]
+pub(crate) const MAX_PENDING_NATIVE_BUFFERS: usize = 128;
 
 pub type Label<'a> = Option<&'a str>;
 pub type MemoryRange = Range<wgt::BufferAddress>;
@@ -2837,7 +2846,8 @@ pub struct AccelerationStructureBarrier {
 }
 
 /// Backend-owned descriptor layout. Native references/options come from
-/// `tlas_instance_to_bytes`; producers only replace transform, custom index and mask.
+/// `tlas_instance_to_bytes`; producers replace transforms, identity, masks and the
+/// explicitly described triangle traversal option bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct TlasInstanceLayout {
     pub stride: u32,
@@ -2845,6 +2855,10 @@ pub struct TlasInstanceLayout {
     pub custom_index: u32,
     pub mask: u32,
     pub mask_shift: u32,
+    /// Word containing triangle traversal options; native references stay immutable.
+    pub triangle_flags: u32,
+    pub disable_triangle_culling: u32,
+    pub force_non_opaque: u32,
 }
 
 #[derive(Debug, Copy, Clone)]

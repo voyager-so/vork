@@ -50,6 +50,7 @@ pub(crate) enum Pass {
     SubsurfaceCompose,
     TransparentControls,
     Controls,
+    PathEnvironment,
     Path,
     Reflections,
     Ao,
@@ -66,6 +67,7 @@ impl Pass {
         matches!(
             self,
             Pass::SubsurfaceDiffuse | Pass::Controls
+                | Pass::PathEnvironment
                 | Pass::Path
                 | Pass::Reflections
                 | Pass::Ao
@@ -304,10 +306,17 @@ fn declare(b: &mut Builder, plan: &crate::plan::ScenePlan) {
         .run(Run::Color)
         .reads(&["visibility slots", "cluster light lists", "ray structures", "light probe volume", "refraction pyramid", "refraction receivers", "HDR resolved", "AOV resolved"])
         .writes(&["refraction pyramid", "HDR resolved", "AOV resolved", "reflection records", "reflection guides"]);
+    b.pass(PathEnvironment)
+        .when(e.path)
+        .run(if e.implicit {Run::Always} else {Run::Color})
+        .reads(&["render images", "path adaptive moments"])
+        // Each active sample's camera environment, left in its output pixel for
+        // transport to read and replace.
+        .writes(&["HDR resolved"]);
     b.pass(Path)
         .when(e.path)
         .run(if e.implicit {Run::Always} else {Run::Color})
-        .reads(&["ray structures", "mesh source areas", "render images", "path adaptive moments", "denoising guides"])
+        .reads(&["ray structures", "mesh source areas", "render images", "path adaptive moments", "denoising guides", "HDR resolved"])
         .writes(if e.implicit {&["HDR resolved", "path adaptive moments", "AOV resolved", "denoising guides", "catcher radiance sums", "packed PNG pixels", "resolved depth", "resolved normals", "resolved IDs"]} else {&["HDR resolved", "path adaptive moments", "AOV resolved", "denoising guides", "catcher radiance sums", "packed PNG pixels"]});
     b.pass(AovResolve).when(plan.aovs).run(Run::Color).reads(&["AOV resolved"]).writes(&["packed PNG pixels"]);
     b.pass(Reflections)
@@ -482,7 +491,8 @@ impl Graph {
                     },
                     Pass::Controls => d.enabled &= plan.effects.standalone_controls(Some(outputs)),
                     Pass::Shade => d.enabled &= outputs.beauty || outputs.aovs || outputs.catcher,
-                    Pass::Path => {
+                    // The camera environment pass exists only to feed transport.
+                    Pass::Path | Pass::PathEnvironment => {
                         d.enabled &= outputs.beauty || outputs.aovs || outputs.catcher || (plan.effects.implicit && outputs.controls());
                         if !plan.effects.denoise {d.reads.retain(|name|*name!="denoising guides");}
                     },
@@ -702,7 +712,7 @@ impl Compute {
             label:Some("path dispatch budget readback"),size:16,
             usage:wgpu::BufferUsages::COPY_DST|wgpu::BufferUsages::MAP_READ,mapped_at_creation:false,
         });
-        let marker=r.timestamp_marker.get_or_init(||timing::Marker::new(&r.device));
+        let marker=r.timestamp_marker.get_or_init(||timing::Marker::new(r));
         marker.encode(encoder,&f.queries,at);
         let mut begin=0;
         let mut previous=if *row_ms>0. {self.dispatches.len()} else {1};
@@ -949,6 +959,9 @@ pub(crate) struct State {
 }
 /// A publication receipt checked at the existing output fence.
 pub(crate) enum PublicationDiagnostic {
+    /// The producing frame's shader diagnostic word. A reservation retry there
+    /// is a redo of every queued frame, not a failed publication.
+    Shader,
     Code(&'static str),
     ComputedGeometry,
     PointDisplacement,
@@ -1155,10 +1168,9 @@ pub(crate) fn encode_view(
         (Work::Compute(work), Pass::Path) if r.test_gpu_segment_times.is_some() => {
             // The frame still resolves its ordinary span. Keep those endpoints
             // initialized while individual dispatches use their own query sets.
-            let marker=r.timestamp_marker.get_or_init(||timing::Marker::new(&r.device));
+            let marker=r.timestamp_marker.get_or_init(||timing::Marker::new(r));
             marker.encode(encoder,&f.queries,timing::query(work.span));
             for index in 0..work.dispatches.len() {
-                let wall_start=std::time::Instant::now();
                 let at=timing::query(work.span);
                 let queries=r.device.create_query_set(&wgpu::QuerySetDescriptor {label:Some("medium segment qualification"),ty:wgpu::QueryType::Timestamp,count:at+2});
                 let resolve=crate::gpu_memory::buffer(&r.device,&wgpu::BufferDescriptor {label:Some("medium segment query resolve"),size:256,usage:wgpu::BufferUsages::QUERY_RESOLVE|wgpu::BufferUsages::COPY_SRC,mapped_at_creation:false});
@@ -1172,8 +1184,10 @@ pub(crate) fn encode_view(
                 r.wait(submission)?;
                 rx.recv()??;
                 let mapped=readback.get_mapped_range(..);let ticks:&[u64]=bytemuck::cast_slice(&mapped);
-                let (ms,source)=timing::measured_or_wall(ticks[0],ticks[1],r.queue.get_timestamp_period(),wall_start.elapsed().as_secs_f64()*1000.);
-                if source != "gpu_timestamp" { eprintln!("medium segment {index}: timing fallback {source}={ms:.6}ms"); }
+                let ms=timing::elapsed_ms(ticks[0],ticks[1],r.queue.get_timestamp_period())
+                    .filter(|ms|ms.is_finite() && *ms>=0.)
+                    .context("invalid GPU timestamps for medium segment; rerun on a device with working timestamp queries")?;
+                let source="gpu_timestamp";
                 drop(mapped);readback.unmap();
                 r.test_gpu_segment_times.as_ref().unwrap().lock().unwrap().push((f.sample_index,index,ms,source));
             }

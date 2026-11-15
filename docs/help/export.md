@@ -50,6 +50,7 @@ Read NAME.export.json and fix each issue before accepting an asset.
 For an intentional loss, repeat --allow-loss CODE for its exact diagnostic code.
 Refusals cannot be acknowledged away. light_representation omits area/environment
 lights; environment_lighting acknowledges the missing default environment.
+audio acknowledges omitted node sound; glTF sound export is not built yet.
 Consumer lighting is outside the asset contract.
 
 GLB is one self-contained file. glTF writes JSON plus a relative content-addressed

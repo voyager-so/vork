@@ -11,7 +11,7 @@ export interface TextOptions {
   extrude?: number;
   bevelDepth?: number;
   bevelResolution?: number;
-  alignX?: 'left' | 'center' | 'right' | 'justify' | 'flush';
+  alignX?: 'left' | 'center' | 'right';
   alignY?: 'top_baseline' | 'top' | 'center' | 'bottom_baseline' | 'bottom';
 }
 /** Font file → ordinary geometry, in XY with +Z front. Uses the installed vork std loader

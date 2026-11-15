@@ -16,6 +16,11 @@ Export a scene headlessly:
 blender -b --disable-autoexec source.blend --python integrations/blender/export.py -- --out /tmp/vork-scene
 ```
 
+Particle object and collection instances export evaluated meshes at the source frame,
+with render counts, transforms and ray visibility. Collection instancers retain their
+hierarchy. Particle animation refuses; export one evaluated frame. Surface-only BSDF trees
+connected to Volume remain empty, matching Cycles; actual mixed media still refuse.
+
 Add `--animation` for scene-sampled clips and camera/light controls. The default
 preserves evaluated modifiers and reports any missing morph targets;
 `--no-apply-modifiers` retains native shape keys and reports omitted modifiers.
@@ -147,8 +152,8 @@ identical Blender BSDFs. No source datablock is edited.
 
 
 
-`display.translate(scene)` writes `render.display` with `std/standard`, `std/agx`
-or `blender/filmic`; exposure, gamma, dither intensity and applicable looks are inputs.
+`display.translate(scene)` writes `composition.view` with `std/standard`, `std/agx`
+or `blender/filmic`; exposure, gamma and applicable looks are inputs.
 White balance is emitted inside the display wrapper using `blender.white_balance`;
 scene-linear outputs retain their original values.
 Non-sRGB display devices, other views (including ACES 1.3), unsupported display curves

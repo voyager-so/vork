@@ -60,23 +60,27 @@ float structure(float r,float azimuth,float time,float gravitational_time) {
     return exp(2.8*(lerp(old,fresh,smoothstep(0.,lifetime,age))-.5));
 }
 
-float3 disk_radiance(float3 point,float3 outgoing,float time,Inputs inputs) {
+float3 disk_radiance(float3 point,float velocity_cosine,float time,Inputs inputs) {
     let rho=length(point);let r=rho*pow(1.+.5/rho,2.);
     let flux=disk_flux(r,inputs.outer_radius);if(flux<=0.) return float3(0.);
     let density=structure(r,atan2(point.z,point.x),time,inputs.gravitational_time);
-    let velocity=normalize(float3(-point.z,0.,point.x));let speed=rsqrt(r-2.);
-    let doppler=sqrt(1.-speed*speed)/(1.-speed*dot(outgoing,velocity));
+    let speed=rsqrt(r-2.);
+    let doppler=sqrt(1.-speed*speed)/(1.-speed*velocity_cosine);
     let temperature=inputs.temperature_scale*pow(flux*density,.25);
     // Thermal Doppler transfer is evaluated spectrally before RGB conversion.
     // Gravity's bolometric transfer belongs to the propagation field, once.
     return inputs.energy*blackbody(temperature*doppler);
 }
 Closure surface(ShadingContext ctx,Inputs inputs) {
-    let rho=length(ctx.POSITION);let r=rho*pow(1.+.5/rho,2.);
-    let density=structure(r,atan2(ctx.POSITION.z,ctx.POSITION.x),ctx.time,inputs.gravitational_time);
+    // Radius and turbulence belong to the annulus; physical angles use the world metric.
+    let point=world_to_object(ctx,ctx.POSITION);
+    let velocity=object_direction_to_world(ctx,float3(-point.z,0.,point.x));
+    let normal=object_normal_to_world(ctx,float3(0.,1.,0.));
+    let rho=length(point);let r=rho*pow(1.+.5/rho,2.);
+    let density=structure(r,atan2(point.z,point.x),ctx.time,inputs.gravitational_time);
     let tau=12.*pow(6./r,3.)*density*(1.-smoothstep(inputs.outer_radius-2.,inputs.outer_radius,r));
     Closure c=Closure();c.base_weight=0.;c.specular_weight=0.;c.geometry_thin_walled=true;
-    c.geometry_opacity=1.-exp(-tau/max(abs(ctx.incoming.y),.03));
-    c.emission_color=disk_radiance(ctx.POSITION,ctx.incoming,ctx.time,inputs);c.emission_luminance=1.;
+    c.geometry_opacity=1.-exp(-tau/max(abs(dot(ctx.incoming,normal)),.03));
+    c.emission_color=disk_radiance(point,dot(ctx.incoming,velocity),ctx.time,inputs);c.emission_luminance=1.;
     return c;
 }

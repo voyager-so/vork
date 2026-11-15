@@ -1,0 +1,225 @@
+{
+  "nodes": [
+    {
+      "id": "gn-chart",
+      "type": "generated",
+      "x": 200,
+      "y": 140,
+      "width": 880,
+      "height": 520,
+      "rotation": 0,
+      "scale": 1,
+      "generatedKind": "chart",
+      "renderMode": "native-children",
+      "metadata": {
+        "name": "Line Chart"
+      },
+      "generatedSource": {
+        "kind": "chart",
+        "chartVersion": 1,
+        "spec": {
+          "type": "line",
+          "x": 0,
+          "y": 0,
+          "width": 880,
+          "height": 520,
+          "config": {
+            "fontFamily": "Inter",
+            "fontSize": 12,
+            "labelColor": "#666666",
+            "titleColor": "#1a1a1a",
+            "subtitleColor": "#666666",
+            "titleSize": 16,
+            "titleWeight": 600,
+            "titleAlign": "left",
+            "subtitleSize": 12,
+            "palette": [
+              "#3b82f6",
+              "#ef4444",
+              "#22c55e",
+              "#f59e0b"
+            ],
+            "background": "transparent",
+            "showGrid": true,
+            "gridColor": "#e5e5e5",
+            "gridStyle": "solid",
+            "gridWidth": 1,
+            "showXAxis": true,
+            "showYAxis": true,
+            "axisColor": "#cccccc",
+            "axisWidth": 1,
+            "showXLabels": true,
+            "showYLabels": true,
+            "yTickCount": 5,
+            "yFormat": "auto",
+            "yScale": "linear",
+            "barRadius": 0,
+            "barGap": 0.2,
+            "barGroupGap": 0.1,
+            "showLabels": false,
+            "labelPosition": "top",
+            "labelFormat": "auto",
+            "valueFormat": "auto",
+            "valueDensity": "auto",
+            "valueLabelColor": "#666666",
+            "valueLabelSize": 11,
+            "showLegend": "auto",
+            "legendPosition": "bottom",
+            "legendAlign": "center",
+            "legendGap": 8,
+            "legendMarker": "line",
+            "legendMarkerSize": 12,
+            "legendColor": "#666666",
+            "strokeWidth": 2,
+            "strokeStyle": "solid",
+            "curve": "smooth",
+            "strokeCap": "round",
+            "strokeJoin": "round",
+            "showPoints": true,
+            "pointSize": 8,
+            "pointShape": "circle",
+            "pointFill": "",
+            "pointStroke": "",
+            "pointStrokeWidth": 0,
+            "fillOpacity": 0.3,
+            "baseline": 0,
+            "pointOpacity": 0.7,
+            "minPointSize": 8,
+            "maxPointSize": 40,
+            "xTickCount": 5,
+            "innerRadius": 0,
+            "startAngle": -90,
+            "direction": "cw",
+            "padAngle": 0,
+            "explode": [],
+            "explodeDistance": 10,
+            "explodeAll": false,
+            "centerLabel": "",
+            "centerSublabel": "",
+            "centerColor": "#1a1a1a",
+            "centerLabelColor": "#1a1a1a",
+            "centerSublabelColor": "#666666",
+            "centerSize": 24,
+            "pieLabelPosition": "outside",
+            "pieLabelFormat": "percent",
+            "minLabelAngle": 10,
+            "padding": 16,
+            "cornerRadius": 0,
+            "title": "Monthly active users"
+          }
+        },
+        "data": {
+          "columns": [
+            "category",
+            "series",
+            "value"
+          ],
+          "rows": [
+            {
+              "category": "Jan",
+              "series": "North",
+              "value": 30
+            },
+            {
+              "category": "Jan",
+              "series": "South",
+              "value": 12
+            },
+            {
+              "category": "Feb",
+              "series": "North",
+              "value": 48
+            },
+            {
+              "category": "Feb",
+              "series": "South",
+              "value": 25
+            },
+            {
+              "category": "Mar",
+              "series": "North",
+              "value": 42
+            },
+            {
+              "category": "Mar",
+              "series": "South",
+              "value": 31
+            },
+            {
+              "category": "Apr",
+              "series": "North",
+              "value": 70
+            },
+            {
+              "category": "Apr",
+              "series": "South",
+              "value": 40
+            },
+            {
+              "category": "May",
+              "series": "North",
+              "value": 64
+            },
+            {
+              "category": "May",
+              "series": "South",
+              "value": 55
+            },
+            {
+              "category": "Jun",
+              "series": "North",
+              "value": 88
+            },
+            {
+              "category": "Jun",
+              "series": "South",
+              "value": 61
+            }
+          ],
+          "series": [
+            "North",
+            "South"
+          ],
+          "categories": [
+            "Jan",
+            "Feb",
+            "Mar",
+            "Apr",
+            "May",
+            "Jun"
+          ],
+          "valueRange": [
+            0,
+            88
+          ]
+        }
+      }
+    }
+  ],
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "generated-chart-line",
+      "width": 1280,
+      "height": 800,
+      "nodeIds": [
+        "gn-chart"
+      ],
+      "fills": [
+        {
+          "id": "fill-0",
+          "paint": {
+            "type": "solid",
+            "color": "#ffffff"
+          }
+        }
+      ]
+    }
+  ],
+  "config": {
+    "renderPageClipping": true
+  },
+  "variables": [],
+  "canvasRootNodeIds": [],
+  "layoutMode": "vertical"
+}

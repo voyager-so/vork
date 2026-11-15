@@ -73,3 +73,32 @@ def homogeneous(socket):
             f'    c.emission = {rgb(emission)};\n'
             f'    c.anisotropy = {anisotropy!r};\n'
             '    return c;\n}\n')
+
+
+def empty_volume(socket, pending=None):
+    """Prove a connected shader has no volume closure under Cycles semantics.
+
+    Cycles svm_node_closure_bsdf skips every BSDF/BSSRDF outside surface
+    evaluation. Unknown closures remain unsupported, including node groups.
+    """
+    if not socket.is_linked:
+        return True
+    link = socket.links[0]
+    node = link.from_node
+    pending = set() if pending is None else pending
+    key = node.as_pointer(), link.from_socket.identifier
+    if key in pending:
+        return False
+    pending.add(key)
+    try:
+        if node.mute:
+            return any(connection.to_socket == link.from_socket
+                       and empty_volume(connection.from_socket, pending)
+                       for connection in node.internal_links)
+        if node.type == 'REROUTE':
+            return empty_volume(node.inputs[0], pending)
+        if node.type in ('MIX_SHADER', 'ADD_SHADER'):
+            return all(empty_volume(inp, pending) for inp in node.inputs if inp.type == 'SHADER')
+        return node.type.startswith('BSDF_') or node.type == 'SUBSURFACE_SCATTERING'
+    finally:
+        pending.remove(key)

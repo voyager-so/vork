@@ -1,20 +1,20 @@
 LIMITS
-Supported GPUs: Apple Silicon Metal and recent NVIDIA Vulkan with hardware ray
-tracing and storage buffer arrays. AMD and Intel GPUs are unsupported.
+Supported GPUs: Apple Silicon Metal, recent NVIDIA Vulkan and AMD Vulkan with
+hardware ray tracing and storage buffer arrays (tested on Mesa RADV, RDNA3).
+Intel GPUs are unsupported.
 CPU rendering requires the explicit opt-in below. Run vork setup to check the
 adapter. Windows x64 ships install.ps1;
 macOS and Linux provide install.sh as a separate release asset.
-The bundled Slang toolchain targets macOS 26; older macOS is unqualified.
+Use Apple Silicon with macOS 15 or newer.
 See README.md (Install) for binary setup.
 
-Device-limit errors report the requested size or count, the device limit, and a
-resource-specific remedy. For image and camera allocations, lower resolution
-with --set resolution=WxH; lower sample-dependent demand with --set samples=N
-or --profile std/draft. Reflection allocations can also shrink with a lower
-profile budget; std/path avoids the screen reflection record allocation when
-suggested by the error. Geometry and compute allocations instead need smaller
-meshes, buffer pools or fewer inputs. Denoising allocations can be avoided with
---set denoise=false. Follow the remedy named by the failing resource.
+Device-limit errors name the failing resource, limit and remedy.
+
+Canvas documents support audio answers only.
+A canvas inside a canvas cannot set viewBox or preserveAspectRatio.
+A canvas frame draws at most 335,544 ordered items (each path, text or image
+is one; a path under a mask or blend may take more). A larger frame is
+refused with the count and the limit.
 
 Homogeneous fog uses closed triangle carriers or constant/height world media
 through complete-camera path transport. Arbitrary smoke, grids, procedural density
@@ -37,19 +37,15 @@ renders on every device, including CPU Vulkan. Use `--profile std/final` with de
 field and path-only effects disabled for subtree rendering, or render the
 selected content in a separate scene without `root`. Computed attributes and their time/seek updates
 do not have a separate CPU restriction.
-A non-finite path contribution (an infinite light sample) is dropped as zero rather
-than refusing the frame. Each affected frame warns with its dropped count;
-`dropped_light_samples` records the count in frame metadata, even without `--diagnostics`.
-Non-finite camera path samples are also zeroed and reported as `dropped_path_samples`.
-Drops above 0.1% of the authored camera-sample budget refuse delivery; this
-protects against systematic broken transport. Very small frames may have no allowance.
+Non-finite camera/light samples mark affected pixels magenta; output metadata lists their coordinates.
 Final's rough glass shadows follow straight connections: roughness does not spread
 transmitted shadows, light off-axis receivers, or test scattered-direction blockers.
 
 On Apple Silicon, solid glass and heavy interiors can still abort with exit code 4
 and "Impacting Interactivity". A retry can succeed; lower resolution is not a reliable
-fix. For thin panes use geometry_thin_walled: true. Try std/path or a supported NVIDIA
-GPU for repeated failures; path is slower and is not a universal workaround.
+fix. For thin panes use geometry_thin_walled: true. Try std/path or a supported
+NVIDIA or AMD GPU for repeated failures; path is slower and is not a universal
+workaround.
 Dense imported transmitting geometry has not been qualified on Metal. Large scenes
 with dense transparency can lose the device in final even at small resolutions;
 try path and test the full shot before committing to a batch.
@@ -59,12 +55,28 @@ the full lookup resolution and integration sample counts. This bounds the
 scene-independent startup workload; lowering scene resolution does not reduce
 that workload.
 
+A scene that draws meshes or imported models can bind a limited number of distinct
+attribute names across all its materials. Apple Silicon Metal fits 17. On Vulkan the
+device's vertex-input and inter-stage limits decide; the refusal states the device's
+limit and how many names it fits. A Gaussian capture binds 1, 4, 9 or 16 names at SH
+degree 0 to 3, so a degree-3 capture beside meshes leaves one more name on Metal. A
+scene of Gaussian captures alone has no such ceiling. Bind fewer distinct names.
+
 Large point scenes and working buffers can exceed a device's per-buffer binding
 limit even when total free VRAM is sufficient. Follow the error's resolution/profile
 advice or simplify scene buffers. Scene import support does not guarantee rendering
 at any size.
 
-vork setup warms only the vork init starter at the default std/final profile. Only
+vork setup builds the prebuilt path engine (the same few pipelines for every scene) and
+warms the vork init starter at the default std/final profile. Without setup, a cold path
+render compiles its own scene kernel before the picture, then exits; it does not build
+the shared engine afterward. On an NVIDIA L4, path-glass and path-many-lights at std/path
+took about 50–60 s to picture and exit, and about 1 s on immediate repeat at authored resolution.
+Repeats reuse the saved scene kernel.
+With a warm engine, supported scenes draw with it while their own kernel compiles
+in a detached background process; delivery and exit do not wait for it. Scenes the engine
+cannot draw (authored programs, a participating medium, AOVs, splats, points or hair, or
+cameras other than one std/camera, say) compile their own kernel before the first frame. Only
 shader warming may stop successfully at its ten-minute limit; required GPU/tool
 checks fail on errors or their own stage timeouts.
 Use setup --skip-warmup for the GPU/tools report only, or setup --all for the
@@ -77,22 +89,8 @@ Hair displacement and lit stages are ignored with a warning. Curved propagation
 selects path transport automatically; motion channels are zero with a warning,
 while sampled shutter blur remains available.
 
-Named opacity and alpha-cutoff attributes use the shared camera and ray evaluators.
-Computed instance material attributes follow GPU publications, including shutter
-samples and seeks. Installation refuses these wholly omitted geometry effects:
-
-- displacement reading computed instance attributes: use static/authored values or
-  pre-baked displaced geometry;
-- displacement on computed points or implicit geometry: compute displaced positions in the
-  producer, evolve the scalar field, or bake triangle geometry;
-- normal-dependent point displacement: use an authored direction attribute or triangles;
-- conflicting displacement materials or inconsistent attributes at shared vertices:
-  use one displacement material and continuous attributes, or split the geometry;
-- computed geometry with coverage/transparency, or computed placement of transparent
-  instances: use opaque geometry, bake geometry updates, or author placements.
-
-These errors name the node and available alternative. Approximate effects still warn
-and render.
+Unsupported geometry effects refuse with the node and an authoring alternative.
+Approximate effects can warn and render.
 Legacy spatial environments evaluate at the origin. Unsupported light masks
 are ignored with warnings. Environment programs sampling
 render images fall back to the light colour. Inspect warnings and the image. Each dropped effect prints WARNING: REQUESTED EFFECT DROPPED,
@@ -114,6 +112,3 @@ Portable shader artifacts and Mesa's own shader disk cache can still speed later
 macOS requires Apple Silicon; CPU mode is unavailable through Metal. Windows
 requires a Vulkan loader and a recent Mesa lavapipe driver with its ICD manifest;
 CPU rendering there has not been qualified.
-
-Fog watchdog termination reports a count and discarded accumulated radiance; the untraced energy remains unknown. Ordinary paths terminate by sampled transport and compensated roulette.
-Custom surface shaders with fog are not yet supported; use builtin surfaces.

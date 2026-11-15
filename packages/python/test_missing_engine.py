@@ -11,5 +11,5 @@ class MissingEngine(unittest.TestCase):
             for executable in ('vork', os.path.join(directory, 'missing-vork')):
                 for call in (lambda: std('rounded_box'), lambda: render('scene.json', 'out.png')):
                     with self.subTest(executable=executable, call=call), patch.dict(os.environ, {'VORK_BIN': executable, 'PATH': directory}):
-                        with self.assertRaisesRegex(RuntimeError, 'vork executable not found:.*PATH.*VORK_BIN.*full path'):
+                        with self.assertRaisesRegex(RuntimeError, 'vork renderer not found:.*Install it with:\\nnpm install -g @voyager-so/vork\\nOr set VORK_BIN'):
                             call()

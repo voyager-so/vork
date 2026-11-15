@@ -3,18 +3,18 @@ import frame;
 import vork_constants;
 import hit_geometry;
 import emitter_mesh_proposal;
-[[vk::binding(10,0)]] StructuredBuffer<uint> source_words : register(t5);
-[[vk::binding(11,0)]] RWStructuredBuffer<float> source_weights : register(u6);
+[[vk::binding(11,0)]] StructuredBuffer<uint> source_words : register(t6);
+[[vk::binding(12,0)]] RWStructuredBuffer<float> source_weights : register(u7);
 import material_layout;
-[[vk::binding(13,0)]] StructuredBuffer<MaterialRecord> source_materials : register(t8);
+[[vk::binding(14,0)]] StructuredBuffer<MaterialRecord> source_materials : register(t9);
 struct AreaStep {uint4 value;uint4 emission;}; // support base, first node, count, dispatch width
-[[vk::binding(12,0)]] ConstantBuffer<AreaStep> area_step : register(b7);
+[[vk::binding(13,0)]] ConstantBuffer<AreaStep> area_step : register(b8);
 // wgpu Metal binding arrays are one argument buffer of resource handles.
 #ifdef VORK_METAL
-[[vk::binding(0,3)]] ParameterBlock<RayHitBuffersTable> source_hit_buffers : register(b9);
+[[vk::binding(0,3)]] ParameterBlock<RayHitBuffersTable> source_hit_buffers : register(b10);
 
 #else
-[[vk::binding(0,3)]] StructuredBuffer<uint> source_hit_buffers[REG_RAY_HIT_BUFFERS] : register(t9);
+[[vk::binding(0,3)]] StructuredBuffer<uint> source_hit_buffers[REG_RAY_HIT_BUFFERS] : register(t10);
 
 #endif
 typedef RayGeometry AreaGeometry;

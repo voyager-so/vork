@@ -8,8 +8,7 @@ pinned Intel Mac or Linux ARM archive.
 
 ## Prerequisites
 
-The pinned Slang 2026.21 macOS binaries target macOS 26. Older macOS versions
-have not been qualified with this toolchain.
+Use Apple Silicon with macOS 15 or newer.
 
 On macOS, install Apple's command line tools, then install Homebrew from
 https://brew.sh if it is not already available:
@@ -54,6 +53,9 @@ sh /tmp/vork-rustup.sh -y --default-toolchain 1.96
 
 ## Install Slang and build
 
+All pinned toolchain archives are public and need no authentication. Linux and
+Windows use upstream archives; macOS uses the source-built archive described below.
+
 Clone the repository if needed, then enter it.
 
 Choose a new, empty destination outside the checkout. The installer downloads
@@ -74,8 +76,9 @@ The build compiles shaders for both Vulkan and Metal on either host. It checks
 the Slang version against the pin. `VORK_SLANGC` must be an absolute executable
 path; alternatively the build can find the pinned `slangc` on `PATH`. Export
 `VORK_SLANGC` again in each new shell, or add the export to your shell startup
-file. A `cannot start slangc` error means this setup is missing; a version
-mismatch means a different compiler was selected.
+file. A compiler-start failure includes the loader diagnostic; check the selected
+toolchain and its OS requirement. A version mismatch means a different compiler
+was selected.
 
 The renderer and its `vork-slang-filesystem` companion must stay together when copied or packaged. Building the companion requires a C++17 compiler and the full pinned Slang headers; it loads the matching shared library at runtime.
 
@@ -91,15 +94,16 @@ uses Vulkan. Install FFmpeg/ffprobe for video commands and encoding tests
 (`brew install ffmpeg` on macOS, `sudo apt-get install ffmpeg` on Ubuntu).
 
 The public workspace includes CPU unit tests and small fixtures. The text tests
-use bundled Liberation Sans and Noto Sans Arabic/Devanagari fonts under SIL OFL
-1.1; their licences are in `crates/vork-std/tests/fonts/OFL.txt` and
-`crates/vork-text/tests/fonts/OFL.txt`. Renderer fixtures are synthetic scene,
+use bundled Liberation Sans and Noto Sans Arabic fonts under SIL OFL 1.1; their
+licences are in `crates/vork-std/tests/fonts/OFL.txt` and
+`crates/vork-std/tests/fonts/OFL-Noto.txt`. Renderer fixtures are synthetic scene,
 shader and glTF inputs shipped with the source. No asset downloads are needed to
 run the default tests. Corpus-dependent tests that require unshipped assets are
 excluded from the public source; they are not part of its test coverage.
 
-Renderer GPU tests require the explicit runtime opt-in `VORK_GPU_TESTS=1`;
-without it they print a skip diagnostic (visible with `-- --nocapture`).
+Renderer GPU unit tests are marked ignored with a message naming their requirements.
+When explicitly selected they require the runtime opt-in `VORK_GPU_TESTS=1` and
+successful renderer creation; missing adapters fail.
 CPU and numeric tests remain enabled. Tests marked ignored explain their additional requirements. GPU tests need a
 supported Metal/Vulkan device, including ray-query support; a CPU-only test run
 does not validate rendering. To run ignored tests after installing their stated
@@ -124,14 +128,14 @@ licence notice check, then check and test every public workspace target:
 ```sh
 npm ci --prefix packages/ts
 cargo +1.96 fetch --locked
-cargo +1.96 check --workspace --all-targets --locked
+cargo +1.96 check --workspace --lib --bins --examples --locked
+cargo +1.96 check --workspace --tests --locked
 cargo +1.96 test --workspace --locked
 ```
 
-Use `-- --nocapture` to see test diagnostics, including any GPU test skipped when
-adapter discovery finds no device. Missing fixtures, missing required tools and
-failed assertions are failures. An ignored or skipped GPU test supplies no GPU
-coverage.
+Use `-- --nocapture` to see test diagnostics. Missing fixtures, missing required
+tools, missing adapters and failed assertions are failures in selected GPU tests.
+An ignored GPU test supplies no GPU coverage.
 
 See [README installation](../README.md#install) for binary installation and runtime
 setup, and `vork help programs --all` for authored Slang programs. Node/npm and the
@@ -154,7 +158,16 @@ the ordinary setup catalogue and a bounded set of starter/example scenes run
 against a no-op wgpu device with Slang. The scene set in `scripts/prepare-shaders`
 uses normal installation at `std/final` and `std/path`, capturing installed material
 unions and linked cameras that isolated library-program jobs cannot cover.
-Shared portable artifacts deduplicate by their existing content keys; arbitrary
+A path kernel's key also names two facts that are not the scene's materials: its
+light kinds and whether a camera can start inside a solid. Each prepared path
+scene therefore compiles its kernel at every covered case of both
+(`ProgramKernel::release_cases`): a single sun, area lights only and every kind
+(the key of no analytic light or any mix), and, where solids are installed, the
+camera proof held and not held. A scene with the same materials and one of those
+cases starts without compiling; one lit by points or spots alone compiles once.
+The bundle holds each artifact as one XZ stream (`<entry>.xz`), expanded when a
+render asks for it and checked against the entry's digest; a render reads only the
+few it needs. Shared portable artifacts deduplicate by their existing content keys; arbitrary
 authored programs and uncommon configurations still compile on demand. Preparation runs
 without opening a GPU driver, OIDN device or executing shaders. Denoiser
 preparation constructs only the renderer's pack/unpack pipelines. macOS emits Metal source;
@@ -198,3 +211,37 @@ Portable shader artifacts and Mesa's own shader disk cache can still speed later
 macOS requires Apple Silicon; CPU mode is unavailable through Metal. Windows
 requires a Vulkan loader and a recent Mesa lavapipe driver with its ICD manifest;
 CPU rendering there has not been qualified.
+
+## Mac toolchain reproduction
+
+`dist/macos-minimum.txt` owns the macOS 15.0 floor. The path-boundary
+allocator uses `atomic_thread_fence`, available on Apple Silicon with Metal 3.2
+(macOS 15). Lowering only Slang's deployment target cannot support that renderer
+path on older Metal drivers. See Apple's
+[Metal language specification](https://developer.apple.com/metal/Metal-Shading-Language-Specification.pdf).
+
+`dist/slang.json` records the exact upstream source commit (which locks recursive
+submodules), Xcode build, CMake/Ninja versions and CMake options for the Mac build.
+The `slang-macos-build` workflow builds that source with an explicit deployment
+target on macOS 15. LLVM host-code generation is disabled: vork uses Slang for
+GPU code generation, and the LLVM payload is not part of vork's runtime. No
+Slang shader compiler source is patched.
+
+To reproduce the build, check out the recorded commit with its recursive
+submodules, select the recorded Xcode, install the recorded CMake and Ninja
+versions, then run `python3 scripts/toolchains/build-macos-slang.py --source
+/path/to/slang-source --output /path/to/new-output`. The output contains the
+archive, SHA-256 and `vork-build.json` recording compiler, SDK and dependency
+identities. Archive timestamps and owners are normalized; this is a pinned
+build recipe, not a claim of byte-identical compiler archives. Repeated builds can differ in
+embedded serialized core-module data and Mach-O UUID/signature bytes even with
+the same tool versions. CI compares exact SPIR-V and Metal shader bytes against the official
+compiler, and separately proves startup and vork shader compilation on macOS
+15 without a GPU. A render still requires Apple Silicon with Metal.
+
+Archive assembly checks every bundled Mach-O slice against the floor and writes
+`macos-runtime.json` with paths, hashes and deployment targets, and preserves
+Slang's build provenance at `slang/vork-build.json`. npm and native
+wheel assembly rechecks that inventory before copying the signed bytes. The
+helper is compiled with the same explicit deployment target. Run
+`python3 scripts/check-macos-runtime /path/to/extracted-runtime` to inspect it.

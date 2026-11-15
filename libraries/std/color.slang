@@ -52,16 +52,19 @@ float3 color_from_hsl(float3 hsl) {
     float c=(1.-abs(2.*hsl.z-1.))*hsl.y;
     return color_from_hsv(float3(hsl.x,1.,1.))*c+(hsl.z-c*0.5);
 }
+// Library rule: compare enums as integers, `int(value) == int(Enum.Member)` (or `!=`).
+// Slang's enum `==` costs front-end time in every program that loads the module, and
+// the integer form emits the same code. Enum fields, arguments, defaults and switches stay enums.
 public enum RampInterpolation { Constant, Linear, Ease, Cardinal, B_Spline };
 public enum RampColorMode { RGB, HSV, HSL };
 public enum HueInterpolation { Near, Far, CW, CCW };
 public struct RampStop { public float position; public float4 color; };
 float ramp_hue(float a,float b,HueInterpolation mode) {
     float d=b-a;
-    if(mode==HueInterpolation.Near) { if(d>0.5) b-=1.; if(d< -0.5) b+=1.; }
-    if(mode==HueInterpolation.Far) { if(d>0. && d<0.5) b-=1.; if(d<=0. && d> -0.5) b+=1.; }
-    if(mode==HueInterpolation.CW && d>0.) b-=1.;
-    if(mode==HueInterpolation.CCW && d<0.) b+=1.;
+    if(int(mode) == int(HueInterpolation.Near)) { if(d>0.5) b-=1.; if(d< -0.5) b+=1.; }
+    if(int(mode) == int(HueInterpolation.Far)) { if(d>0. && d<0.5) b-=1.; if(d<=0. && d> -0.5) b+=1.; }
+    if(int(mode) == int(HueInterpolation.CW) && d>0.) b-=1.;
+    if(int(mode) == int(HueInterpolation.CCW) && d<0.) b+=1.;
     return b;
 }
 // Stops are ordered by position. Empty ramps return transparent black.
@@ -72,23 +75,23 @@ public float4 color_ramp<let N:int>(float factor,RampStop stops[N],
     if(N==1 || factor<stops[0].position) return stops[0].color;
     int i=0;
     for(int j=1;j<N;j++) if(factor>=stops[j].position) i=j;
-    if(i==N-1 || interpolation==RampInterpolation.Constant) return stops[i].color;
+    if(i==N-1 || int(interpolation) == int(RampInterpolation.Constant)) return stops[i].color;
     float width=stops[i+1].position-stops[i].position;
     float t=width>0.?(factor-stops[i].position)/width:0.;
-    if(interpolation==RampInterpolation.Ease) t=t*t*(3.-2.*t);
+    if(int(interpolation) == int(RampInterpolation.Ease)) t=t*t*(3.-2.*t);
     float4 a=stops[i].color,b=stops[i+1].color;
-    if(mode!=RampColorMode.RGB) {
-        a.xyz=mode==RampColorMode.HSV?color_to_hsv(a.xyz):color_to_hsl(a.xyz);
-        b.xyz=mode==RampColorMode.HSV?color_to_hsv(b.xyz):color_to_hsl(b.xyz);
+    if(int(mode) != int(RampColorMode.RGB)) {
+        a.xyz=int(mode) == int(RampColorMode.HSV)?color_to_hsv(a.xyz):color_to_hsl(a.xyz);
+        b.xyz=int(mode) == int(RampColorMode.HSV)?color_to_hsv(b.xyz):color_to_hsl(b.xyz);
         b.x=ramp_hue(a.x,b.x,hue);
         float4 result=lerp(a,b,t);
-        result.xyz=mode==RampColorMode.HSV?color_from_hsv(result.xyz):color_from_hsl(result.xyz);
+        result.xyz=int(mode) == int(RampColorMode.HSV)?color_from_hsv(result.xyz):color_from_hsl(result.xyz);
         return result;
     }
-    if(interpolation==RampInterpolation.Cardinal || interpolation==RampInterpolation.B_Spline) {
+    if(int(interpolation) == int(RampInterpolation.Cardinal) || int(interpolation) == int(RampInterpolation.B_Spline)) {
         float4 p=stops[max(i-1,0)].color,q=stops[min(i+2,N-1)].color;
         float t2=t*t,t3=t2*t;
-        if(interpolation==RampInterpolation.B_Spline)
+        if(int(interpolation) == int(RampInterpolation.B_Spline))
             return ((1.-3.*t+3.*t2-t3)*p+(4.-6.*t2+3.*t3)*a+(1.+3.*t+3.*t2-3.*t3)*b+t3*q)/6.;
         // Cardinal tension 0.71, as specified by the Blender ramp.
         float4 m0=0.71*(b-p),m1=0.71*(q-a);
@@ -104,11 +107,11 @@ public enum BlendMode { Mix, Darken, Multiply, Burn, Lighten, Screen, Dodge, Add
 public float3 mix(float3 a,float3 b,float factor=0.5,BlendMode mode=BlendMode.Mix,
                   bool clamp_factor=true,bool clamp_result=false) {
     float f=clamp_factor?saturate(factor):factor;
-    if(mode==BlendMode.Burn || mode==BlendMode.Dodge) {
+    if(int(mode) == int(BlendMode.Burn) || int(mode) == int(BlendMode.Dodge)) {
         float3 result;
         for(int i=0;i<3;i++) {
-            float denominator=mode==BlendMode.Burn?1.-f+f*b[i]:1.-f*b[i];
-            result[i]=mode==BlendMode.Burn?(denominator<=0.?0.:1.-(1.-a[i])/denominator):
+            float denominator=int(mode) == int(BlendMode.Burn)?1.-f+f*b[i]:1.-f*b[i];
+            result[i]=int(mode) == int(BlendMode.Burn)?(denominator<=0.?0.:1.-(1.-a[i])/denominator):
                 (denominator<=0.?1.:a[i]/denominator);
         }
         return saturate(result);
@@ -130,10 +133,10 @@ public float3 mix(float3 a,float3 b,float factor=0.5,BlendMode mode=BlendMode.Mi
         case BlendMode.Divide: for(int i=0;i<3;i++) c[i]=b[i]==0.?a[i]:a[i]/b[i]; break;
         case BlendMode.Hue: case BlendMode.Saturation: case BlendMode.Color: case BlendMode.Value: {
             float3 ah=color_to_hsv(a),bh=color_to_hsv(b);
-            if(mode==BlendMode.Hue && bh.y!=0.) ah.x=bh.x;
-            if(mode==BlendMode.Saturation) ah.y=bh.y;
-            if(mode==BlendMode.Color) { ah.x=bh.x; ah.y=bh.y; }
-            if(mode==BlendMode.Value) ah.z=bh.z;
+            if(int(mode) == int(BlendMode.Hue) && bh.y!=0.) ah.x=bh.x;
+            if(int(mode) == int(BlendMode.Saturation)) ah.y=bh.y;
+            if(int(mode) == int(BlendMode.Color)) { ah.x=bh.x; ah.y=bh.y; }
+            if(int(mode) == int(BlendMode.Value)) ah.z=bh.z;
             c=color_from_hsv(ah); break;
         }
         default: break;

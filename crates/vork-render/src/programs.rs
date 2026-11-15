@@ -76,9 +76,13 @@ pub(crate) struct Instance {
 }
 #[derive(Clone, Debug, serde::Serialize)]
 pub(crate) struct Image {
+    /// The scene image's name, for diagnostics only: two names for one file are one resource.
+    #[serde(skip)]
+    pub image: String,
     pub input: String,
     pub source: crate::texture_source::TextureSource,
     pub srgb: bool,
+    pub color_space: Option<v2::ColorSpace>,
     pub sampler: v2::Sampler,
 }
 /// The program instance of a non-OpenPBR material; None for std/openpbr, whose
@@ -113,9 +117,11 @@ pub(crate) fn instance(scene: &v2::Scene, name: &str) -> Result<Option<Instance>
                 )
             })?;
         images.push(Image {
+            image: image_name.to_string(),
             input: input_name.clone(),
             source: crate::texture_source::TextureSource::scene(image_name, image),
             srgb: image.is_srgb(),
+            color_space: image.color_space,
             sampler: image.sampler(),
         });
     }
@@ -133,8 +139,6 @@ pub(crate) fn instance(scene: &v2::Scene, name: &str) -> Result<Option<Instance>
 }
 
 pub(crate) struct Programs {
-    /// Program and attribute identity for the installed pipeline cache.
-    pub(crate) identity: String,
     /// The same programs as Slang modules for the native colour passes; None
     /// when the scene has only named attributes.
     pub(crate) native: Option<std::sync::Arc<Native>>,
@@ -181,6 +185,10 @@ impl Programs {
     pub(crate) fn attribute_width(&self,p:&Instance,input:&str)->Option<u32> {
         self.compiled[self.instances[&instance_key(p)]].inputs.fields.iter().find_map(|f|if f.name==input {if let vork_slang::Type::Attribute(n)=f.ty {Some(n)} else {None}} else {None})
     }
+    /// Whether the instance's program reads `time` (surface, lit or displacement).
+    pub(crate) fn reads_time(&self, p: &Instance) -> bool {
+        self.instances.get(&instance_key(p)).is_some_and(|&index| self.compiled[index].capabilities.dependencies.time)
+    }
     pub(crate) fn is_hair(&self, p: &Instance) -> bool { self.compiled[self.instances[&instance_key(p)]].capabilities.hair }
     pub(crate) fn has_physical_hair(&self) -> bool { self.physical_hair }
     pub(crate) fn is_physical_hair(&self, p: &Instance) -> bool { self.bound.get(&instance_key(p)).is_some_and(|c| c.physical_hair) }
@@ -209,6 +217,7 @@ impl Programs {
             capabilities.spatial_subsurface &= bound.spatial_subsurface;
             capabilities.emission &= bound.emission;
             capabilities.anisotropy &= bound.anisotropy;
+            capabilities.coat_anisotropy &= bound.coat_anisotropy;
             capabilities.film &= bound.film;
             capabilities.coat &= bound.coat;
             capabilities.fuzz &= bound.fuzz;
@@ -440,6 +449,10 @@ pub(crate) struct Stages {
     pub displacement: bool,
 }
 pub(crate) fn mesh_stages(r: &Renderer, scene: &v2::Scene, base: &Path) -> Result<std::collections::BTreeMap<String, Stages>> {
+    source_mesh_stages(&r.disk_cache, scene, base)
+}
+
+fn mesh_material_names(scene: &v2::Scene) -> std::collections::BTreeSet<String> {
     fn visit(nodes: &[v2::Node], names: &mut std::collections::BTreeSet<String>) {
         for node in nodes {
             match &node.kind {
@@ -452,6 +465,90 @@ pub(crate) fn mesh_stages(r: &Renderer, scene: &v2::Scene, base: &Path) -> Resul
     }
     let mut names = std::collections::BTreeSet::new();
     visit(&scene.nodes, &mut names);
+    names
+}
+
+/// A negative source test, not stage discovery: only the compiler supplies stage
+/// facts. Without the name, preprocessing or external modules, a medium entry
+/// cannot exist. Keep comments/strings intact: false positives cost a probe but
+/// can never admit fog. The generated ABI and registered library-only modules
+/// are written into every compiler workspace and export no material stages.
+fn may_declare_medium(source: &str) -> bool {
+    if ["medium", "#", "\\", "include", "implementing", "__"].iter().any(|text| source.contains(text)) {
+        return true;
+    }
+    source.match_indices("import").any(|(offset, word)| {
+        let Some((module, _)) = source[offset + word.len()..].split_once(';') else { return true; };
+        let module = module.trim();
+        module != "vork" && !vork_slang::library_modules()
+            .any(|known| !known.material && module == known.name.replace('/', "."))
+    })
+}
+
+#[cfg(test)]
+mod fog_admission_tests {
+    use super::*;
+
+    #[test]
+    fn negative_source_test_keeps_module_loading_and_preprocessing_uncertain() {
+        for source in ["", "import vork;", "import \n vork ; import std.texture;",
+            "Closure surface() {} // colour edit"] {
+            assert!(!may_declare_medium(source), "{source}");
+        }
+        for source in ["MediumCoefficients medium() {}", "// medium", "#define entry surface",
+            "import fog;", "import std.hair;", "import vork_extra;", "import vork.extra;",
+            "import /* comment */ vork;", "import \"fog.slang\";", "__include \"fog.slang\";",
+            "implementing fog;", "im\\\nport fog;", "#include \"fog.slang\""] {
+            assert!(may_declare_medium(source), "{source}");
+        }
+    }
+
+    #[test]
+    fn surface_library_imports_cannot_supply_medium() -> Result<()> {
+        // Exercise surface helpers and their transitive exports with Slang.
+        // Compute-library include fragments require their generator's constants
+        // and are not standalone imports for this mesh-program ABI.
+        let compiler = Compiler::discover();
+        let root = std::env::temp_dir().join(format!("vork-library-admission-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("std"))?;
+        // Authored files must not shadow the compiler-owned imports trusted by
+        // the negative test, even when they declare a medium entry.
+        let shadow = "import vork; struct Inputs {}; MediumCoefficients medium(MediumContext c, Inputs i) { return MediumCoefficients(); }";
+        std::fs::write(root.join("vork.slang"), shadow)?;
+        std::fs::write(root.join("std/texture.slang"), shadow)?;
+        for module in ["vork", "std.texture", "blender.nodes", "blender.volume"] {
+            let (stages, _) = compiler.stages(&abi(), &format!("import {module};"), &root.join("surface.slang"))?;
+            assert!(!stages.contains("medium"), "library-only module {module} exports medium");
+        }
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+}
+
+/// Fog's pre-device refusal needs AST facts only when a bound source can supply
+/// a medium, or an environment explicitly binds one. Ordinary surface editing
+/// must not prepare compiler inputs or open/trim the disk store during parsing.
+pub(crate) fn needs_fog_admission(scene: &v2::Scene, base: &Path) -> Result<bool> {
+    let names = mesh_material_names(scene);
+    let programs: std::collections::BTreeSet<_> = names.iter()
+        .map(|name| scene.materials[name].program.as_str()).filter(|name| *name != "std/openpbr").collect();
+    if programs.is_empty() { return Ok(false); }
+    fn world_medium(nodes: &[v2::Node]) -> bool {
+        nodes.iter().any(|node| matches!(&node.kind,
+            v2::NodeKind::Light { shape: v2::LightShape::Environment, medium: Some(_), .. })
+            || world_medium(&node.children))
+    }
+    if world_medium(&scene.nodes) { return Ok(true); }
+    for program in programs {
+        let (source, _) = material_source(scene, base, program)?;
+        if may_declare_medium(&source) { return Ok(true); }
+    }
+    Ok(false)
+}
+
+/// AST stage facts are host work and share installation's portable cache.
+pub(crate) fn source_mesh_stages(store: &disk_cache::Store, scene: &v2::Scene, base: &Path) -> Result<std::collections::BTreeMap<String, Stages>> {
+    let names = mesh_material_names(scene);
     let builtin=Stages {surface:true,medium:false,displacement:false};
     let mut programs=std::collections::BTreeMap::new();
     for name in &names {
@@ -471,8 +568,8 @@ pub(crate) fn mesh_stages(r: &Renderer, scene: &v2::Scene, base: &Path) -> Resul
         }
         let programs:Vec<_>=groups.into_iter().collect();
         let probe=|((source,origin),names):&((String,PathBuf),Vec<String>)| -> Result<Vec<(String,Stages)>> {
-            let identity=program_identity(&r.disk_cache,&compiler,&abi,source,origin)?;
-            let stages=cached(r, input_key(b"mesh-stages-v5", &abi, &identity.identity)?.finalize(), &compiler.with_identity(&identity), &abi, source, origin, |compiler| {
+            let identity=program_identity(store,&compiler,&abi,source,origin)?;
+            let stages=cached_proof(store, input_key(b"mesh-stages-v5", &abi, &identity.identity)?.finalize(), &compiler.with_identity(&identity), &abi, source, origin, |compiler| {
                 let (declarations, _) = compiler.stages(&abi, source, origin)?;
                 let stages = Stages {
                     surface: declarations.contains("surface"),
@@ -608,7 +705,6 @@ pub(crate) fn install<'a>(
     let physical_hair = bound.values().any(|c| c.physical_hair);
     validate_bound_geometry(scene, &ids, &mut compiled)?;
     Ok(Some(Programs {
-        identity: format!("{:?}{}{}",crate::attributes::names(scene)?,physical_hair,compiled.iter().map(|p| p.wgsl.as_str()).collect::<String>()),
         native: if compiled.is_empty() {
             None
         } else {
@@ -657,10 +753,15 @@ pub(crate) fn compile(
     Ok(program)
 }
 
+/// The key `compile` stores a program under; its tests probe the store with it.
+fn compile_key(abi: &Abi, identity: &vork_slang::InputIdentity) -> Result<blake3::Hash> {
+    Ok(input_key(b"program-v8", abi, &identity.identity)?.finalize())
+}
+
 // Launch preanalysis defers visible-loss diagnostics to the consuming traversal.
 fn compile_quiet(r: &Renderer, compiler: &Compiler, abi: &Abi, source: &str, origin: &Path) -> Result<Program> {
     let identity=program_identity(&r.disk_cache,compiler,abi,source,&origin)?;
-    let key = input_key(b"program-v8", abi, &identity.identity)?.finalize();
+    let key = compile_key(abi, &identity)?;
     let mut program = cached(
         r,
         key,
@@ -813,6 +914,30 @@ fn input_key(tag: &[u8], abi: &Abi, identity: &[u8]) -> Result<blake3::Hasher> {
     Ok(key)
 }
 
+/// The store's record of the toolchains that passed the version check
+/// (`vork_slang::Compiler::toolchain`). One entry per toolchain in the store that `cache`
+/// names entries in, named by the toolchain itself, so every kind of lookup in that store
+/// reads and writes the same record. It names this host's files: like the exact receipts it
+/// sits beside them and is not among the kinds read from shipped shaders.
+struct Admissions<'a>(&'a dyn Fn(blake3::Hash)->PathBuf);
+impl vork_slang::AdmissionLedger for Admissions<'_> {
+    fn entry(&self, toolchain: blake3::Hash) -> Option<PathBuf> {
+        Some((self.0)(toolchain).parent()?.join(format!("{}.slang-admission-v1.entry",toolchain.to_hex())))
+    }
+    fn admitted(&self, entry: &Path, toolchain: blake3::Hash) -> bool {
+        disk_cache::read(entry).is_some_and(|held| held==toolchain.as_bytes())
+    }
+    fn record(&self, entry: &Path, toolchain: blake3::Hash) {
+        let _=disk_cache::write(entry,toolchain.as_bytes());
+    }
+}
+
+/// Admit the selected compiler against the store that `cache` names entries in. Every
+/// receipt, proof and compiler-named key starts here.
+pub(crate) fn admit<'c>(cache: &dyn Fn(blake3::Hash)->PathBuf, compiler: &'c Compiler) -> Result<vork_slang::Admitted<'c>> {
+    compiler.admit(&Admissions(cache))
+}
+
 fn program_identity(store: &disk_cache::Store, compiler: &Compiler, abi: &Abi, source: &str, origin: &Path) -> Result<vork_slang::InputIdentity> {
     bound_program_identity(store,compiler,abi,source,origin,"")
 }
@@ -821,17 +946,31 @@ pub(crate) fn bound_program_identity(
     store: &disk_cache::Store, compiler: &Compiler, abi: &Abi,
     source: &str, origin: &Path, bindings: &str,
 ) -> Result<vork_slang::InputIdentity> {
+    let admitted=admit(&|key|store.path("slang-input",1,key),compiler)?;
     let mut raw=input_key(b"program-input-receipt-v2",abi,source.as_bytes())?;
     raw.update(&(bindings.len() as u64).to_le_bytes());raw.update(bindings.as_bytes());
-    for part in [compiler.input_policy(),std::env::current_dir()?.join(origin).to_string_lossy().into_owned()] {
+    for part in [admitted.input_policy(),std::env::current_dir()?.join(origin).to_string_lossy().into_owned()] {
         raw.update(&(part.len() as u64).to_le_bytes());raw.update(part.as_bytes());
     }
     let path=store.path("slang-input",1,raw.finalize());
     if let Some(identity) = read_native_input_receipt(&path) { return Ok(identity); }
+    let roots=compiler.program_input_roots(origin)?;
+    let mut portable=input_key(b"closed-program-input-v1",abi,source.as_bytes())?;
+    let policy=admitted.portable_input_policy();
+    // Cache lookup must not add a UTF-8 restriction to compiler origins.
+    for part in [bindings.as_bytes(),origin.as_os_str().as_encoded_bytes(),policy.as_bytes()] {
+        portable.update(&(part.len() as u64).to_le_bytes());portable.update(part);
+    }
+    let closed=closed_receipt_path(&store.path("slang-program",2,portable.finalize()))?;
+    if let Some(identity)=read_closed_input_receipt(&closed,&roots) {
+        write_input_receipt(&path,&identity)?;
+        return Ok(identity);
+    }
     let prepared=compiler.prepare_bound_program(abi,source,origin,bindings)
         .with_context(|| format!("program source {}", origin.display()))?;
     let identity=prepared.receipt();
     write_input_receipt(&path, &identity)?;
+    write_closed_input_receipt(&closed,&identity,&roots)?;
     Ok(identity)
 }
 
@@ -846,10 +985,17 @@ pub(crate) fn native_input_identity(
     let path=native_input_receipt_path(cache,compiler,modules,main,entries,args,identities,inputs)?;
     if let Some(identity)=read_native_input_receipt(&path)
         && inputs.iter().all(|input| identity.verify(input).is_ok()) {return Ok((identity,None));}
+    let (closed,roots)=native_closed_input_receipt(cache,compiler,modules,main,entries,args,identities,inputs)?;
+    if let Some(identity)=read_closed_input_receipt(&closed,&roots)
+        && inputs.iter().all(|input| identity.verify(input).is_ok()) {
+        write_input_receipt(&path,&identity)?;
+        return Ok((identity,None));
+    }
     let prepared=compiler.prepare_identified_modules(modules,main,entries,args,identities)?;
     let identity=prepared.receipt();
     for input in inputs { identity.verify(input)?; }
     write_input_receipt(&path, &identity)?;
+    write_closed_input_receipt(&closed,&identity,&roots)?;
     Ok((identity,Some(prepared)))
 }
 
@@ -876,7 +1022,9 @@ pub(crate) fn native_code(
     Ok(code)
 }
 
-/// Scheduling probes must never invoke Slang: an unknown receipt is a miss.
+/// Scheduling probes never compile: an unknown receipt is a miss. Like every receipt
+/// path they admit the compiler first, which runs it only when the store has not seen
+/// this toolchain pass.
 /// Only the build owns preparation, retaining its snapshot through codegen.
 pub(crate) fn cached_native_input_identity(
     cache: &dyn Fn(blake3::Hash)->PathBuf, compiler: &Compiler,
@@ -884,8 +1032,59 @@ pub(crate) fn cached_native_input_identity(
     identities: &std::collections::BTreeMap<String,Vec<u8>>,
     inputs: &[vork_slang::InputIdentity],
 ) -> Result<Option<vork_slang::InputIdentity>> {
-    Ok(read_native_input_receipt(&native_input_receipt_path(cache,compiler,modules,main,entries,args,identities,inputs)?)
-        .filter(|identity| inputs.iter().all(|input| identity.verify(input).is_ok())))
+    let local=read_native_input_receipt(&native_input_receipt_path(cache,compiler,modules,main,entries,args,identities,inputs)?);
+    let identity=if local.is_some() {local} else {
+        let (closed,roots)=native_closed_input_receipt(cache,compiler,modules,main,entries,args,identities,inputs)?;
+        read_closed_input_receipt(&closed,&roots)
+    };
+    Ok(identity.filter(|identity| inputs.iter().all(|input| identity.verify(input).is_ok())))
+}
+
+fn closed_receipt_path(artifact: &Path) -> Result<PathBuf> {
+    let name=artifact.file_name().and_then(|n|n.to_str()).and_then(|n|n.split_once('.')).context("native cache file name")?.0;
+    Ok(artifact.with_file_name(format!("{name}.slang-closed-input-v1.entry")))
+}
+
+fn read_closed_input_receipt(path: &Path, roots: &[PathBuf]) -> Option<vork_slang::InputIdentity> {
+    let identity:vork_slang::ClosedInputIdentity=serde_json::from_slice(&disk_cache::read(path)?).ok()?;
+    identity.relocate(roots)
+}
+
+fn write_closed_input_receipt(path: &Path, identity: &vork_slang::InputIdentity, roots: &[PathBuf]) -> Result<()> {
+    if let Some(closed)=identity.closed(roots) {
+        let _=disk_cache::write(path,&serde_json::to_vec(&closed)?);
+    }
+    Ok(())
+}
+
+fn native_closed_input_receipt(
+    cache: &dyn Fn(blake3::Hash)->PathBuf, compiler: &Compiler,
+    modules: &[(&str,&str)], main: &str, entries: &[(&str,&str)], args: &[&str],
+    identities: &std::collections::BTreeMap<String,Vec<u8>>, inputs: &[vork_slang::InputIdentity],
+) -> Result<(PathBuf,Vec<PathBuf>)> {
+    let mut include=false;
+    let mut includes=Vec::new();
+    let portable_args:Vec<_>=args.iter().map(|arg| {
+        if include {include=false;includes.push(PathBuf::from(arg)); "<search-root>"}
+        else {include=*arg=="-I";*arg}
+    }).collect();
+    let mut raw=blake3::Hasher::new();
+    // This key binds the entire request, including unused supplied modules.
+    // Only path strings are relocated; each observed absence is checked again.
+    fn part(hash:&mut blake3::Hasher,bytes:&[u8]) {hash.update(&(bytes.len() as u64).to_le_bytes());hash.update(bytes);}
+    part(&mut raw,b"closed-native-input-v1");part(&mut raw,main.as_bytes());
+    raw.update(&(entries.len() as u64).to_le_bytes());
+    for (entry,stage) in entries {part(&mut raw,entry.as_bytes());part(&mut raw,stage.as_bytes());}
+    raw.update(&(portable_args.len() as u64).to_le_bytes());
+    for arg in portable_args {part(&mut raw,arg.as_bytes());}
+    raw.update(&(modules.len() as u64).to_le_bytes());
+    for (name,source) in modules {part(&mut raw,name.as_bytes());part(&mut raw,source.as_bytes());}
+    part(&mut raw,admit(cache,compiler)?.portable_input_policy().as_bytes());
+    raw.update(&(inputs.len() as u64).to_le_bytes());
+    for input in inputs {part(&mut raw,&input.identity);}
+    raw.update(&(identities.len() as u64).to_le_bytes());
+    for (name,identity) in identities {part(&mut raw,name.as_bytes());part(&mut raw,identity);}
+    Ok((closed_receipt_path(&cache(raw.finalize()))?,compiler.input_roots(&includes)?))
 }
 
 fn read_native_input_receipt(path: &Path) -> Option<vork_slang::InputIdentity> {
@@ -922,7 +1121,7 @@ pub(crate) fn native_input_receipt_path(
         .chain(modules.iter().flat_map(|(name,source)|[*name,*source])) {
         raw.update(&(part.len() as u64).to_le_bytes());raw.update(part.as_bytes());
     }
-    raw.update(compiler.input_policy().as_bytes());
+    raw.update(admit(cache,compiler)?.input_policy().as_bytes());
     // Every installed program is a dependency of this native composition, even
     // if its import paths are disjoint from a previously cached composition.
     for input in inputs {
@@ -966,18 +1165,13 @@ fn cached_proof<T: serde::Serialize + serde::de::DeserializeOwned>(
     abi: &Abi, source: &str, origin: &Path,
     build: impl FnOnce(&Compiler) -> Result<T>,
 ) -> Result<T> {
+    // A stored proof is this compiler's answer: admit it before reading one, also when
+    // the caller supplies the receipt.
+    admit(&|key|store.path("slang-input",1,key),compiler)?;
     let identity=match compiler.input_identity() {
         Some(identity)=>identity.clone(),
         None=>program_identity(store,compiler,abi,source,origin)?,
     };
-    for name in &identity.compatibility_modules {
-        crate::warnings::compatibility(name, serde_json::json!({"program":origin,"module":name}));
-    }
-    if let Some(name) = origin.to_str().and_then(|s| s.strip_suffix(".slang")) {
-        if vork_scene::libraries::COMPATIBILITY_MODULES.contains(&name) {
-            crate::warnings::compatibility(name, serde_json::json!({"program":origin,"module":name}));
-        }
-    }
     let key=input_key(key.as_bytes(),abi,&identity.identity)?.finalize();
     let path=store.path("slang-program",2,key);
     if identity.valid()
@@ -1176,7 +1370,8 @@ pub(crate) fn native(abi: &Abi, programs: &[Program], physical_hair: bool, cover
     };
     // The lit stage sees the surface stage's context: its shading normal, not the program's.
     let lit_stage = if lit {
-        format!("    let true_normal=coordinates_true_normal(k,s.geometric)*select(s.front_facing,1.,-1.);\n    \
+        format!("    surface_material_context(v,k);\n    \
+                 let true_normal=coordinates_true_normal(k,s.geometric)*select(s.front_facing,1.,-1.);\n    \
                  let record=material_records[material_record(v.object)];\n    \
                  var base=s;base.closure.geometry_normal=s.normal;\n    \
                  float4 a[{c}]={{}};\n{}    \
@@ -1291,9 +1486,10 @@ mod help_tests {
     /// falls. Before the ABI exposed it, install failed with
     /// "'geometry_coat_normal' is not a member of 'Closure'".
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     #[cfg(vork_private_tests)]
     fn programs_shade_their_coat_normal() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let render=|integrator:&str,coat_normal:&str|->Result<[f32;3]> {
             let mut scene:serde_json::Value=vork_scene::v2::with_test_settings(include_str!("../tests/fixtures/analytic.json"), include_str!("../tests/presets/analytic-7fefd52a.json"))?;
             scene["animation"]=serde_json::json!([]);
@@ -1323,8 +1519,9 @@ mod help_tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn camera_programs_deduplicate_and_keep_independent_content() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         // Keep the compile-count assertion independent of an earlier test process's disk cache.
         let source=format!("{}\n// independence test {}", "import vork; struct Inputs {float value=0.25;}; Closure surface(ShadingContext ctx,Inputs i) {Closure c;c.base_color=float3(i.value);return c;}",std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos());
         let mut scene:v2::Scene=vork_scene::v2::from_test_value(serde_json::json!({"version":2,"nodes":[],
@@ -1452,9 +1649,9 @@ float3 environment(EnvironmentContext ctx, Inputs inputs) { return float3(.1); }
 struct Inputs {};
 float4 composite(CompositeContext ctx, Inputs inputs) { return compositor_sample(ctx.uv); }
 "#),
-            ("display", r#"import vork;
+            ("view", r#"import vork;
 struct Inputs {};
-float3 display(DisplayContext ctx, Inputs inputs) { return ctx.color / (1. + ctx.color); }
+import std.view; ViewResult view(ViewContext ctx, Inputs inputs) { return finish_view(ctx.color / (1. + ctx.color),ctx,1.); }
 "#),
             ("compute", r#"import vork;
 struct Inputs {};
@@ -1474,7 +1671,7 @@ void compute(ComputeContext ctx, Inputs inputs) {}
                 "medium" => compiler.compile_medium(&abi,source,&origin,&tag).map(|_|())?,
                 "environment" => compiler.compile_environment(&abi,source,&origin,&tag).map(|_|())?,
                 "composite" => compiler.compile_composite(&abi,source,&origin,&tag).map(|_|())?,
-                "display" => compiler.compile_display(&abi,source,&origin,&tag).map(|_|())?,
+                "view" => compiler.compile_display(&abi,source,&origin,&tag).map(|_|())?,
                 "compute" => compiler.compile_compute(source,&origin,crate::compute::CONTEXT_BINDINGS,1,[1,1,1]).map(|_|())?,
                 _ => anyhow::bail!("unknown documented stage {stage}"),
             }
@@ -1529,7 +1726,8 @@ pub(crate) fn sample_words(value: &crate::animation::Sample, binding: &crate::an
     let value = match value {
         crate::animation::Sample::Numeric(value) => value,
         crate::animation::Sample::Bool(value) => return vec![u32::from(*value)],
-        crate::animation::Sample::String(value) => return vec![binding.enum_tokens.as_ref().unwrap().iter().position(|v| v == value.as_ref()).unwrap() as u32],
+        crate::animation::Sample::Style(_) => unreachable!("CSS/SVG channels do not bind material inputs"),
+                crate::animation::Sample::String(value) => return vec![binding.enum_tokens.as_ref().unwrap().iter().position(|v| v == value.as_ref()).unwrap() as u32],
     };
     value.iter().map(|&v| match ty {
         vork_slang::Type::Int => (v as i32) as u32,
@@ -1544,12 +1742,18 @@ pub(crate) struct InputAnimation {
     plan: crate::animation::Plan,
 }
 impl InputAnimation {
+    /// On its own, reading any media the plan needs itself.
+    #[cfg(test)]
     pub(crate) fn new(scene: &v2::Scene, base: &Path, material: &str, layout: &vork_slang::InputLayout, words: &mut [u32]) -> Result<Option<Self>> {
-        Self::with_discrete(scene, base, material, layout, words, false)
+        Self::with_discrete(scene, base, material, layout, words, false, &Default::default())
     }
-    pub(crate) fn with_discrete(scene: &v2::Scene, base: &Path, material: &str, layout: &vork_slang::InputLayout, words: &mut [u32], discrete: bool) -> Result<Option<Self>> {
+    /// Within a document open: the plan reads media through the sources that open read.
+    pub(crate) fn new_in(scene: &v2::Scene, base: &Path, material: &str, layout: &vork_slang::InputLayout, words: &mut [u32], opened: &crate::footage::Opened) -> Result<Option<Self>> {
+        Self::with_discrete(scene, base, material, layout, words, false, opened)
+    }
+    pub(crate) fn with_discrete(scene: &v2::Scene, base: &Path, material: &str, layout: &vork_slang::InputLayout, words: &mut [u32], discrete: bool, opened: &crate::footage::Opened) -> Result<Option<Self>> {
         if !crate::materials::animated_inputs(scene)?.contains_key(material) { return Ok(None); }
-        let mut plan = crate::animation::Plan::compile_with_buffers(scene, base, None)?;
+        let mut plan = crate::animation::Plan::compile_in(scene, base, None, opened)?;
         bind_input_words(&mut plan, material, layout, words, 0, 0., discrete)?;
         Ok(Some(Self { plan }))
     }
@@ -1618,7 +1822,7 @@ mod bundled_origin_tests {
 
     #[test]
     fn launch_analysis_keeps_failures_in_traversal_order() -> Result<()> {
-        let renderer = pollster::block_on(Renderer::create(|_| Ok(true), true))?;
+        let renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
         let mut scene = crate::test_scene(serde_json::json!({
             "version":2,
             "programs":{"a":{"file":"missing-second.slang"},"z":{"file":"missing-first.slang"}},
@@ -1635,7 +1839,7 @@ mod bundled_origin_tests {
 
     #[test]
     fn launch_analysis_shares_programs_and_preserves_warning_order() -> Result<()> {
-        let renderer = pollster::block_on(Renderer::create(|_| Ok(true), true))?;
+        let renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
         let mut scene = crate::test_scene(serde_json::json!({
             "version":2,
             "programs":{
@@ -1670,7 +1874,7 @@ mod bundled_origin_tests {
 
     #[test]
     fn launch_analysis_preserves_static_and_animated_implicit_inputs() -> Result<()> {
-        let renderer = pollster::block_on(Renderer::create(|_| Ok(true), true))?;
+        let renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
         let mut scene = crate::test_scene(serde_json::json!({
             "version":2,
             "buffers":{"field":{"type":"f32","dims":[2,2,2]}},
@@ -1759,7 +1963,7 @@ mod bundled_origin_tests {
         let store=disk_cache::Store::for_test(root.join("cache"));
         let compiler=Compiler::discover(); let abi=abi();
         let origin=root.join("main.slang");
-        let source="import sub.wrapper; struct Inputs {}; float3 display(DisplayContext ctx, Inputs inputs){return float3(wrapped());}";
+        let source="import sub.wrapper; struct Inputs {}; import std.view; ViewResult view(ViewContext ctx, Inputs inputs){return finish_view(float3(wrapped()),ctx,1.);}";
         let helper=root.join("helper.slang"); let sibling=root.join("sub/helper.slang");
         std::fs::write(root.join("sub/wrapper.slang"),"import helper; public float wrapped(){return value();}")?;
         std::fs::write(&helper,"public float value(){return 0.25;}")?;
@@ -1790,7 +1994,7 @@ mod bundled_origin_tests {
         let store=disk_cache::Store::for_test(root.join("cache"));
         let compiler=Compiler::discover(); let abi=abi();
         let origin=root.join("main.slang"); let sibling=root.join("helper.slang");
-        let source="import helper; struct Inputs {}; float3 display(DisplayContext ctx, Inputs inputs){return float3(value());}";
+        let source="import helper; struct Inputs {}; import std.view; ViewResult view(ViewContext ctx, Inputs inputs){return finish_view(float3(value()),ctx,1.);}";
         std::fs::write(&sibling,"public float value(){return 0.5;}")?;
         let build=|compiler:&Compiler|compiler.compile_display(&abi,source,&origin,"cachetest");
         let race_key=blake3::hash(b"display-publication-race");
@@ -1810,30 +2014,23 @@ mod bundled_origin_tests {
     }
 
     #[test]
-    fn compatibility_warnings_survive_proof_cache_hits() -> Result<()> {
-        let root=std::env::temp_dir().join(format!("vork-compatibility-proof-{}",std::process::id()));
-        std::fs::create_dir_all(&root)?;
-        let store=disk_cache::Store::for_test(root.join("cache"));
-        let compiler=Compiler::discover(); let abi=abi(); let origin=root.join("main.slang");
-        for (module, deprecated) in [("std/vector", false), ("std/procedurals", false), ("std/particles", true)] {
-            let source=format!("import {}; struct Inputs {{}}; float3 display(DisplayContext ctx, Inputs i){{return float3(0.25);}}",module.replace('/', "."));
-            let key=blake3::hash(module.as_bytes());
-            for warm in [false, true] {
-                let collector=crate::warnings::Collector::default();
-                let _scope=collector.enter();
-                let _:vork_slang::DisplayProgram=cached_proof(&store,key,&compiler,&abi,&source,&origin,|compiler| {
-                    assert!(!warm, "second call must use the stored proof");
-                    compiler.compile_display(&abi,&source,&origin,"compat")
-                })?;
-                let warnings=collector.snapshot();
-                assert_eq!(warnings.len(),usize::from(deprecated),"{module}, warm={warm}");
-                if deprecated {
-                    assert_eq!(warnings[0].code,"compatibility_04");
-                    assert_eq!(warnings[0].requested["module"],module);
-                }
+    fn removed_modules_never_publish_proofs() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("vork-removed-proof-{}", std::process::id()));
+        let store = disk_cache::Store::for_test(root.join("cache"));
+        let compiler = Compiler::discover();
+        let abi = abi();
+        for (module, replacement) in [("post.white_balance", "std.white_balance"), ("std.particles", "fluid.particles")] {
+            let source = format!("import {module}; struct Inputs {{}}; import std.view; ViewResult view(ViewContext c, Inputs i) {{return finish_view(float3(0.25),c,1.);}}");
+            for _ in 0..2 {
+                let result: Result<vork_slang::DisplayProgram> = cached_proof(&store, blake3::hash(source.as_bytes()), &compiler, &abi, &source, &root.join("main.slang"), |_| {
+                    panic!("removed imports must refuse before building a proof")
+                });
+                let error = format!("{:#}", result.err().expect("removed module accepted"));
+                assert_eq!(error.lines().count(), 1, "{error}");
+                assert!(error.contains(replacement) && error.contains("vork help upgrade"), "{error}");
             }
         }
-        std::fs::remove_dir_all(root)?;
+        if root.exists() { std::fs::remove_dir_all(root)?; }
         Ok(())
     }
 
@@ -1844,8 +2041,8 @@ mod bundled_origin_tests {
         std::fs::write(root.join("helper.slang"),"public float value(){return 0.75;}")?;
         let store=disk_cache::Store::for_test(root.join("cache"));
         let compiler=Compiler::discover(); let abi=abi(); let origin=root.join("main.slang");
-        let source="struct Inputs {}; float3 display(DisplayContext ctx, Inputs i){return float3(0.25);}";
-        let actual="import helper; struct Inputs {}; float3 display(DisplayContext ctx, Inputs i){return float3(value());}";
+        let source="struct Inputs {}; import std.view; ViewResult view(ViewContext ctx, Inputs i){return finish_view(float3(0.25),ctx,1.);}";
+        let actual="import helper; struct Inputs {}; import std.view; ViewResult view(ViewContext ctx, Inputs i){return finish_view(float3(value()),ctx,1.);}";
         let key=blake3::hash(b"proof-extra-inputs");
         let result=cached_proof(&store,key,&compiler,&abi,source,&origin,|compiler|
             compiler.compile_display(&abi,actual,&origin,"extra"));
@@ -1865,7 +2062,7 @@ mod bundled_origin_tests {
         let root=std::env::temp_dir().join(format!("vork-portable-proof-{}",std::process::id()));
         let store=disk_cache::Store::for_test(root.clone());
         let key=blake3::hash(b"portable-display-proof");
-        let source="struct Inputs {}; float3 display(DisplayContext ctx, Inputs inputs){return ctx.color;}";
+        let source="struct Inputs {}; import std.view; ViewResult view(ViewContext ctx, Inputs inputs){return finish_view(ctx.color,ctx,1.);}";
         let abi=abi(); let compiler=Compiler::discover();
         let first_origin=root.join("setup/embedded.slang");
         let other_origin=root.join("scene/embedded.slang");
@@ -1897,7 +2094,7 @@ mod bundled_origin_tests {
         stage!("surface","struct Inputs {}; Closure surface(ShadingContext c,Inputs i){Closure o={};o.base_color=float3(0.3);return o;}",compile_surface);
         stage!("camera",vork_slang::module_source("std/camera").unwrap(),compile_camera);
         stage!("environment","struct Inputs {}; float3 environment(EnvironmentContext c,Inputs i){return float3(c.direction.y);}",compile_environment);
-        stage!("medium",vork_slang::module_source("std/fog").unwrap(),compile_medium);
+        stage!("medium",include_str!("../../vork-scene/tests/fixtures/medium.slang"),compile_medium);
         stage!("composite","struct Inputs {float gain=1.;}; float4 composite(CompositeContext c,Inputs i){return compositor_sample(c.uv)*i.gain;}",compile_composite);
         stage!("propagation","struct Inputs {}; PropagationStep propagation(PropagationContext c,Inputs i){PropagationStep s;s.direction=c.direction;s.distance=1.;return s;}",compile_propagation);
         let source="struct Inputs {uint amount=3;}; void compute(ComputeContext c,Inputs i){result_store(c.id.x,i.amount);}";
@@ -1913,6 +2110,23 @@ mod bundled_origin_tests {
         std::fs::remove_dir_all(root)?;Ok(())
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn closed_program_lookup_preserves_non_utf8_origins() -> Result<()> {
+        use std::os::unix::ffi::OsStringExt;
+        let root=std::env::temp_dir().join(format!("vork-closed-origin-{}",std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let origin=root.join(std::ffi::OsString::from_vec(b"material\xff.slang".to_vec()));
+        let compiler=Compiler::discover();let abi=abi();
+        let source="struct Inputs {}; Closure surface(ShadingContext c,Inputs i){Closure o={};return o;}";
+        let expected=compiler.prepare_program(&abi,source,&origin)?.receipt();
+        let store=disk_cache::Store::for_test(root.join("cache"));
+        let actual=program_identity(&store,&compiler,&abi,source,&origin)?;
+        assert_eq!(actual.identity,expected.identity);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
     #[test]
     fn semantic_program_aliases_keep_ids_when_only_comments_change() -> Result<()> {
         let compiler=Compiler::discover(); let abi=abi(); let origin=Path::new("material.slang");
@@ -1921,6 +2135,68 @@ mod bundled_origin_tests {
         let comment=compiler.prepare_program(&abi,&format!("// alias description\n{source}"),origin)?;
         let edited=compiler.prepare_program(&abi,&source.replace("0.25","0.75"),origin)?;
         assert_eq!(semantic_indices([base.identity(),comment.identity(),edited.identity(),base.identity()].into_iter()),vec![0,0,1,0]);
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_compiler_that_is_not_the_pinned_one_is_refused_before_any_cache_decision() -> Result<()> {
+        // audit-3d 9: receipt and proof reuse answered before the version check, so a wrong
+        // compiler was refused only on a miss. `echo` runs and reports no Slang version.
+        let root=std::env::temp_dir().join(format!("vork-compiler-admission-{}",std::process::id()));
+        let _=std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root)?;
+        let store=disk_cache::Store::for_test(root.join("cache"));
+        let cache=|key|store.path("slang-variant",1,key);
+        let compiler=Compiler::new("/bin/echo");
+        let refused=|error:Option<anyhow::Error>,path:&str| {
+            let error=error.unwrap_or_else(||panic!("{path} accepted an unadmitted compiler"));
+            assert!(error.downcast_ref::<vork_slang::CompilerUnavailable>().is_some(),"{path}: {error:#}");
+        };
+        refused(admit(&cache,&compiler).err(),"admit");
+        let modules=[("main","[numthreads(1,1,1)] void main(){}")];
+        let entries=[("main","compute")];
+        let args=["-target","spirv"];
+        // The lookup that never compiles: on an empty store it used to answer "a miss".
+        refused(cached_native_input_identity(&cache,&compiler,&modules,"main",&entries,&args,&Default::default(),&[]).err(),"scheduling lookup");
+        refused(native_input_receipt_path(&cache,&compiler,&modules,"main",&entries,&args,&Default::default(),&[]).err(),"receipt path");
+        refused(native_input_identity(&cache,&compiler,&modules,"main",&entries,&args,&Default::default(),&[]).err(),"native identity");
+        let abi=abi();
+        let source="struct Inputs {}; float3 environment(EnvironmentContext c,Inputs i){return float3(c.direction.y);}";
+        let origin=root.join("environment.slang");
+        refused(bound_program_identity(&store,&compiler,&abi,source,&origin,"").err(),"program identity");
+        let key=blake3::hash(b"admission");
+        let proof:Result<serde_json::Value>=cached_proof(&store,key,&compiler,&abi,source,&origin,
+            |_|anyhow::bail!("an unadmitted compiler reached the build"));
+        refused(proof.err(),"proof");
+        // The warm case: the pinned compiler leaves a receipt and a proof in the store. The
+        // other executable, handed that valid receipt, would be answered from the proof.
+        let pinned=Compiler::discover();
+        let receipt=bound_program_identity(&store,&pinned,&abi,source,&origin,"")?;
+        let proved:serde_json::Value=cached_proof(&store,key,&pinned.with_identity(&receipt),&abi,source,&origin,|compiler|
+            Ok(serde_json::to_value(compiler.compile_environment(&abi,source,&origin,"admission")?)?))?;
+        let again:serde_json::Value=cached_proof(&store,key,&pinned.with_identity(&receipt),&abi,source,&origin,
+            |_|anyhow::bail!("the stored proof was not reused"))?;
+        assert_eq!(proved,again);
+        let warm:Result<serde_json::Value>=cached_proof(&store,key,&compiler.with_identity(&receipt),&abi,source,&origin,
+            |_|anyhow::bail!("an unadmitted compiler reached the build"));
+        refused(warm.err(),"stored proof with a supplied receipt");
+        // A refused toolchain is never recorded as admitted. (Which store holds the pinned
+        // one's record depends on the test that first checked it in this process.)
+        use vork_slang::AdmissionLedger as _;
+        let toolchain=compiler.toolchain()?;
+        let by_input=Admissions(&|key|store.path("slang-input",1,key));
+        let by_variant=Admissions(&cache);
+        // Every kind of lookup in one store names the same admission entry.
+        assert_eq!(by_input.entry(toolchain),by_variant.entry(toolchain));
+        let entry=by_input.entry(toolchain).context("admission entry")?;
+        assert!(!by_input.admitted(&entry,toolchain));
+        // An admission written through one kind is read through the other.
+        let pinned_toolchain=pinned.toolchain()?;
+        let entry=by_variant.entry(pinned_toolchain).context("admission entry")?;
+        by_variant.record(&entry,pinned_toolchain);
+        assert!(by_input.admitted(&entry,pinned_toolchain));
+        std::fs::remove_dir_all(&root)?;
         Ok(())
     }
 
@@ -1993,15 +2269,52 @@ mod bundled_origin_tests {
     }
 
     #[test]
+    fn closed_native_inputs_relocate_without_skipping_import_precedence() -> Result<()> {
+        let root=std::env::temp_dir().join(format!("vork-closed-native-{}",std::process::id()));
+        let first=root.join("first");let second=root.join("second");
+        std::fs::create_dir_all(&first)?;std::fs::create_dir_all(&second)?;
+        let store=disk_cache::Store::for_test(root.join("cache"));
+        let cache=|key|store.path("slang-variant",1,key);
+        let compiler=Compiler::discover();
+        let first_text=first.to_string_lossy();let second_text=second.to_string_lossy();
+        let a=["-target","spirv","-I",first_text.as_ref()];
+        let b=["-target","spirv","-I",second_text.as_ref()];
+        let modules=[("main","import helper; RWStructuredBuffer<float> output; [numthreads(1,1,1)] void main(uint3 id:SV_DispatchThreadID){output[id.x]=value();}"),
+            ("helper","public float value(){return 0.25;}")];
+        let entries=[("main","compute")];let identities=Default::default();
+        let (before,prepared)=native_input_identity(&cache,&compiler,&modules,"main",&entries,&a,&identities,&[])?;
+        assert!(prepared.is_some());
+        let (after,prepared)=native_input_identity(&cache,&compiler,&modules,"main",&entries,&b,&identities,&[])?;
+        assert!(prepared.is_none(),"closed request must use the relocated receipt");
+        assert_eq!(before.identity,after.identity);
+        let fresh=compiler.prepare_identified_modules(&modules,"main",&entries,&b,&identities)?.receipt();
+        assert_eq!(fresh.identity,after.identity,"relocation must match fresh compiler capture");
+        assert!(after.valid());
+        let changed=[modules[0],("helper","public float value(){return 0.5;}")];
+        assert!(cached_native_input_identity(&cache,&compiler,&changed,"main",&entries,&b,&identities,&[])?.is_none());
+        // Slang probes serialized modules ahead of the supplied source. Adding
+        // one invalidates both the local and the portable receipt.
+        let (closed_path,roots)=native_closed_input_receipt(&cache,&compiler,&modules,"main",&entries,&b,&identities,&[])?;
+        assert!(read_closed_input_receipt(&closed_path,&roots).is_some());
+        std::fs::write(second.join("helper.slang-module"),b"not a valid module")?;
+        assert!(cached_native_input_identity(&cache,&compiler,&modules,"main",&entries,&b,&identities,&[])?.is_none());
+        assert!(read_closed_input_receipt(&closed_path,&roots).is_none());
+        std::fs::remove_dir_all(root)?;Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn setup_surface_artifacts_are_reused_from_another_scene_directory() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let scene:v2::Scene=serde_json::from_value(serde_json::json!({"version":2,"nodes":[]}))?;
         let (source,origin)=material_source(&scene,Path::new("/setup"),"std/hair")?;
         let abi=abi();
         let first=compile(&r,&Compiler::discover(),&abi,&source,&origin)?;
         let (source,origin)=material_source(&scene,Path::new("/scenes/shot"),"std/hair")?;
-        let key=program_key(b"program-v4",&abi,&source,&origin)?.finalize();
-        let second:Program=cached(&r,key,&Compiler::discover(),&abi,&source,&origin,
+        // Probe the store exactly as `compile` reads it: same identity, same key.
+        let compiler=Compiler::discover();
+        let identity=program_identity(&r.disk_cache,&compiler,&abi,&source,&origin)?;
+        let second:Program=cached(&r,compile_key(&abi,&identity)?,&compiler.with_identity(&identity),&abi,&source,&origin,
             |_|anyhow::bail!("bundled hair recompiled in another scene directory"))?;
         assert_eq!(first.slang,second.slang);
         assert_eq!(first.wgsl,second.wgsl);
@@ -2011,7 +2324,7 @@ mod bundled_origin_tests {
     #[test]
     fn bundled_material_origins_are_independent_of_the_scene_directory() -> Result<()> {
         let scene:v2::Scene=serde_json::from_value(serde_json::json!({"version":2,"nodes":[]}))?;
-        for name in ["std/hair", "std/fog"] {
+        for name in ["std/hair"] {
             let a=material_source(&scene,Path::new("/setup"),name)?;
             let b=material_source(&scene,Path::new("/scenes/shot"),name)?;
             assert_eq!(a,b);

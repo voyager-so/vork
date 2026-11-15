@@ -1,4 +1,4 @@
-//! Visible losses and compatibility notices are render results, not debug logging. A shot owns its collector;
+//! Visible losses are render results, not debug logging. A shot owns its collector;
 //! installation workers explicitly inherit it, so concurrent shots stay isolated.
 use std::{cell::RefCell, sync::{Arc, Mutex}};
 use serde::Serialize;
@@ -8,17 +8,20 @@ pub struct RenderWarning {
     pub code: &'static str,
     /// Authored object, program, binding or value; runtime losses name the output frame and counters.
     pub requested: serde_json::Value,
-    /// Omitted/substituted behaviour, or compatibility removal and rewrite guidance.
+    /// Omitted/substituted behaviour.
     pub dropped: String,
 }
 #[derive(Clone, Default)]
-pub(crate) struct Collector(Arc<Mutex<Vec<RenderWarning>>>);
+pub(crate) struct Collector(Arc<Mutex<Vec<RenderWarning>>>, bool);
 thread_local! { static CURRENT: RefCell<Option<Collector>> = const { RefCell::new(None) }; }
 pub(crate) struct Guard(Option<Collector>);
 impl Drop for Guard {
     fn drop(&mut self) { CURRENT.with(|c| *c.borrow_mut() = self.0.take()); }
 }
 impl Collector {
+    /// CPU read-back collects render-only notices without printing them into a
+    /// question's atomic answer/refusal. Rendering retains the default policy.
+    pub(crate) fn quiet() -> Self { Self(Arc::default(), true) }
     pub(crate) fn enter(&self) -> Guard {
         Guard(CURRENT.with(|c| c.replace(Some(self.clone()))))
     }
@@ -34,12 +37,13 @@ fn record(code: &'static str, requested: serde_json::Value, dropped: String) {
         let collector = current.borrow();
         let Some(collector) = collector.as_ref() else { return true };
         let mut warnings = collector.0.lock().unwrap();
-        if warnings.contains(&warning) { false } else { warnings.push(warning.clone()); true }
+        if warnings.contains(&warning) { false } else { warnings.push(warning.clone()); !collector.1 }
     });
-    if fresh {
+    if fresh && code == "nonfinite_samples" {
+        eprintln!("WARNING: {}", warning.dropped);
+    } else if fresh {
         // No ANSI or TTY detection: the same conspicuous record survives logs.
-        let title = if code == "compatibility_04" { "0.4 COMPATIBILITY" } else { "REQUESTED EFFECT DROPPED" };
-        eprintln!("\nWARNING: {title} [{}]\n  requested: {}\n  dropped: {}\n", warning.code, warning.requested, warning.dropped);
+        eprintln!("\nWARNING: REQUESTED EFFECT DROPPED [{}]\n  requested: {}\n  dropped: {}\n", warning.code, warning.requested, warning.dropped);
     }
 }
 
@@ -74,10 +78,4 @@ mod tests {
         assert_eq!(first.snapshot()[0].requested["stage"], "lit");
         assert_eq!(serde_json::to_value(first.snapshot()).unwrap()[0]["code"], "test");
     }
-}
-
-pub(crate) fn compatibility(name: &str, requested: serde_json::Value) {
-    let rewrite = if name == "std/particles" { "an import of fluid.particles" }
-        else { "authored Slang" };
-    record("compatibility_04", requested, format!("{name} is deprecated and will be removed in a future release; rewrite as {rewrite}; see upgrade notes"));
 }

@@ -329,6 +329,8 @@ pub(crate) fn sample_frame(
     sample_pose(&s.nodes, &s.assets, &s.animation, &s.targets, &s.environment, &request, samples, values, worlds)?;
     let active_camera=s.animation.camera_at_request(&request,s.camera)?;
     for (index,node) in values.iter_mut().enumerate().filter_map(|(index,node)|node.as_mut().map(|node|(index,node))) {
+        // Rule 1: an absent camera's program state is not evaluated.
+        if s.animation.absent(samples,index) {continue;}
         if let Some(camera)=&mut node.camera {
             camera.time=time;
             for (binding,value) in s.animation.material_values(samples,0.) {
@@ -338,8 +340,8 @@ pub(crate) fn sample_frame(
                 }
             }
             let selected=std::iter::once(s.render.clone()).filter(|_|index==active_camera)
-                .chain(s.scene.images.values().filter_map(|i|i.render.as_ref()).filter(|image|
-                    image.camera.as_deref().map_or(index==s.camera,|name|name==node.node.name)).map(|image|image.resolve(&s.render)));
+                .chain(s.scene.images.values().filter(|image|image.render.as_ref().is_some_and(|render|
+                    render.camera.as_deref().map_or(index==s.camera,|name|name==node.node.name))).filter_map(|image|image.resolved_render(&s.render)));
             for render in selected {
                 let calibration=camera.calibration(render.resolution[0] as f32/render.resolution[1] as f32)?;
                 ensure!(render.settings.integrator.is_path() || calibration.is_some(),"raster camera must retain projective calibration at every sample");
@@ -378,6 +380,20 @@ pub(crate) fn sample_pose_inputs(
     let request=request.into();
     let time=request.numeric()?;
     animation.sample_request_into(time, &request, samples)?;
+    apply_pose_samples(originals, assets, animation, targets, time, samples, values, worlds)
+}
+
+/// Apply an already sampled plan, including the frame evaluator's instance offsets.
+pub(crate) fn apply_pose_samples(
+    originals: &[EvalNode],
+    assets: &[Asset],
+    animation: &animation::Plan,
+    targets: &crate::targets::Plan,
+    time: f32,
+    samples: &animation::Samples,
+    values: &mut [Option<EvalNode>],
+    worlds: &mut [Mat4],
+) -> Result<()> {
     animation.apply_nodes(samples, values);
     let nodes = SampledNodes::new(originals, values);
     let mut poses = std::collections::HashMap::new();
@@ -385,22 +401,29 @@ pub(crate) fn sample_pose_inputs(
         let index = targets.order.get(position).copied().unwrap_or(position);
         let original = &originals[index];
         let node = &nodes[index];
+        // Rule 1: an absent node, an absent asset's imported nodes included, is not evaluated.
+        if animation.absent(samples, index) { continue; }
         if let Some((asset, local, root, _)) = original.embedded {
             let pose = poses.entry(asset).or_insert_with(|| assets[asset].pose_with_plan(samples, animation));
             worlds[index] = worlds[root] * pose.worlds[local];
         } else if original.dynamic {
             let world = node_world(&node.node, node.parent.map_or(Mat4::IDENTITY, |p| worlds[p]))?;
-            worlds[index] = targets.aim(index, world, worlds, &node.node).map_err(|error| anyhow::anyhow!("{error} at sample time {time}"))?;
+            worlds[index] = targets.aim(index, world, worlds, &node.node, |target| animation.absent(samples, target)).map_err(|error| anyhow::anyhow!("{error} at sample time {time}"))?;
         }
     }
     for (index, original) in originals.iter().enumerate() {
         if let Some((asset, local, _, _)) = original.embedded {
+            // An absent imported node keeps the visibility its absence gave it: off.
+            if animation.absent(samples, index) { continue; }
             if let Some(node) = values[index].as_mut() {
                 node.node.visibility = lights::visibility_from_mask(poses[&asset].visibility[local]);
             }
         }
     }
     for &(camera, target) in &targets.focus {
+        if animation.absent(samples, camera) { continue; }
+        ensure!(!animation.absent(samples, target), "node {:?}: focus_object {:?} is absent (active); focus on a node that exists at sample time {time}",
+            originals[camera].node.name, originals[target].node.name);
         if let Some(state) = &mut values[camera].as_mut().expect("focus camera is dynamic").camera {
             state.focus = crate::targets::focus_distance(worlds[camera], worlds[target]);
         }
@@ -432,7 +455,7 @@ impl FrameSlot {
     ) -> Result<(Vec<u8>, Vec<Upload>, Mat4, Uniform)> {
         self.sample_request=request.into();
         let time=self.sample_request.numeric()?;
-        let exact=!s.footage.is_empty() || s.compute.is_some() || s.animation.has_camera_tracks() || s.environment.has_media() || s.animation.has_discrete_tracks();
+        let exact=!s.footage.is_empty() || s.compute.is_some() || s.animation.has_camera_tracks() || s.environment.has_media() || s.animation.has_discrete_tracks() || s.animation.has_clocks();
         self.previous_request=if self.exposure_cut {self.sample_request.clone()}
             else if exact {self.sample_request.previous(s.render.fps)?}
             else {vork_time::Request::Numeric((time-1./s.render.fps.as_f32()).max(0.))};
@@ -469,6 +492,9 @@ impl FrameSlot {
             s.animation
                 .apply_render(&mut self.animation_values, &s.render);
         }
+        // Rule 1: an absent camera has no view to render through.
+        ensure!(!s.animation.absent(&self.animation_values, camera_index),
+            "render.camera: camera {:?} is absent (active); render through a camera that exists at sample time {time}", s.nodes[camera_index].node.name);
         let render = self.animation_values.render.as_ref().unwrap();
         let nodes = SampledNodes::new(&s.nodes, &self.sampled_nodes);
         let cut=self.exposure_cut;
@@ -608,6 +634,8 @@ impl FrameSlot {
                 if camera_world { environment_constant } else { [0.; 3] }
             }
             vork_scene::Background::Mode(vork_scene::BackgroundMode::Transparent) => [0.; 3],
+            // A 2D canvas's background; a 3D world refuses it when the scene loads.
+            vork_scene::Background::Css(_) => [0.; 3],
         };
         let environment_links = s.environment.node.map(|node| s.links.illuminates(node));
         // Jittered temporal colour never writes controls; its nominal pass does.
@@ -696,7 +724,7 @@ impl FrameSlot {
                 s.environment.initial_mean()[0],
                 s.environment.initial_mean()[1],
                 s.environment.initial_mean()[2],
-                0.,
+                f32::from(s.environment.lighting_is_black),
             ],
             scene: [time, self.nominal_frame as f32, f32::from(cut), render.fps.as_f32()],
             shadow_links: [0, 1, 0, 0],
@@ -730,11 +758,12 @@ impl FrameSlot {
                 },
                 transmission_word(render),
             ],
-            medium: [s.medium_base,s.rays.as_ref().map_or(0,|r|r.emitters),0,u32::from(environment_visibility & constants::RAY_VOLUME!=0)],
+            medium: [s.medium_base,s.rays.as_ref().map_or(0,|r|r.emitters),s.environment_base,u32::from(environment_visibility & constants::RAY_VOLUME!=0)],
             display: [f32::from_bits(render.settings.seed),render.resolution[0] as f32,render.resolution[1] as f32,self.view.post.display_base.unwrap_or(0) as f32],
             post: [if s.has_catchers {1.} else {post_mode(render)},
-                0.,
-                0.,
+                frame_time,
+                // The display stage's dither switch: zero dithers; only tests turn it off (Render::dither).
+                if render.dither {0.} else {1.},
                 lens_scale(sampled_lens && s.plan.decoupled && self.view.visibility_samples > 1)],
             composite_projection: projection,
             composite_optics,
@@ -765,7 +794,7 @@ impl FrameSlot {
                 if s.plan.effects.indirect { 1. } else { 0. },
             ],
         };
-        self.view.post.compositor_inputs.upload(s, frame_time, changes);
+        self.view.post.compositor_inputs.upload(s, frame_time, changes)?;
         if let Some(buffer) = &self.view.post.display_inputs {
             s.display_program.upload(buffer, frame_time, changes);
         }
@@ -822,6 +851,7 @@ impl FrameSlot {
                     let order = if group.world_order.is_empty() { &group.nodes } else { &group.world_order };
                     for &index in order {
                         let node = &shifted_nodes[index];
+                        if s.animation.absent(offset_samples, index) { continue; }
                         if let Some((asset, local, root, _)) = s.nodes[index].embedded {
                             let pose = poses
                                 .entry(asset)
@@ -829,7 +859,7 @@ impl FrameSlot {
                             offset_worlds[index] = offset_worlds[root] * pose.worlds[local];
                         } else {
                             let world = node_world(&node.node, node.parent.map_or(Mat4::IDENTITY, |p| offset_worlds[p]))?;
-                            offset_worlds[index] = s.targets.aim(index, world, offset_worlds, &node.node).map_err(|error| anyhow::anyhow!("{error} at sample time {}", pose_time + group.offset))?;
+                            offset_worlds[index] = s.targets.aim(index, world, offset_worlds, &node.node, |target| s.animation.absent(offset_samples, target)).map_err(|error| anyhow::anyhow!("{error} at sample time {}", pose_time + group.offset))?;
                         }
                     }
                 }
@@ -858,7 +888,9 @@ impl FrameSlot {
                 for &object in &group.objects {
                     let root = &s.roots[object];
                     let mut world = root.world(worlds);
-                    let hidden_scale = buffers::node_collapsed(&sampled_nodes, root.node)
+                    // Rule 1: an absent object is hidden without evaluating its asset's pose.
+                    let absent = s.animation.absent(sampled, root.node);
+                    let hidden_scale = absent || buffers::node_collapsed(&sampled_nodes, root.node)
                         || root.imported_pose.is_some_and(|(asset, local)| {
                             poses.entry(asset).or_insert_with(|| s.assets[asset].pose_sampled(sampled)).collapsed[local]
                         });
@@ -868,10 +900,12 @@ impl FrameSlot {
                     let value = &mut self.object_values[object];
                     if current {
                         value.model = world;
-                        value.metadata[1] = if hidden_scale {0} else {buffers::node_visibility_mask(&sampled_nodes, root.node)}
-                            & if let Some((asset, local)) = root.imported_pose {
-                                poses.entry(asset).or_insert_with(|| s.assets[asset].pose_sampled(sampled)).visibility[local]
-                            } else { root.imported_visibility };
+                        value.metadata[1] = if hidden_scale {0} else {
+                            buffers::node_visibility_mask(&sampled_nodes, root.node)
+                                & if let Some((asset, local)) = root.imported_pose {
+                                    poses.entry(asset).or_insert_with(|| s.assets[asset].pose_sampled(sampled)).visibility[local]
+                                } else { root.imported_visibility }
+                        };
                         value.metadata[1] |= buffers::node_matte_flags(&sampled_nodes,root.node);
                         if value.metadata[1]!=0 {value.metadata[1] |= s.objects[object].metadata[1]&vork_slang::registry::OBJECT_IMPLICIT;}
                     } else if pose==1 {
@@ -883,6 +917,8 @@ impl FrameSlot {
                 let mut palettes = std::collections::HashMap::new();
                 for &draw_id in &group.deforms {
                     let draw = &s.draws[draw_id];
+                    // Rule 1: an absent object's deformation is not evaluated; its draw is hidden.
+                    if s.animation.absent(sampled, s.roots[draw.object as usize].node) { continue; }
                     let deform = draw.deform.as_ref().unwrap();
                     let key = if let Some(native) = &deform.native {
                         (true, native.mesh, 0, None, offset_bits)
@@ -1463,6 +1499,10 @@ pub(crate) fn capture_uniform(
 ) -> Result<Uniform> {
     let samples = image.exposure_samples;
     let visibility_samples = image.visibility_samples;
+    // Rule 1: an absent camera has no view to render through.
+    ensure!(!s.animation.absent(&frame.animation_values, image.camera),
+        "images.{}.render.camera: camera {:?} is absent (active); a render image renders through a camera that exists at sample time {}",
+        image.name, s.nodes[image.camera].node.name, frame.sample_request.numeric()?);
     let nodes = SampledNodes::new(&s.nodes, &frame.sampled_nodes);
     let previous_nodes = SampledNodes::new(&s.nodes, &frame.previous_nodes);
     let node = &nodes[image.camera];
@@ -1564,8 +1604,9 @@ mod capture_lens_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn imported_visible_keys_reach_objects_lights_and_shadow_reservations() -> Result<()> {
-        let Some(renderer) = crate::test_renderer()? else { return Ok(()); };
+        let renderer = crate::test_renderer()?;
         let mut gltf: serde_json::Value = vork_scene::v2::from_test_str(include_str!("../tests/goldens/skinned-box.gltf"))?;
         gltf["nodes"].as_array_mut().unwrap().push(serde_json::json!({"name":"parent","children":[0,3]}));
         gltf["nodes"].as_array_mut().unwrap().push(serde_json::json!({"name":"lamp","translation":[0,2,3],"extensions":{"KHR_lights_punctual":{"light":0}}}));
@@ -1598,8 +1639,9 @@ mod capture_lens_tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn animated_visible_hides_environment_and_lights_through_parents() -> Result<()> {
-        let Some(renderer) = crate::test_renderer()? else { return Ok(()); };
+        let renderer = crate::test_renderer()?;
         let input = vork_scene::v2::from_test_value(serde_json::json!({
             "version":2,"render":{"resolution":[16,16],"duration":2,"settings":{"samples":1}},
             "nodes":[{"type":"camera","name":"cam"},
@@ -1641,8 +1683,9 @@ fn post_mode(render: &vork_scene::Render) -> f32 {
 mod aim_tests {
     use super::*;
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn installation_uses_animated_poses_and_reports_evaluated_coincidence() -> Result<()> {
-        let Some(renderer) = crate::test_renderer()? else { return Ok(()); };
+        let renderer = crate::test_renderer()?;
         let document = serde_json::json!({"version":2,
             "render":{"resolution":[8,8]},
             "buffers":{"p":{"type":"vec3","data":[[0,0,0],[1,0,0],[0,1,0]]}},
@@ -1671,8 +1714,9 @@ mod aim_tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn keyed_camera_uses_requested_initial_time_and_checks_sampled_poses() -> Result<()> {
-        let Some(renderer) = crate::test_renderer()? else { return Ok(()); };
+        let renderer = crate::test_renderer()?;
         let document = serde_json::json!({"version":2,
             "render":{"resolution":[8,8],"fps":1,"duration":2},
             "nodes":[{"type":"camera","name":"cam","target":"subject"},
@@ -1701,13 +1745,16 @@ mod aim_tests {
         // Sampled motion blur does not evaluate unused shutter endpoints.
         installed.render_frame(&renderer, &mut slot, 0.)?;
         let error = installed.render_frame(&renderer, &mut slot, 1.).err().expect("coincident sampled pose");
-        assert!(error.to_string().contains("node \"cam\""), "{error:#}");
-        assert!(error.to_string().contains("sample time 1"), "{error:#}");
+        // The frame-abort context wraps the pose error; the cause names the node
+        // and the one evaluated shutter sample: the middle of [1, 2] at 1 fps.
+        let chain = format!("{error:#}");
+        assert!(chain.ends_with("node \"cam\": target coincides with the node origin at sample time 1.5"), "{chain}");
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn offset_instances_use_aimed_worlds_and_shifted_parents() -> Result<()> {
-        let Some(renderer)=crate::test_renderer()? else {return Ok(());};
+        let renderer = crate::test_renderer()?;
         let mut input: serde_json::Value = vork_scene::v2::from_test_str(include_str!("../tests/fixtures/analytic.json"))?;
         input["render"] = serde_json::json!({"resolution":[8,8],"duration":3,"settings":{"samples":1}});
         input["buffers"]["translations"] = serde_json::json!({"type":"vec3","data":[[0,0,0],[0,0,0]]});
@@ -1735,8 +1782,9 @@ mod aim_tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn additive_rotation_layers_compose_after_target_and_move_children() -> Result<()> {
-        let Some(renderer)=crate::test_renderer()? else {return Ok(());};
+        let renderer = crate::test_renderer()?;
         let input=vork_scene::v2::from_test_value(serde_json::json!({"version":2,
             "render":{"resolution":[8,8],"duration":2},
             "nodes":[{"type":"camera","name":"cam","translation":[0,0,6]},
@@ -1744,7 +1792,7 @@ mod aim_tests {
                     "children":[{"type":"node","name":"child","translation":[0,0,-2]}]},
                 {"type":"node","name":"subject","translation":[0,0,-3]}],
             "animation":[{"tracks":[{"path":["nodes","subject","translation"],"keys":[[0,[0,0,-3]],[1,[2,0,-3]]]}]},
-                {"blend":"add","tracks":[{"path":["nodes","aimed","rotation"],"keys":[[0,{"euler":[0,0,0]}],[1,{"euler":[0,0.7,0]}]]}]}]
+                {"blend":"combine","tracks":[{"path":["nodes","aimed","rotation"],"keys":[[0,{"euler":[0,0,0]}],[1,{"euler":[0,0.7,0]}]]}]}]
         }))?;
         let installed=renderer.install(input,Path::new("."))?;
         let index=|name:&str| installed.nodes.iter().position(|node|node.node.name==name).unwrap();
@@ -1762,8 +1810,9 @@ mod aim_tests {
     // Aim and focus follow animated targets at every evaluated time, including
     // shutter sub-frame times: keyed targets and targets under an animated parent.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn aim_and_focus_follow_animated_targets_at_any_time() -> Result<()> {
-        let Some(renderer) = crate::test_renderer()? else { return Ok(()); };
+        let renderer = crate::test_renderer()?;
         let base = std::path::Path::new(".");
         let scene = serde_json::json!({"version":2,
             "render":{"resolution":[16,16],"fps":24,"duration":2,"motion_blur":{"shutter":0.5},"settings":{"samples":2}},
@@ -1810,7 +1859,7 @@ mod retained_selection_tests {
 
     fn scene() -> Result<Scene> {
         Ok(vork_scene::v2::from_test_value(json!({"version":2,
-            "render":{"resolution":[16,16],"fps":2,"duration":2,"settings":{"integrator":"raster","samples":1},"display":{"program":"std/standard","inputs":{"dither_intensity":0}}},
+            "composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[16,16],"fps":2,"duration":2,"settings":{"integrator":"raster","samples":1}},
             "nodes":[{"type":"camera","name":"cam"},{"type":"mesh","geometry":"g","name":"actors","materials":["m"],"instances":{"attributes":{"TRANSLATION":"positions"}}}],
             "buffers":{"p":{"type":"vec3","data":[[-1,-1,0],[1,-1,0],[0,1,0]]},"positions":{"type":"vec3","data":[[0,0,-5],[8,0,-5],[30,0,-5],[40,0,-5]]}},
             "geometry":{"g":{"attributes":{"POSITION":"p"}}},
@@ -1822,8 +1871,9 @@ mod retained_selection_tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn static_selection_retains_work_across_shading_slots_repeat_and_seek() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         for blur in [false,true] {
         let mut input = scene()?;
         if blur {
@@ -1854,8 +1904,9 @@ mod retained_selection_tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn preparing_capture_staging_preserves_live_selection() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let s = r.install(scene()?, Path::new("."))?;
         let frame = s.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
         let cull = &frame.view.camera_cull;
@@ -1878,8 +1929,9 @@ mod retained_selection_tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn selection_observes_publications_bounds_and_capture_buffer_replacement() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let mut s = r.install(scene()?, Path::new("."))?;
         let frame = s.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
         // Exercise the CPU receiver contract with a producer-owned local bound.

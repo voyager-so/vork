@@ -60,6 +60,6 @@ run([shutil.which('npm'), 'install', '--offline', '--ignore-scripts', '--no-audi
      next(dist.glob(f'voyager-so-vork-{a.platform}-*.tgz'))], project)
 run([sys.executable, '-m', 'venv', project / '.venv'])
 python = project / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
-run([python, '-m', 'pip', 'install', '--no-index', '--find-links', dist, 'vork'], project)
+run([python, '-m', 'pip', 'install', '--no-index', '--find-links', dist, 'vork', 'vork-native-' + a.platform], project)
 run([python, ROOT / 'scripts/test-registry-install', '--starter-render'], project)
 print('PASS: release archive -> npm and wheel -> installed starter renders')

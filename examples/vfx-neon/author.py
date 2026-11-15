@@ -58,10 +58,10 @@ def write(media):
         materials[name]={'program':'composite','inputs':dict(mode=mode,**bindings)}
     comp('save',0)
     comp('catcher_filter',5,catcher={'channel':'shadow_catcher'})
-    comp('over',1,source={'node':'cg'},catcher={'node':'reflection'},**common)
-    comp('highlight',2,source={'node':'cg'},integrated={'node':'integrated'},**common)
+    comp('over',1,source={'step':'cg'},catcher={'step':'reflection'},**common)
+    comp('highlight',2,source={'step':'cg'},integrated={'step':'integrated'},**common)
     comp('horizontal',3,direction=[1,0]);comp('vertical',3,direction=[0,1])
-    comp('finish',4,integrated={'node':'integrated'},glow={'node':'glow'},wide={'node':'wide'},**common)
+    comp('finish',4,integrated={'step':'integrated'},glow={'step':'glow'},wide={'step':'wide'},**common)
     graph=[dict(material='save',name='cg'),
         dict(material='catcher_filter',name='reflection'),dict(material='over',name='integrated'),
         dict(material='highlight',resolution=.5),dict(material='horizontal',resolution=.25),
@@ -74,8 +74,8 @@ def write(media):
         tracks.append(dict(path=['nodes','camera',field],keys=[[p['time'],p[key]] for p in camera['poses']]))
     clock_keys=[[n/24,(n+.1)/24] for n in range(120)]
     tracks.append(dict(path=['images','plate','time'],interpolation='STEP',keys=clock_keys))
-    scene=dict(version=2,render=dict(resolution=[1920,1080],fps=24,duration=5,background='transparent',display={'program':'std/standard','inputs':{'dither_intensity':0}},
-        motion_blur={'shutter':0},compositor=graph),
+    scene=dict(version=2,composition=dict(space='3d',view={'program':'std/standard'},compositor=graph),render=dict(resolution=[1920,1080],fps=24,duration=5,background='transparent',
+        motion_blur={'shutter':0}),
         images=imgs,programs={n:{'file':n+'.slang'} for n in ['composite','wet']},
         materials=materials,buffers=buffers,geometry=geometry,nodes=nodes,animation=[dict(tracks=tracks)])
     for clean in [False,True]:

@@ -56,7 +56,7 @@ impl Parameters {
         let mut counts = std::collections::BTreeSet::from([1usize, vork_slang::registry::MOTION_TAPS as usize]);
         let mut film_counts=std::collections::BTreeSet::from([1usize]);
         for settings in std::iter::once(render.clone()).chain(
-            scene.images.values().filter_map(|i| i.render.as_ref()).map(|r| r.resolve(render))
+            scene.images.values().filter_map(|i| i.resolved_render(render))
         ) {
             counts.insert(settings.settings.samples as usize);
             film_counts.insert(settings.settings.samples as usize);
@@ -305,14 +305,15 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn shutter_strata_render_convolved_motion_edge() -> anyhow::Result<()> {
         use serde_json::json;
-        let Some(renderer) = crate::test_renderer()? else { return Ok(()); };
+        let renderer = crate::test_renderer()?;
         for velocity in [-1., 1.] {
             // One world unit per pixel; the edge crosses one pixel per shutter.
             let scene = json!({
                 "version": 2,
-                "render": {"resolution": [16,16], "fps": 1, "duration": 1, "background": "transparent", "motion_blur": {"shutter": 1, "position": "center"}, "settings": {"integrator":"raster","samples":256,"reflections":"environment"},"display":{"program":"std/agx","inputs":{"dither_intensity":0}}},
+                "composition":{"space":"3d","view":{"program":"std/agx","inputs":{}}},"render": {"dither":false,"resolution": [16,16], "fps": 1, "duration": 1, "background": "transparent", "motion_blur": {"shutter": 1, "position": "center"}, "settings": {"integrator":"raster","samples":256,"reflections":"environment"}},
                 "nodes": [
                     {"type": "camera","material":{"program":"std/camera","inputs":{"projection": "ortho","ortho_scale": 16}}},
                     {"type": "mesh", "name": "edge", "geometry": "quad", "materials": ["white"]}
@@ -383,9 +384,10 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn shader_sequence_matches_host_for_exposure_wide_budgets() -> anyhow::Result<()> {
         use crate::*;
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let source = r#"
 import vork_sampling;
 [[vk::binding(0,0)]] RWStructuredBuffer<float4> output;
@@ -442,12 +444,14 @@ import vork_sampling;
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn contiguous_shader_sequence_matches_individual_points() -> anyhow::Result<()> {
         use crate::*;
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let source=r#"
 import vork_sampling;
-[[vk::binding(0,0)]] RWStructuredBuffer<float4> output;
+import vork_constants;
+[[vk::binding(0,0)]] RWStructuredBuffer<uint4> output;
 [[vk::binding(1,0)]] StructuredBuffer<uint> parameters;
 [shader("compute")][numthreads(1,1,1)] void numerical_test(uint3 id:SV_DispatchThreadID) {
     uint counts[8]={1u,3u,16u,65u,4096u,65536u,405504u,4294967291u};
@@ -455,9 +459,42 @@ import vork_sampling;
     let count=counts[id.x/6u];let start=starts[id.x%6u];
     let pixel=uint2(17u+id.x,53u);let stream=2u+id.x;
     var sequence=sample_2d_sequence_installed(parameters,parameters[id.x/6u],pixel,start,count,stream);
+    var local_sequence=sample_2d_sequence(pixel,start,count,stream);
+    let grouped_points=8u*REG_ANALYTIC_LIGHT_SAMPLES;
+    let output_base=id.x*(33u+grouped_points);
     for (var j=0u;j<16u;j++) {
-        output[id.x*16u+j]=float4(sample_2d(pixel,start+j,count,stream),sample_2d_next(sequence));
+        let expected=asuint(sample_2d(pixel,start+j,count,stream));
+        output[output_base+j]=uint4(expected,asuint(sample_2d_next(sequence)));
+        output[output_base+16u+j]=uint4(expected,asuint(sample_2d_next(local_sequence)));
     }
+    // The analytic stream restarts at each covered sample, including sparse,
+    // nonmonotonic sample identities. Zero coverage skips an entire group;
+    // per-light rejections consume their point even at the group's endpoints.
+    uint exposures[6]={1u,3u,16u,65u,4096u,65536u};
+    uint covered_samples[8]={start,0u,start+3u,start+1u,start+65u,1u,start+31u,start+7u};
+    let source_seed=pixel_hash(id.x);let source_key=pixel^uint2(source_seed,pixel_hash(source_seed));
+    let source_count=exposures[id.x%6u]*REG_ANALYTIC_LIGHT_SAMPLES;
+    let rotation_bits=screen_ray_hash(source_key,0u,REG_SAMPLING_STREAM_ANALYTIC_SOURCE);
+    let rotation=(float(rotation_bits>>16u)+.5)*(1./4294967296.);
+    Sample2DSequence source_sequence;var initialized=0u;var advanced=0u;
+    for(var next=0u;next<grouped_points;next++) {
+        let tap=next/REG_ANALYTIC_LIGHT_SAMPLES;let pick=next%REG_ANALYTIC_LIGHT_SAMPLES;
+        let output_index=output_base+32u+next;output[output_index]=uint4(0u);
+        if(tap%3u==0u) {continue;}
+        let covered_sample=covered_samples[tap];
+        if(pick==0u) {
+            source_sequence=sample_2d_sequence(source_key,covered_sample*REG_ANALYTIC_LIGHT_SAMPLES,
+                source_count,REG_SAMPLING_STREAM_ANALYTIC_SOURCE);
+            initialized++;
+        }
+        var actual=sample_2d_next(source_sequence);advanced++;
+        if(pick==0u || pick==3u || pick==REG_ANALYTIC_LIGHT_SAMPLES-1u) {continue;}
+        var expected=sample_2d(source_key,covered_sample*REG_ANALYTIC_LIGHT_SAMPLES+pick,
+            source_count,REG_SAMPLING_STREAM_ANALYTIC_SOURCE);
+        actual.x=frac(actual.x+rotation);expected.x=frac(expected.x+rotation);
+        output[output_index]=uint4(asuint(expected),asuint(actual));
+    }
+    output[output_base+32u+grouped_points]=uint4(5u,5u*REG_ANALYTIC_LIGHT_SAMPLES,initialized,advanced);
 }"#;
         let pipeline=medium::test_pipeline(&r,source,&medium::Native::default(),&[
             pipelines::buffer_entry(0,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:false}),
@@ -467,7 +504,8 @@ import vork_sampling;
         let mut words:Vec<u32>=offsets.values().map(|offset|offset+8).collect();
         words.extend(payload);
         let parameters=init(&r.device,"installed sequence regression",bytemuck::cast_slice(&words),wgpu::BufferUsages::STORAGE);
-        let size=48*16*16;
+        let row_points=33+8*u64::from(vork_slang::renderer_registry::REG_ANALYTIC_LIGHT_SAMPLES);
+        let size=48*row_points*16;
         let buffer=|usage|r.device.create_buffer(&wgpu::BufferDescriptor {label:Some("contiguous shared sequence"),size,usage,mapped_at_creation:false});
         let output=buffer(wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_SRC);
         let readback=buffer(wgpu::BufferUsages::MAP_READ|wgpu::BufferUsages::COPY_DST);
@@ -478,9 +516,9 @@ import vork_sampling;
         let (tx,rx)=std::sync::mpsc::channel();
         readback.map_async(wgpu::MapMode::Read,..,move|v|{let _=tx.send(v);});
         r.device.poll(wgpu::PollType::Wait {submission_index:None,timeout:None})?;rx.recv()??;
-        let mapped=readback.get_mapped_range(..);let points:&[[f32;4]]=bytemuck::cast_slice(&mapped);
+        let mapped=readback.get_mapped_range(..);let points:&[[u32;4]]=bytemuck::cast_slice(&mapped);
         for (index,p) in points.iter().enumerate() {
-            assert_eq!(&p[..2],&p[2..],"sequence point {index} changed");
+            assert_eq!(&p[..2],&p[2..],"sequence point bits or group counters {index} changed");
         }
         r.errors.check()?;
         Ok(())

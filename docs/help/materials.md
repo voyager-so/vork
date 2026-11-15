@@ -1,15 +1,9 @@
 MATERIALS
 Use std/openpbr (the default) for constant, image and named attribute inputs.
-Mesh Node.instances takes custom attribute columns in instances.attributes;
-a material reads a column with {"attribute": name}. Two instances with different colours:
-{"type":"mesh","geometry":{"std":"sphere"},
- "instances":{"attributes":{"TRANSLATION":{"type":"vec3","data":[[0,0,0],[2,0,0]]},
-                            "tint":{"type":"vec3","data":[[1,0,0],[0,0,1]]}}},
- "materials":[{"inputs":{"base_color":{"attribute":"tint"}}}]}
-These are data materials: they share the shipped evaluator and add no surface
-code to the scene kernel. Use a surface program for custom logic, such as
-procedural patterns, transformed texture sampling, or layered closures. Merely
-returning OpenPBR parameters does not require a program.
+Instance attributes are equal-length columns in node.instances.attributes;
+material attribute bindings select a column by name.
+Constant, image and attribute bindings share the shipped evaluator. Custom logic
+needs a surface program; constant OpenPBR parameters do not.
 emission_luminance is cd/m²; emission_color is linear RGB.
 base_color is linear RGB; base_metalness=1
 makes metal; specular_roughness controls highlight width. Inputs and defaults:
@@ -19,15 +13,7 @@ and RGB for colour. Custom factors, channels and UV transforms need a program.
 For glass panes use transmission_weight: 1 and geometry_thin_walled: true.
 Use transmission_color for glass tint and subsurface_color for scattering colour.
 Use std/path when refraction or indirect lighting is important.
-In std/previs, scalar std/openpbr geometry_opacity and alpha_cutoff use each
-material's raster coverage, retaining direct lighting and visible emission. Fractional
-coverage is sampled and can look grainy at the preview sample budget. Bindings
-or animation of either input, and opacity combined with transmission, retain
-whole-view path transport until qualified. Other effects can also require path
-transport. The sample budget and denoise setting stay unchanged.
-Raster previs uses analytic lights and environment approximations. Emissive
-meshes stay visible, but light they cast on other objects needs std/draft,
-std/final or std/path; the former alpha-triggered path view included that light.
+Profile coverage, emissive lighting and transport selection: vork help profiles.
 <!-- all -->
 MATERIAL REFERENCE
 Solid glass requires closed mesh boundaries; model hollow vessels with a shell.

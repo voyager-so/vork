@@ -31,6 +31,14 @@ DirectionalRadianceSample receiver_provider(float3 world,float3 normal,float3 vi
 #endif
     return directional_provider(world,normal,view,direction,roughness,false,frame,environment,environment_sampler,world_permitted);
 }
+// A black terminal with no local provider has no reflected-radiance integral.
+// Test source availability before evaluating an expensive directional BSDF.
+bool receiver_reflection_active(Frame frame,bool world_permitted) {
+#ifdef VORK_PROBES
+    if(probe_grid().field.x!=0u) return true;
+#endif
+    return world_permitted && (any(frame.radiance.xyz!=float3(0.)) || frame.environment.x>0.);
+}
 float3 receiver_reflection(float3 world,float3 normal,float3 view,float3 direction,float roughness,Frame frame,Texture2D environment,SamplerState environment_sampler,bool capture_endpoint=false,bool world_permitted=true) {
     return receiver_provider(world,normal,view,direction,roughness,frame,environment,environment_sampler,capture_endpoint,world_permitted).radiance;
 }

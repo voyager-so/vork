@@ -1,6 +1,6 @@
 //! Polygon outline with holes → closed prism along Z, sharing text's cap tessellation.
 use crate::text::{Mesh, contains, fill};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use lyon_path::math::{Point, Vector, point, vector};
 use serde::Deserialize;
 
@@ -140,34 +140,19 @@ fn geometry(mut o: Options) -> Result<serde_json::Value> {
             o.holes.is_empty(),
             "holes cannot be combined with d; use SVG subpaths"
         );
-        let path = vork_path::parse(d)?;
+        let (cmds, _) = crate::moda::path_commands(d)?;
         // Bound flattening error relative to the authored geometry, in object-space metres.
-        let bounds = path
-            .iter()
-            .flat_map(|e| match e {
-                lyon_path::Event::Begin { at } => vec![at],
-                lyon_path::Event::Line { to, .. } => vec![to],
-                lyon_path::Event::Quadratic { ctrl, to, .. } => vec![ctrl, to],
-                lyon_path::Event::Cubic {
-                    ctrl1, ctrl2, to, ..
-                } => vec![ctrl1, ctrl2, to],
-                _ => vec![],
-            })
-            .fold(
-                (
-                    point(f32::INFINITY, f32::INFINITY),
-                    point(f32::NEG_INFINITY, f32::NEG_INFINITY),
-                ),
-                |(lo, hi), p| (lo.min(p), hi.max(p)),
-            );
-        let extent = (bounds.1 - bounds.0).x.max((bounds.1 - bounds.0).y);
+        let bounds = crate::moda::path_bounds(&cmds).context("d must enclose an area")?;
+        let extent = (bounds[2] - bounds[0]).max(bounds[3] - bounds[1]);
         ensure!(extent.is_finite() && extent > 0., "d must enclose an area");
-        let mut contours = vork_path::flatten(&path, extent * 0.0001)?;
+        // Moda's flattening for its own extrusion: every subpath closed, repeated points dropped.
+        let mut contours = moda_engine::solid::outline::flatten(&cmds, extent * 0.0001);
         ensure!(!contours.is_empty(), "d must enclose an area");
         // SVG fill implicitly closes open subpaths. Extrude retains its existing
         // one-outline-with-holes contract, including intersection validation below.
-        o.outline = Some(contours.remove(0).points);
-        o.holes = contours.into_iter().map(|c| c.points).collect();
+        let points = |c: Vec<[f64; 2]>| c.into_iter().map(|[x, y]| [x as f32, y as f32]).collect::<Vec<_>>();
+        o.outline = Some(points(contours.remove(0)));
+        o.holes = contours.into_iter().map(points).collect();
     }
     let outline = o.outline.as_ref().unwrap();
     let mut contours: Vec<Vec<Point>> = std::iter::once(outline)
@@ -458,6 +443,50 @@ mod tests {
         ] {
             assert!(extrude(options).is_err());
         }
+    }
+
+    #[test]
+    fn svg_cleanup_is_independent_of_coordinate_units() {
+        for size in [1e-10_f32, 1e-6, 1., 1e6] {
+            let svg = extrude(json!({"name":"e", "d":format!("M0 0 L{size} 0 L0 {size} Z"), "depth":size})).unwrap();
+            let array = extrude(json!({"name":"e", "outline":[[0.,0.],[size,0.],[0.,size]], "depth":size})).unwrap();
+            assert_eq!(svg, array, "size {size}");
+        }
+        // A hole below the consumer's output precision must be refused, not
+        // silently discarded by the path flattener (which would fill it in).
+        assert!(extrude(json!({"name":"e", "d":"M0 0h1v1h-1z M.1 .1l1e-10 0l0 1e-10z"})).is_err());
+    }
+
+    fn assert_svg_builder_subdivision(d: &str, extent: f64) {
+        // Compare the complete builder output to an array-outline reference at
+        // the independently known extent, rather than testing the bounds helper.
+        let (commands, _) = crate::moda::path_commands(d).unwrap();
+        let contours = moda_engine::solid::outline::flatten(&commands, extent * 0.0001);
+        assert_eq!(contours.len(), 1);
+        let outline: Vec<_> = contours[0].iter().map(|&[x,y]| [x as f32,y as f32]).collect();
+        let reference = extrude(json!({"name":"e", "outline":outline, "depth":0.25})).unwrap();
+        let built = extrude(json!({"name":"e", "d":d, "depth":0.25})).unwrap();
+        assert_eq!(data::<Vec<[f32;3]>>(&built, "position").len(),
+            data::<Vec<[f32;3]>>(&reference, "position").len(), "subdivision: {d}");
+        assert_eq!(built, reference, "mesh: {d}");
+    }
+
+    #[test]
+    fn svg_builder_subdivision_uses_major_arc_extent() {
+        // Near-complete arcs have diameter 2r despite endpoints one unit apart.
+        for (d, extent) in [
+            ("M0 0 A10 10 0 1 1 1 0 Z", 20.),
+            ("M0 0 A1000 1000 0 1 1 1 0 Z", 2000.),
+        ] {
+            assert_svg_builder_subdivision(d, extent);
+        }
+    }
+
+    #[test]
+    fn svg_builder_subdivision_ordinary_curve_control() {
+        // This quadratic stays inside its unit control box, so the copied
+        // endpoint/control bounds and geometric bounds agree.
+        assert_svg_builder_subdivision("M0 0 Q0 1 1 1 L1 0 Z", 1.);
     }
 
     #[test]

@@ -238,7 +238,7 @@ impl Table {
             .min(r.device.limits().max_buffer_size);
         ensure!(
             bytes <= limit,
-            "{}", crate::gpu_memory::limit_message("geometry reference table", format_args!("{bytes} bytes"), format_args!("{limit} bytes"), "use smaller collision proxies")
+            crate::gpu_memory::device_limit("geometry reference table", format_args!("{bytes} bytes"), format_args!("{limit} bytes"), "use smaller collision proxies")
         );
         let buffer = init(
             &r.device,

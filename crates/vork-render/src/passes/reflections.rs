@@ -8,8 +8,14 @@ pub(crate) fn record_fields_entry(binding:u32, read_only:bool)->wgpu::BindGroupL
     entry.count=std::num::NonZeroU32::new(constants::VISIBILITY_REFLECTION_WORDS);
     entry
 }
-pub(crate) fn record_fields(buffer:&wgpu::Buffer, bytes:u64)->Vec<wgpu::BufferBinding<'_>> {
-    (0..constants::VISIBILITY_REFLECTION_WORDS).map(|field|wgpu::BufferBinding {buffer,offset:u64::from(field)*bytes,size:std::num::NonZeroU64::new(bytes)}).collect()
+/// One binding per record field. Fields are packed `per_buffer` at a time, so the
+/// complete array may exceed the device's single-allocation limit.
+pub(crate) fn record_fields(buffers:&[wgpu::Buffer], bytes:u64, per_buffer:u32)->Vec<wgpu::BufferBinding<'_>> {
+    (0..constants::VISIBILITY_REFLECTION_WORDS).map(|field|{
+        let chunk=(field/per_buffer) as usize;
+        let offset=u64::from(field%per_buffer)*bytes;
+        wgpu::BufferBinding {buffer:&buffers[chunk],offset,size:std::num::NonZeroU64::new(bytes)}
+    }).collect()
 }
 /// One retained hit-shading specialization for the complete installed scene.
 pub(crate) fn pipeline(r: &Renderer, cached: &std::sync::Arc<crate::pipelines::CachedPipelines>, features: crate::forward_variant::FeatureMask, probes: bool, mode: &crate::pipelines::VariantCompile) -> Result<crate::pipelines::Drawn<wgpu::ComputePipeline>> {
@@ -31,6 +37,7 @@ impl Resources {
         color: &wgpu::TextureView,
         uniform: &wgpu::Buffer,
         lights: &wgpu::Buffer,
+        light_tree: &wgpu::Buffer,
         objects: &wgpu::Buffer,
         cluster_config: &wgpu::Buffer,
         cluster_lights: &wgpu::Buffer,
@@ -51,7 +58,7 @@ impl Resources {
         }
         let v=decoupled.context("reflections need decoupled receiver guides")?;
         let (slots,reflection_records,reflection_guides)=(&v.slots,&v.reflection_records,&v.reflection_guides);
-        let record_fields=record_fields(reflection_records,v.reflection_field_bytes);
+        let record_fields=record_fields(reflection_records,v.reflection_field_bytes,v.reflection_fields_per_buffer);
         let batch=constants::REFLECTION_BATCH_SAMPLES;
         let samples=v.samples();
         let chunks=samples.div_ceil(batch);
@@ -96,6 +103,7 @@ impl Resources {
         // rt::reflections_hits_entries: the scene globals, then the trace's images and rays.
         for item in 0..owners.len() {
         let entries = vec![
+            entry(10, light_tree.as_entire_binding()),
             entry(0, uniform.as_entire_binding()),
             entry(1, objects.as_entire_binding()),
             entry(2, lights.as_entire_binding()),
@@ -106,18 +114,18 @@ impl Resources {
             entry(7, cluster_config.as_entire_binding()),
             entry(8, cluster_lights.as_entire_binding()),
             entry(9, wgpu::BindingResource::TextureView(&s.environment.ltc)),
-            entry(10, wgpu::BindingResource::TextureView(color)),
-            entry(11, wgpu::BindingResource::TextureView(receivers)),
-            entry(12, wgpu::BindingResource::TextureView(normals)),
-            entry(13, wgpu::BindingResource::TextureView(ambient)),
-            entry(14, wgpu::BindingResource::TextureView(&output)),
-            entry(15, tlas.as_binding()),
-            entry(16, alpha.as_entire_binding()),
-            entry(17, s.sampling.buffer.as_entire_binding()),
-            entry(18, slots.as_entire_binding()),
-            entry(19,reflection_guides.as_entire_binding()),
-            entry(20,range(item)),entry(21,accumulation.as_entire_binding()),
-            entry(22,frame_rays.emitter_weights.as_ref().map_or(alpha,|w|&w.buffer).as_entire_binding()),
+            entry(11, wgpu::BindingResource::TextureView(color)),
+            entry(12, wgpu::BindingResource::TextureView(receivers)),
+            entry(13, wgpu::BindingResource::TextureView(normals)),
+            entry(14, wgpu::BindingResource::TextureView(ambient)),
+            entry(15, wgpu::BindingResource::TextureView(&output)),
+            entry(16, tlas.as_binding()),
+            entry(17, alpha.as_entire_binding()),
+            entry(18, s.sampling.buffer.as_entire_binding()),
+            entry(19, slots.as_entire_binding()),
+            entry(20,reflection_guides.as_entire_binding()),
+            entry(21,range(item)),entry(22,accumulation.as_entire_binding()),
+            entry(23,frame_rays.emitter_weights.as_ref().map_or(alpha,|w|&w.buffer).as_entire_binding()),
         ];
         let trace = d.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("ray reflection resources"),
@@ -173,8 +181,68 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+    fn evaluation_storage_preserves_full_precision_coat_and_adjacent_fields() -> Result<()> {
+        let r = crate::test_renderer()?;
+        // Exercise the production codec with diffusion/AOV offsets and two adjacent
+        // records. Values differ below FP16 precision, so early quantization fails.
+        let generated=crate::camera_native::evaluation_source("// EVALUATION_STORAGE");
+        let codec=generated[generated.find("float4 evaluation_load").unwrap()..]
+            .replace("evaluation_pages.buffers[page][at]","fixture_storage[at]")
+            .replace("evaluation_pages[NonUniformResourceIndex(page)][at]","fixture_storage[at]");
+        let source=format!(r#"
+import vork_constants;
+#define VORK_CAMERA_DIFFUSION 1u
+#define VORK_CAMERA_AOVS 2u
+#define VORK_AOV_CHANNELS 1u
+#define VORK_CAMERA_TRANSPARENT 1u
+interface IVariant {{static const bool has_reflections;static const bool has_indirect_controls;static const bool has_camera_receivers;static const bool subsurface;}};
+struct Variant:IVariant {{static const bool has_reflections=true;static const bool has_indirect_controls=true;static const bool has_camera_receivers=false;static const bool subsurface=true;}};
+struct Bsdf {{float4 data[REG_REFLECTION_BSDF_VECTORS];}};
+struct Baseline {{float3 diffuse;}};
+struct Response {{float3 color;float roughness;Baseline baseline;float3 reflected;float3 diffuse;float3 normal;Bsdf reflection;}};
+struct Diffusion {{float3 light;float3 ambient;float3 radius;float3 albedo;float3 light_albedo;float3 ambient_albedo;}};
+struct EvaluatedSlot {{Response response;float ray_distance;float3 world;float3 geometric;float2 barycentrics;float4 alpha;Diffusion diffusion;float4 aovs[VORK_CAMERA_AOVS];}};
+struct Config {{uint capacity;uint words;uint diffusion;}};
+static const Config camera_config={{2u,8u+6u+2u+REG_REFLECTION_EVALUATION_VECTORS,1u}};
+[[vk::binding(0,0)]] RWStructuredBuffer<float4> fixture_storage;
+[[vk::binding(1,0)]] RWStructuredBuffer<float4> result;
+{codec}
+[shader("compute")][numthreads(1,1,1)] void numerical_test(uint3 id:SV_DispatchThreadID) {{
+    var e=(EvaluatedSlot)0;
+    for(uint i=0u;i<REG_REFLECTION_BSDF_VECTORS;i++) {{e.response.reflection.data[i]=asfloat(uint4(0x3f000001u+id.x*1000u+i*7u)+uint4(0u,1u,2u,3u));}}
+    e.response.reflection.data[9].w=0.;e.response.reflection.data[10].w=0.;
+    e.response.reflected=float3(2.,3.,4.);e.response.normal=float3(5.,6.,7.);
+    e.world=float3(8.,9.,10.);e.geometric=float3(11.,12.,13.);e.barycentrics=float2(.25,.75);
+    e.alpha=float4(.1,.2,.3,.4);e.diffusion.ambient_albedo=float3(.5,.6,.7);
+    e.aovs[0]=float4(1.,2.,3.,4.);e.aovs[1]=float4(5.,6.,7.,8.);
+    evaluation_write<Variant>(id.x,e);let actual=evaluation_read<Variant>(id.x);
+    var errors=0u;
+    for(uint i=0u;i<REG_REFLECTION_BSDF_VECTORS;i++) {{errors+=uint(any(asuint(actual.response.reflection.data[i])!=asuint(e.response.reflection.data[i])));}}
+    errors+=uint(any(actual.response.reflected!=e.response.reflected))+uint(any(actual.response.normal!=e.response.normal));
+    errors+=uint(any(actual.world!=e.world))+uint(any(actual.geometric!=e.geometric))+uint(any(actual.barycentrics!=e.barycentrics));
+    errors+=uint(any(actual.alpha!=e.alpha))+uint(any(actual.diffusion.ambient_albedo!=e.diffusion.ambient_albedo));
+    for(uint i=0u;i<VORK_CAMERA_AOVS;i++) {{errors+=uint(any(actual.aovs[i]!=e.aovs[i]));}}
+    result[id.x]=float4(float(errors),0.,0.,0.);
+}}
+"#);
+        let entries=[0,1].map(|binding|pipelines::buffer_entry(binding,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage{read_only:false}));
+        let pipeline=crate::medium::test_pipeline(&r,&source,&crate::medium::Native::default(),&entries,(1,1,1))?;
+        let words=8+6+2+vork_slang::registry::REFLECTION_EVALUATION_VECTORS;
+        let storage=crate::gpu_memory::buffer(&r.device,&wgpu::BufferDescriptor {label:None,size:u64::from(words)*16*2,
+            usage:wgpu::BufferUsages::STORAGE,mapped_at_creation:false});
+        let output=crate::gpu_memory::buffer(&r.device,&wgpu::BufferDescriptor {label:None,size:32,
+            usage:wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_SRC,mapped_at_creation:false});
+        let bind=r.device.create_bind_group(&wgpu::BindGroupDescriptor {label:None,layout:&pipeline.get_bind_group_layout(0),entries:&[
+            entry(0,storage.as_entire_binding()),entry(1,output.as_entire_binding())]});
+        assert_eq!(compute_vec4(&r,&pipeline,&bind,&output,2)?,vec![[0.;4];2]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn reflection_mixture_keeps_energy_with_one_query_per_sample() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let source=r#"
 import vork_prelude;
 import reflection_receiver;
@@ -219,8 +287,9 @@ struct MockTrace : IReflectionTrace {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn decoupled_reflections_keep_lobes_with_covered_samples() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let d=&r.device;
         let source=r#"
 import vork_prelude;
@@ -243,6 +312,13 @@ struct TestReflectionFields {StructuredBuffer<uint> buffers[REG_VISIBILITY_REFLE
 [shader("compute")][numthreads(1,1,1)] void numerical_test(uint3 id:SV_DispatchThreadID) {
     Frame f={};f.flags.x=1.;f.sampling.w=7u;f.post.z=1.;f.projection.xy=1.;
     f.vp=float4x4(1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.,0.,0.,0.,0.,1.);f.inverse_vp=f.vp;f.view=f.vp;
+    if (id.x>=17u) {
+        f.sampling.w=1u;
+        var direct=ReflectionSlots(slots,uint2(2u),int2(1),f,0u,0u,1u,false);
+        ReflectionSite site;uint index;
+        let found=direct.next(slots,records,film,f,site,index);
+        result[id.x]=id.x==17u ? float4(site.receiver.roughness,site.receiver.reflected.r,site.position.z,float(found)) : site.bsdf.data[id.x==18u ? REG_REFLECTION_BSDF_VECTORS-1u : (id.x>=20u ? id.x-11u : 0u)];return;
+    }
     if (id.x==16u) {let selected=reflection_receiver(guides,uint2(2u),uint2(0u),0u);result[id.x]=float4(float2(selected.pixel),selected.source_tag,float(selected.eligible));return;}
     if (id.x>=14u) {
         let c=id.x-14u;var samples=ReflectionSlots(slots,uint2(2u),int2(0),f,c);
@@ -303,6 +379,15 @@ struct TestReflectionFields {StructuredBuffer<uint> buffers[REG_VISIBILITY_REFLE
         records[grazing+3]=(-0.5f32-crate::sampling::offset(6,7)[0]+1e-5*0.625).to_bits();records[grazing+5]=half2(31.,0.);
         let classes=constants::REFLECTION_CLASSES as usize;
         let mut guide_words=vec![0u32;pixels*classes*VISIBILITY_REFLECTION_GUIDE_WORDS as usize];
+        // The final pixel's direct record is index 3, not dense-slot index 12.
+        // Do not add a slot key: the merged fixture must keep its original coverage.
+        let compact=records[..VISIBILITY_REFLECTION_WORDS as usize].to_vec();
+        records[3*VISIBILITY_REFLECTION_WORDS as usize..4*VISIBILITY_REFLECTION_WORDS as usize].copy_from_slice(&compact);
+        let direct=3*VISIBILITY_REFLECTION_WORDS as usize;
+        records[direct+6]=half2(6.,7.);records[direct+7]=half2(8.,9.);
+        records[direct+25]=half2(10.,4.);
+        records[direct+27]=half2(11.,5.);
+        records[direct+VISIBILITY_REFLECTION_WORDS as usize-1]=half2(2.,3.);
         let guide_at=|pixel,c|(pixel*classes+c)*VISIBILITY_REFLECTION_GUIDE_WORDS as usize;
         for pixel in 0..pixels {for c in 0..classes {
             let at=guide_at(pixel,c);
@@ -318,11 +403,14 @@ struct TestReflectionFields {StructuredBuffer<uint> buffers[REG_VISIBILITY_REFLE
         let field_bytes=(count as u64*4).div_ceil(u64::from(d.limits().min_storage_buffer_offset_alignment))*u64::from(d.limits().min_storage_buffer_offset_alignment);
         let mut fields=vec![0u32;field_bytes as usize/4*VISIBILITY_REFLECTION_WORDS as usize];
         for record in 0..count {for word in 0..VISIBILITY_REFLECTION_WORDS as usize {fields[word*field_bytes as usize/4+record]=records[record*VISIBILITY_REFLECTION_WORDS as usize+word];}}
-        let records=crate::init(d,"reflection record fixture",bytemuck::cast_slice(&fields),wgpu::BufferUsages::STORAGE);
-        let record_fields=record_fields(&records,field_bytes);
+        // Cross several allocation boundaries, including a partial last allocation.
+        let per_buffer=7;
+        let records:Vec<_>=fields.chunks(field_bytes as usize/4*per_buffer as usize).map(|chunk|
+            crate::init(d,"reflection record fixture",bytemuck::cast_slice(chunk),wgpu::BufferUsages::STORAGE)).collect();
+        let record_fields=record_fields(&records,field_bytes,per_buffer);
         let film:Vec<u32>=(0..7).flat_map(|i|crate::sampling::offset(i,7).map(f32::to_bits)).collect();
         let film=crate::init(d,"reflection film fixture",bytemuck::cast_slice(&film),wgpu::BufferUsages::STORAGE);
-        let groups=17u32;
+        let groups=22u32;
         let output=crate::gpu_memory::buffer(d,&wgpu::BufferDescriptor {label:None,size:u64::from(groups)*16,
             usage:wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_SRC,mapped_at_creation:false});
         let bind=d.create_bind_group(&wgpu::BindGroupDescriptor {label:None,layout:&pipeline.get_bind_group_layout(0),entries:&[
@@ -346,13 +434,20 @@ struct TestReflectionFields {StructuredBuffer<uint> buffers[REG_VISIBILITY_REFLE
         assert_eq!(values[13],[0.,0.,1.,1./7.],"World-excluded coverage was lost");
         assert_eq!(values[14][0],-1.,"World-enabled correction was diluted by an excluded slot");
         assert_eq!(values[15][0],0.,"World-excluded black hit subtracted World radiance");
+        assert!((values[17][0]-1.).abs()<1e-6 && (values[17][1]-1.).abs()<1e-6);
+        assert_eq!([values[17][2],values[17][3]],[0.5,1.],"direct receivers must read the compact final pixel record");
+        assert_eq!(values[18],[2.,3.,4.,5.],"final BSDF fields crossed an allocation incorrectly");
+        assert_eq!(values[19],[6.,7.,8.,9.],"BSDF vector straddling allocations was corrupted");
+        assert_eq!(values[20],[0.,0.,10.,0.],"optical IOR was corrupted by the shared coat word");
+        assert_eq!(values[21],[0.,0.,11.,0.],"compensation was corrupted by the shared coat word");
         assert_eq!(values[16],[0.,0.,1.,1.],"reflection receiver borrowed a neighbouring pixel instead of retaining its own coverage");
         Ok(())
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn ggx_reflection_estimator_matches_hemisphere_integral() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let source=r#"
 import reflection_bsdf;
 import reflection_receiver;
@@ -394,8 +489,11 @@ float3 evaluate(Closure c,float3 view,float3 light) {
         if(c.coat_weight>0.) {
             value*=coat_transmission(c.coat_weight,dot(c.geometry_coat_normal,light),c.coat_ior);
             var coat=(Closure)0;coat.geometry_normal=c.geometry_coat_normal;coat.specular_roughness=c.coat_roughness;
-            coat.specular_ior=c.coat_ior;coat.specular_color=float3(1.);coat.specular_weight=c.coat_weight;
-            value+=evaluate(coat,view,light)*.9*.7;
+            // The coat amount scales a unit-weight interface, as it does in
+            // coat_transmission: a dielectric specular weight would instead
+            // modulate the coat's IOR.
+            coat.specular_ior=c.coat_ior;coat.specular_color=float3(1.);coat.specular_weight=1.;
+            value+=c.coat_weight*evaluate(coat,view,light)*.9*.7;
         }
         reference+=value*(REG_TAU/(512.*1024.));
     }}
@@ -420,8 +518,9 @@ float3 evaluate(Closure c,float3 view,float3 light) {
     /// A tiny bright source must be integrated by both proposals, without a
     /// radiance clamp or a persistent bias when its guide is much broader.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn sampled_hit_emitters_preserve_energy_and_partial_visibility() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let source=r#"
 import surface_lighting;
 import subsurface_transport;
@@ -527,8 +626,9 @@ float response(uint test,Closure c,ReflectionBsdf state,float3 view,float3 direc
     /// Compare finite-source energy to the independent path direct estimator,
     /// including the transmission domain and non-coincident lobe horizons.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn sampled_hit_backlighting_and_normals_match_path() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         if !r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY | crate::rt::HIT_BUFFER_FEATURES) {return Ok(());}
         for backlight in [true,false] {
             let mut document:serde_json::Value=serde_json::from_str(include_str!("../../tests/fixtures/sampled-hit-energy.json"))?;
@@ -567,8 +667,9 @@ float response(uint test,Closure c,ReflectionBsdf state,float3 view,float3 direc
     // Equal flux from sources differing by 100x in area must remain stable
     // even when the tiny source is outside the camera-colour guide domain.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn hardware_reflections_discover_subpixel_offscreen_emitters() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         if !r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY | crate::rt::HIT_BUFFER_FEATURES) {return Ok(());}
         let path=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/tiny-reflection-emitter.json");
         let tiny=crate::load_test_fixture(&path, include_str!("../../tests/presets/tiny-reflection-emitter-25918a49.json"))?;
@@ -598,8 +699,9 @@ float response(uint test,Closure c,ReflectionBsdf state,float3 view,float3 direc
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn installed_reflection_specialization_matches_the_full_evaluator() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let path=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hit-layers.json");
         let mut scene=crate::load_test_fixture(&path, include_str!("../../tests/presets/hit-layers-3bd1f7c2.json"))?;
         scene.render.resolution=[96,64];
@@ -617,8 +719,9 @@ float response(uint test,Closure c,ReflectionBsdf state,float3 view,float3 direc
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn transport_controls_keep_nearest_sample_and_exported_depth() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let d=&r.device;
         // Shared pass IDs cannot join disconnected primitives at different depths.
         let module=d.create_shader_module(wgpu::ShaderModuleDescriptor {label:None,source:wgpu::ShaderSource::Wgsl(std::borrow::Cow::Borrowed(r#"
@@ -685,8 +788,9 @@ import vork_control_sample;
     // from BB109. Bounds come from projecting the original triangle vertices
     // onto the camera's view axis, independently of raster depth reconstruction.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn folded_mesh_depth_stays_on_near_surface() -> Result<()> {
-        let Some(renderer) = crate::test_renderer()? else { return Ok(()); };
+        let renderer = crate::test_renderer()?;
         let mut json: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/depth-folds.json"))?;
         json["render"]["settings"] = serde_json::json!({"integrator": "path", "samples": 4, "denoiser": null});
         let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");

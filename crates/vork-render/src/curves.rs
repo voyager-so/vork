@@ -369,7 +369,7 @@ pub(crate) fn projected_sides(
         for &i in &targets.order {
             if !pose_dynamic[i] {
                 let world=nodes[i].parent.map_or(Mat4::IDENTITY,|p|worlds[p])*nodes[i].node.transform.matrix();
-                worlds[i]=targets.aim(i,world,&worlds,&nodes[i].node)?;
+                worlds[i]=targets.aim(i,world,&worlds,&nodes[i].node,|_|false)?;
             }
         }
         for (i,node) in planned_nodes.iter_mut().enumerate() {
@@ -803,8 +803,9 @@ mod projected_tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn computed_cloud_detail_tracks_only_spatial_writers() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let mut scene:Scene=vork_scene::v2::from_test_value(serde_json::json!({"version":2,
             "render":{"resolution":[640,480]},
             "buffers":{"p":{"type":"vec3","data":[[0,0,0]]},"w":{"type":"f32","data":[0.001]},"color":{"type":"vec3","data":[[1,1,1]]},"live":{"type":"u32","data":[1]}},

@@ -1,6 +1,6 @@
 {
   "name": "@voyager-so/vork",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Rust-generated scene types, JSON Schema and serialization for vork",
   "type": "module",
   "license": "SEE LICENSE IN LICENSE",

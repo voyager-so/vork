@@ -104,6 +104,8 @@ constants! {
     REG_SPECTRAL_MIN_NM: f32 = 380. => "f32";
     REG_SPECTRAL_SPAN_NM: f32 = 400. => "f32";
     // Spatial-source proposal: global uniform support, not a radiance clamp.
+    REG_ANALYTIC_LIGHT_SAMPLES: u32 = 8u32 => "u32";
+    REG_SAMPLING_STREAM_ANALYTIC_SOURCE: u32 = 26u32 => "u32";
     REG_LIGHT_TREE_UNIFORM_MIX: f32 = 0.25 => "f32";
     // Squared-distance guide regularization inside a punctual source.
     REG_LIGHT_TREE_MIN_DISTANCE_SQUARED: f32 = 1e-12 => "f32";

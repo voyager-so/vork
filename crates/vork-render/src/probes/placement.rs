@@ -22,8 +22,9 @@ impl std::ops::Deref for Bricks {
 impl std::ops::DerefMut for Bricks {
     fn deref_mut(&mut self) -> &mut BrickMap { &mut self.cells }
 }
+/// Probe storage beyond what the device can bind or hold now; placement retries coarser on it.
 #[derive(Debug)]
-struct MemoryPressure(String);
+pub(crate) struct MemoryPressure(String);
 impl std::fmt::Display for MemoryPressure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(&self.0)
@@ -36,10 +37,10 @@ impl Bricks {
         let sizes=field_sizes(nodes,bricks,res);
         if nodes>u64::from(u32::MAX) || sizes.metadata/std::mem::size_of::<Grid>() as u64>u64::from(u32::MAX)
             || self.binding_limit.is_some_and(|limit|!sizes.fits(limit)) {
-            return Err(MemoryPressure(crate::gpu_memory::limit_message("probe storage",
+            return Err(MemoryPressure(crate::gpu_memory::device_limit("probe storage",
                 format_args!("{nodes} nodes; {} metadata rows; bindings in bytes: records={}, moments={}, sums={}, metadata={}, traced={}", sizes.metadata/std::mem::size_of::<Grid>() as u64, sizes.records,sizes.moments,sizes.sums,sizes.metadata,sizes.traced),
                 format_args!("{} nodes and metadata rows; binding={}",u32::MAX,self.binding_limit.map_or_else(|| "not reported".to_owned(), |bytes| format!("{bytes} bytes"))),
-                "reduce geometry density or choose --profile std/draft")).into());
+                "reduce geometry density or choose --profile std/draft").0).into());
         }
         self.check(sizes.retained())
     }
@@ -64,9 +65,9 @@ impl Bricks {
         }
         self.available.set(available);
         if let Some(headroom) = available.filter(|headroom| bytes > *headroom) {
-            return Err(MemoryPressure(crate::gpu_memory::limit_message("probe storage",
+            return Err(MemoryPressure(crate::gpu_memory::device_limit("probe storage",
                 format_args!("{bytes} bytes"), format_args!("{headroom} bytes of native memory headroom"),
-                "reduce geometry density or choose --profile std/draft, or close other GPU applications")).into());
+                "reduce geometry density or choose --profile std/draft, or close other GPU applications").0).into());
         }
         Ok(())
     }
@@ -503,7 +504,7 @@ impl Field {
     }
     fn grow_with(&self,requests:&BTreeSet<[i32;3]>,level:u32,bricks:bool,mut target:u32)->Result<Self> {
         loop {
-            ensure!(target<127,"{}",crate::gpu_memory::limit_message("probe spatial level under device pressure", target, 126, "reduce geometry density or choose --profile std/draft"));
+            ensure!(target<127,crate::gpu_memory::device_limit("probe spatial level under device pressure", target, 126, "reduce geometry density or choose --profile std/draft"));
             match self.grow_at_level(requests,level,target,bricks) {
                 Err(error) if error.is::<MemoryPressure>()=> {
                     target=target.max(self.header.field[3]).checked_add(1).context("probe spatial level overflow")?;
@@ -1201,8 +1202,9 @@ mod tests {
         }
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn automatic_frame_is_covariant_without_cpu_receiver_bounds() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let scene:vork_scene::Scene=vork_scene::v2::from_test_value(serde_json::json!({"version":2,"nodes":[
             {"type":"camera","name":"camera","material":{"program":"std/camera","inputs":{"clip_start":0.1,"clip_end":40}}},
             {"type":"camera","name":"scaled","material":{"program":"std/camera","inputs":{"clip_start":0.4,"clip_end":160}}}]}))?;

@@ -7,9 +7,14 @@ use super::*;
 struct Summary {scale:f32,total:f32,invalid:f32,inverse:f32}
 #[repr(C)]
 #[derive(Clone,Copy,Pod,Zeroable)]
-struct Statistics {sh:[[f32;4];4],summary:Summary,mean:[f32;4]}
+struct Statistics {
+    sh:[[f32;4];4],summary:Summary,mean:[f32;4],
+    // Exact lighting RGB bits, plus 1.0f32 bits when every texel matches.
+    uniform:[u32;4],
+}
 pub(super) struct Evaluation {
     source:wgpu::Texture,
+    uniform:std::sync::OnceLock<Option<[u32;3]>>,
     _proposal:Option<wgpu::Texture>,
     reduce:Option<wgpu::BindGroup>,
     bind:wgpu::BindGroup,
@@ -48,6 +53,7 @@ impl Evaluation {
         if let (Some(proposal),Some(distribution))=(&proposal_view,&distribution) {entries.push(entry(1,wgpu::BindingResource::TextureView(proposal)));entries.push(entry(3,distribution.as_entire_binding()));}
         let bind=d.create_bind_group(&wgpu::BindGroupDescriptor {label:None,layout:&layout,entries:&entries});
         let shader=include_str!("../../shaders/environment_evaluated.wgsl")
+            .replace("$STATISTICS_VECTORS",&(std::mem::size_of::<Statistics>()/16).to_string())
             .replace("$PI",&format!("{:.9e}",vork_slang::registry::PI))
             .replace("$HALF_SCALE",&format!("{:.9e}",constants::HALF_FLOAT_MAX*0.5))
             .replace("$LUMINANCE",&constants::LUMINANCE_REC709.map(|v|format!("{v:.9e}")).join(","))
@@ -57,7 +63,7 @@ impl Evaluation {
         let layout=d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {label:None,bind_group_layouts:&[Some(&layout)],immediate_size:0});
         let entries=if proposal_needed {&["peaks","peak_summary","moments_and_rows","summarize","normalize_rows"][..]} else {&["peaks","peak_summary"][..]};
         let pipelines=entries.iter().map(|name|r.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {label:Some(name),layout:Some(&layout),module:&module,entry_point:Some(*name),compilation_options:Default::default(),cache:r.cache.as_ref()})).collect();
-        Self {source:source.clone(),_proposal:proposal,reduce,bind,pipelines,statistics,read,distribution,size,validation:Default::default()}
+        Self {uniform:std::sync::OnceLock::new(),source:source.clone(),_proposal:proposal,reduce,bind,pipelines,statistics,read,distribution,size,validation:Default::default()}
     }
     #[cfg(test)]
     pub fn work(&self)->(bool,u64,usize) {
@@ -80,6 +86,9 @@ impl Evaluation {
         encoder.copy_buffer_to_buffer(&self.statistics,std::mem::offset_of!(Statistics,summary) as u64,uniform,(std::mem::offset_of!(Uniform,environment)+std::mem::size_of::<f32>()) as u64,std::mem::size_of::<f32>() as u64);
         encoder.copy_buffer_to_buffer(&self.statistics,std::mem::offset_of!(Statistics,mean) as u64,uniform,std::mem::offset_of!(Uniform,environment_mean) as u64,std::mem::size_of::<[f32;4]>() as u64);
     }
+    /// Exact source bits, proved equal at every lighting texel by the existing
+    /// statistics pass. Compaction never changes the proposal or its dimensions.
+    pub fn uniform(&self)->Option<[u32;3]> {self.uniform.get().copied().flatten()}
     pub fn diagnostics(&self,r:&Renderer)->Validation {Validation::new(r,&self.statistics,self.validation.get_or_init(||Validation::pipeline(r)).clone())}
     pub fn update(&self,r:&Renderer)->Result<([glam::DVec3;4],f32)> {
         let mut encoder=r.device.create_command_encoder(&Default::default());
@@ -92,7 +101,12 @@ impl Evaluation {
         let mapped=self.read.get_mapped_range(..);let data:&Statistics=bytemuck::from_bytes(&mapped);
         let scale=data.summary.scale;let sh=std::array::from_fn(|i|glam::DVec3::new(data.sh[i][0] as f64,data.sh[i][1] as f64,data.sh[i][2] as f64)*scale as f64);
         let valid=data.summary.invalid==0. && scale.is_finite() && sh.iter().all(|v|v.is_finite());
-        drop(mapped);self.read.unmap();ensure!(valid,"environment radiance must be finite and nonnegative");
+        let uniform=(data.uniform[3]==1f32.to_bits()).then(||data.uniform[..3].try_into().unwrap());
+        drop(mapped);self.read.unmap();
+        // What the device recorded outranks what its readback says about the scene.
+        r.errors.check()?;
+        ensure!(valid,"environment radiance must be finite and nonnegative");
+        let _=self.uniform.set(uniform);
         Ok((sh,scale))
     }
 }

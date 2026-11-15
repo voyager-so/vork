@@ -1,0 +1,1588 @@
+{
+ "_comment": "Vendored fonts (TTFs per catalog key, plus the fallback and emoji faces) for the native text tests and the degraded tier. Originally fetched by tools/oracle/fetch-fonts.mjs; the MSDF atlases and metrics it also vendored were dropped with the MSDF lane.",
+ "source": "http://localhost:8001 canvas=7d8c1049-ed78-4889-9e99-fda865cb2ee5 team=7020ddb3-8c1b-49dc-8027-dbee1dcd80b6",
+ "fetchedAt": "2026-06-11T08:17:43.029Z",
+ "keys": {
+  "Inter-400-normal": {
+   "family": "Inter",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/inter/Inter_24pt-Regular.ttf",
+   "ttfPath": "inter/Inter_24pt-Regular.ttf"
+  },
+  "Noto Sans-400-normal": {
+   "family": "Noto Sans",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosans/NotoSans-Regular.ttf",
+   "ttfPath": "noto-sans/NotoSans-Regular.ttf"
+  },
+  "Noto Sans-700-normal": {
+   "family": "Noto Sans",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosans/NotoSans-Bold.ttf",
+   "ttfPath": "noto-sans/NotoSans-Bold.ttf"
+  },
+  "Noto Sans-300-normal": {
+   "family": "Noto Sans",
+   "weight": 300,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosans/NotoSans-Light.ttf",
+   "ttfPath": "noto-sans/NotoSans-Light.ttf"
+  },
+  "Inter-800-normal": {
+   "family": "Inter",
+   "weight": 800,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/inter/Inter_24pt-ExtraBold.ttf",
+   "ttfPath": "inter/Inter_24pt-ExtraBold.ttf"
+  },
+  "Noto Sans-800-normal": {
+   "family": "Noto Sans",
+   "weight": 800,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosans/NotoSans-ExtraBold.ttf",
+   "ttfPath": "noto-sans/NotoSans-ExtraBold.ttf"
+  },
+  "Inter-700-normal": {
+   "family": "Inter",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/inter/Inter_24pt-Bold.ttf",
+   "ttfPath": "inter/Inter_24pt-Bold.ttf"
+  },
+  "Noto Sans-600-normal": {
+   "family": "Noto Sans",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosans/NotoSans-SemiBold.ttf",
+   "ttfPath": "noto-sans/NotoSans-SemiBold.ttf"
+  },
+  "Inter-900-normal": {
+   "family": "Inter",
+   "weight": 900,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/inter/Inter_24pt-Black.ttf",
+   "ttfPath": "inter/Inter_24pt-Black.ttf"
+  },
+  "Noto Sans-900-normal": {
+   "family": "Noto Sans",
+   "weight": 900,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosans/NotoSans-Black.ttf",
+   "ttfPath": "noto-sans/NotoSans-Black.ttf"
+  },
+  "Montserrat-700-normal": {
+   "family": "Montserrat",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/montserrat/Montserrat-Bold.ttf",
+   "ttfPath": "montserrat/Montserrat-Bold.ttf"
+  },
+  "Inter-400-italic": {
+   "family": "Inter",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/inter/Inter_24pt-Italic.ttf",
+   "ttfPath": "inter/Inter_24pt-Italic.ttf"
+  },
+  "Noto Sans-400-italic": {
+   "family": "Noto Sans",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosans/NotoSans-Italic.ttf",
+   "ttfPath": "noto-sans/NotoSans-Italic.ttf"
+  },
+  "Noto Sans-700-italic": {
+   "family": "Noto Sans",
+   "weight": 700,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosans/NotoSans-BoldItalic.ttf",
+   "ttfPath": "noto-sans/NotoSans-BoldItalic.ttf"
+  },
+  "Noto Sans-300-italic": {
+   "family": "Noto Sans",
+   "weight": 300,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosans/NotoSans-LightItalic.ttf",
+   "ttfPath": "noto-sans/NotoSans-LightItalic.ttf"
+  },
+  "Fraunces-400-normal": {
+   "family": "Fraunces",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/fraunces/Fraunces[SOFT,WONK,opsz,wght]-Regular.ttf",
+   "ttfPath": "fraunces/Fraunces[SOFT,WONK,opsz,wght]-Regular.ttf"
+  },
+  "Lato-400-normal": {
+   "family": "Lato",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/lato/Lato-Regular.ttf",
+   "ttfPath": "lato/Lato-Regular.ttf"
+  },
+  "Inter-300-normal": {
+   "family": "Inter",
+   "weight": 300,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/inter/Inter_24pt-Light.ttf",
+   "ttfPath": "inter/Inter_24pt-Light.ttf"
+  },
+  "Inter-600-normal": {
+   "family": "Inter",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/inter/Inter_24pt-SemiBold.ttf",
+   "ttfPath": "inter/Inter_24pt-SemiBold.ttf"
+  },
+  "Noto Sans JP-400-normal": {
+   "family": "Noto Sans JP",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansjp/NotoSansJP[wght]-Regular.ttf",
+   "ttfPath": "noto-sans-jp/NotoSansJP[wght]-Regular.ttf"
+  },
+  "Noto Sans KR-400-normal": {
+   "family": "Noto Sans KR",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanskr/NotoSansKR[wght]-Regular.ttf",
+   "ttfPath": "noto-sans-kr/NotoSansKR[wght]-Regular.ttf"
+  },
+  "Noto Sans SC-400-normal": {
+   "family": "Noto Sans SC",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanssc/NotoSansSC[wght]-Regular.ttf",
+   "ttfPath": "noto-sans-sc/NotoSansSC[wght]-Regular.ttf"
+  },
+  "Noto Sans TC-400-normal": {
+   "family": "Noto Sans TC",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanstc/NotoSansTC[wght]-Regular.ttf",
+   "ttfPath": "noto-sans-tc/NotoSansTC[wght]-Regular.ttf"
+  },
+  "Playfair Display-700-normal": {
+   "family": "Playfair Display",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/playfairdisplay/PlayfairDisplay-Bold.ttf",
+   "ttfPath": "playfair-display/PlayfairDisplay-Bold.ttf"
+  },
+  "Noto Sans Arabic-400-normal": {
+   "family": "Noto Sans Arabic",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansarabic/NotoSansArabic[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-arabic/NotoSansArabic[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Hebrew-400-normal": {
+   "family": "Noto Sans Hebrew",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanshebrew/NotoSansHebrew[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-hebrew/NotoSansHebrew[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Devanagari-400-normal": {
+   "family": "Noto Sans Devanagari",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansdevanagari/NotoSansDevanagari[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-devanagari/NotoSansDevanagari[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Bengali-400-normal": {
+   "family": "Noto Sans Bengali",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansbengali/NotoSansBengali[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-bengali/NotoSansBengali[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Gurmukhi-400-normal": {
+   "family": "Noto Sans Gurmukhi",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansgurmukhi/NotoSansGurmukhi[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-gurmukhi/NotoSansGurmukhi[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Gujarati-400-normal": {
+   "family": "Noto Sans Gujarati",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansgujarati/NotoSansGujarati[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-gujarati/NotoSansGujarati[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Oriya-400-normal": {
+   "family": "Noto Sans Oriya",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansoriya/NotoSansOriya[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-oriya/NotoSansOriya[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Tamil-400-normal": {
+   "family": "Noto Sans Tamil",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanstamil/NotoSansTamil[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-tamil/NotoSansTamil[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Telugu-400-normal": {
+   "family": "Noto Sans Telugu",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanstelugu/NotoSansTelugu[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-telugu/NotoSansTelugu[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Kannada-400-normal": {
+   "family": "Noto Sans Kannada",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanskannada/NotoSansKannada[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-kannada/NotoSansKannada[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Malayalam-400-normal": {
+   "family": "Noto Sans Malayalam",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansmalayalam/NotoSansMalayalam[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-malayalam/NotoSansMalayalam[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Sinhala-400-normal": {
+   "family": "Noto Sans Sinhala",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanssinhala/NotoSansSinhala[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-sinhala/NotoSansSinhala[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Thai-400-normal": {
+   "family": "Noto Sans Thai",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansthai/NotoSansThai[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-thai/NotoSansThai[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Lao-400-normal": {
+   "family": "Noto Sans Lao",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanslao/NotoSansLao[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-lao/NotoSansLao[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Khmer-400-normal": {
+   "family": "Noto Sans Khmer",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanskhmer/NotoSansKhmer[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-khmer/NotoSansKhmer[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Myanmar-400-normal": {
+   "family": "Noto Sans Myanmar",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansmyanmar/NotoSansMyanmar[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-myanmar/NotoSansMyanmar[wdth,wght]-Regular.ttf"
+  },
+  "Noto Serif Tibetan-400-normal": {
+   "family": "Noto Serif Tibetan",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notoseriftibetan/NotoSerifTibetan[wght]-Regular.ttf",
+   "ttfPath": "noto-serif-tibetan/NotoSerifTibetan[wght]-Regular.ttf"
+  },
+  "Noto Sans Ethiopic-400-normal": {
+   "family": "Noto Sans Ethiopic",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansethiopic/NotoSansEthiopic[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-ethiopic/NotoSansEthiopic[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Georgian-400-normal": {
+   "family": "Noto Sans Georgian",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansgeorgian/NotoSansGeorgian[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-georgian/NotoSansGeorgian[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Armenian-400-normal": {
+   "family": "Noto Sans Armenian",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansarmenian/NotoSansArmenian[wdth,wght]-Regular.ttf",
+   "ttfPath": "noto-sans-armenian/NotoSansArmenian[wdth,wght]-Regular.ttf"
+  },
+  "Noto Sans Syriac-400-normal": {
+   "family": "Noto Sans Syriac",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/syriac/fonts/NotoSansSyriac/unhinted/ttf/NotoSansSyriac-Regular.ttf",
+   "ttfPath": "noto-sans-syriac/NotoSansSyriac-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans Thaana-400-normal": {
+   "family": "Noto Sans Thaana",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/thaana/fonts/NotoSansThaana/unhinted/ttf/NotoSansThaana-Regular.ttf",
+   "ttfPath": "noto-sans-thaana/NotoSansThaana-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans NKo-400-normal": {
+   "family": "Noto Sans NKo",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/nko/fonts/NotoSansNKo/unhinted/ttf/NotoSansNKo-Regular.ttf",
+   "ttfPath": "noto-sans-nko/NotoSansNKo-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans Samaritan-400-normal": {
+   "family": "Noto Sans Samaritan",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/samaritan/fonts/NotoSansSamaritan/unhinted/ttf/NotoSansSamaritan-Regular.ttf",
+   "ttfPath": "noto-sans-samaritan/NotoSansSamaritan-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans Mandaic-400-normal": {
+   "family": "Noto Sans Mandaic",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/mandaic/fonts/NotoSansMandaic/unhinted/ttf/NotoSansMandaic-Regular.ttf",
+   "ttfPath": "noto-sans-mandaic/NotoSansMandaic-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans Adlam-400-normal": {
+   "family": "Noto Sans Adlam",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/adlam/fonts/NotoSansAdlam/unhinted/ttf/NotoSansAdlam-Regular.ttf",
+   "ttfPath": "noto-sans-adlam/NotoSansAdlam-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans Mongolian-400-normal": {
+   "family": "Noto Sans Mongolian",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/mongolian/fonts/NotoSansMongolian/unhinted/ttf/NotoSansMongolian-Regular.ttf",
+   "ttfPath": "noto-sans-mongolian/NotoSansMongolian-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans Brahmi-400-normal": {
+   "family": "Noto Sans Brahmi",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/brahmi/fonts/NotoSansBrahmi/unhinted/ttf/NotoSansBrahmi-Regular.ttf",
+   "ttfPath": "noto-sans-brahmi/NotoSansBrahmi-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans Limbu-400-normal": {
+   "family": "Noto Sans Limbu",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/limbu/fonts/NotoSansLimbu/unhinted/ttf/NotoSansLimbu-Regular.ttf",
+   "ttfPath": "noto-sans-limbu/NotoSansLimbu-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans Tai Tham-400-normal": {
+   "family": "Noto Sans Tai Tham",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/tai-tham/fonts/NotoSansTaiTham/unhinted/ttf/NotoSansTaiTham-Regular.ttf",
+   "ttfPath": "noto-sans-tai-tham/NotoSansTaiTham-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans Hanifi Rohingya-400-normal": {
+   "family": "Noto Sans Hanifi Rohingya",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://notofonts.github.io/hanifi-rohingya/fonts/NotoSansHanifiRohingya/unhinted/ttf/NotoSansHanifiRohingya-Regular.ttf",
+   "ttfPath": "noto-sans-hanifi-rohingya/NotoSansHanifiRohingya-Regular.ttf",
+   "vectorOnly": true
+  },
+  "Noto Sans Math-400-normal": {
+   "family": "Noto Sans Math",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosansmath/NotoSansMath-Regular.ttf",
+   "ttfPath": "noto-sans-math/NotoSansMath-Regular.ttf"
+  },
+  "Noto Sans Symbols 2-400-normal": {
+   "family": "Noto Sans Symbols 2",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosanssymbols2/NotoSansSymbols2-Regular.ttf",
+   "ttfPath": "noto-sans-symbols-2/NotoSansSymbols2-Regular.ttf"
+  },
+  "Arimo-400-normal": {
+   "family": "Arimo",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/arimo/Arimo[wght]-Regular.ttf",
+   "ttfPath": "arimo/Arimo[wght]-Regular.ttf"
+  },
+  "Arimo-700-normal": {
+   "family": "Arimo",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/arimo/Arimo[wght]-Bold.ttf",
+   "ttfPath": "arimo/Arimo[wght]-Bold.ttf"
+  },
+  "Bricolage Grotesque-800-normal": {
+   "family": "Bricolage Grotesque",
+   "weight": 800,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/bricolagegrotesque/BricolageGrotesque[opsz,wdth,wght]-ExtraBold.ttf",
+   "ttfPath": "bricolage-grotesque/BricolageGrotesque[opsz,wdth,wght]-ExtraBold.ttf"
+  },
+  "Cousine-400-normal": {
+   "family": "Cousine",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/cousine/Cousine-Regular.ttf",
+   "ttfPath": "cousine/Cousine-Regular.ttf"
+  },
+  "DM Sans-400-italic": {
+   "family": "DM Sans",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/dmsans/DMSans-Italic.ttf",
+   "ttfPath": "dm-sans/DMSans-Italic.ttf"
+  },
+  "DM Sans-400-normal": {
+   "family": "DM Sans",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/dmsans/DMSans-Regular.ttf",
+   "ttfPath": "dm-sans/DMSans-Regular.ttf"
+  },
+  "DM Sans-500-normal": {
+   "family": "DM Sans",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/dmsans/DMSans-Medium.ttf",
+   "ttfPath": "dm-sans/DMSans-Medium.ttf"
+  },
+  "DM Sans-700-normal": {
+   "family": "DM Sans",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/dmsans/DMSans-Bold.ttf",
+   "ttfPath": "dm-sans/DMSans-Bold.ttf"
+  },
+  "Hanken Grotesk-400-normal": {
+   "family": "Hanken Grotesk",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/hankengrotesk/HankenGrotesk-Regular.ttf",
+   "ttfPath": "hanken-grotesk/HankenGrotesk-Regular.ttf"
+  },
+  "IBM Plex Mono-400-normal": {
+   "family": "IBM Plex Mono",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexmono/IBMPlexMono-Regular.ttf",
+   "ttfPath": "ibm-plex-mono/IBMPlexMono-Regular.ttf"
+  },
+  "IBM Plex Mono-500-normal": {
+   "family": "IBM Plex Mono",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexmono/IBMPlexMono-Medium.ttf",
+   "ttfPath": "ibm-plex-mono/IBMPlexMono-Medium.ttf"
+  },
+  "IBM Plex Mono-600-normal": {
+   "family": "IBM Plex Mono",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexmono/IBMPlexMono-SemiBold.ttf",
+   "ttfPath": "ibm-plex-mono/IBMPlexMono-SemiBold.ttf"
+  },
+  "IBM Plex Sans Condensed-400-normal": {
+   "family": "IBM Plex Sans Condensed",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexsanscondensed/IBMPlexSansCondensed-Regular.ttf",
+   "ttfPath": "ibm-plex-sans-condensed/IBMPlexSansCondensed-Regular.ttf"
+  },
+  "IBM Plex Sans Condensed-600-normal": {
+   "family": "IBM Plex Sans Condensed",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexsanscondensed/IBMPlexSansCondensed-SemiBold.ttf",
+   "ttfPath": "ibm-plex-sans-condensed/IBMPlexSansCondensed-SemiBold.ttf"
+  },
+  "IBM Plex Sans Condensed-700-normal": {
+   "family": "IBM Plex Sans Condensed",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexsanscondensed/IBMPlexSansCondensed-Bold.ttf",
+   "ttfPath": "ibm-plex-sans-condensed/IBMPlexSansCondensed-Bold.ttf"
+  },
+  "IBM Plex Serif-400-italic": {
+   "family": "IBM Plex Serif",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexserif/IBMPlexSerif-Italic.ttf",
+   "ttfPath": "ibm-plex-serif/IBMPlexSerif-Italic.ttf"
+  },
+  "IBM Plex Serif-400-normal": {
+   "family": "IBM Plex Serif",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexserif/IBMPlexSerif-Regular.ttf",
+   "ttfPath": "ibm-plex-serif/IBMPlexSerif-Regular.ttf"
+  },
+  "IBM Plex Serif-600-normal": {
+   "family": "IBM Plex Serif",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexserif/IBMPlexSerif-SemiBold.ttf",
+   "ttfPath": "ibm-plex-serif/IBMPlexSerif-SemiBold.ttf"
+  },
+  "Instrument Serif-400-italic": {
+   "family": "Instrument Serif",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/instrumentserif/InstrumentSerif-Italic.ttf",
+   "ttfPath": "instrument-serif/InstrumentSerif-Italic.ttf"
+  },
+  "Instrument Serif-400-normal": {
+   "family": "Instrument Serif",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/instrumentserif/InstrumentSerif-Regular.ttf",
+   "ttfPath": "instrument-serif/InstrumentSerif-Regular.ttf"
+  },
+  "JetBrains Mono-400-normal": {
+   "family": "JetBrains Mono",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/jetbrainsmono/JetBrainsMono[wght]-Regular.ttf",
+   "ttfPath": "jetbrains-mono/JetBrainsMono[wght]-Regular.ttf"
+  },
+  "JetBrains Mono-500-normal": {
+   "family": "JetBrains Mono",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/jetbrainsmono/JetBrainsMono[wght]-Medium.ttf",
+   "ttfPath": "jetbrains-mono/JetBrainsMono[wght]-Medium.ttf"
+  },
+  "JetBrains Mono-700-normal": {
+   "family": "JetBrains Mono",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/jetbrainsmono/JetBrainsMono[wght]-Bold.ttf",
+   "ttfPath": "jetbrains-mono/JetBrainsMono[wght]-Bold.ttf"
+  },
+  "Lora-400-italic": {
+   "family": "Lora",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/lora/Lora-Italic.ttf",
+   "ttfPath": "lora/Lora-Italic.ttf"
+  },
+  "Lora-400-normal": {
+   "family": "Lora",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/lora/Lora-Regular.ttf",
+   "ttfPath": "lora/Lora-Regular.ttf"
+  },
+  "Lora-700-normal": {
+   "family": "Lora",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/lora/Lora-Bold.ttf",
+   "ttfPath": "lora/Lora-Bold.ttf"
+  },
+  "Public Sans-100-italic": {
+   "family": "Public Sans",
+   "weight": 100,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-ThinItalic.ttf",
+   "ttfPath": "public-sans/PublicSans[wght]-ThinItalic.ttf"
+  },
+  "Public Sans-400-normal": {
+   "family": "Public Sans",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-Regular.ttf",
+   "ttfPath": "public-sans/PublicSans[wght]-Regular.ttf"
+  },
+  "Public Sans-500-normal": {
+   "family": "Public Sans",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-Medium.ttf",
+   "ttfPath": "public-sans/PublicSans[wght]-Medium.ttf"
+  },
+  "Public Sans-600-normal": {
+   "family": "Public Sans",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-SemiBold.ttf",
+   "ttfPath": "public-sans/PublicSans[wght]-SemiBold.ttf"
+  },
+  "Public Sans-700-normal": {
+   "family": "Public Sans",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-Bold.ttf",
+   "ttfPath": "public-sans/PublicSans[wght]-Bold.ttf"
+  },
+  "Roboto Mono-400-normal": {
+   "family": "Roboto Mono",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/robotomono/RobotoMono[wght]-Regular.ttf",
+   "ttfPath": "roboto-mono/RobotoMono[wght]-Regular.ttf"
+  },
+  "Tinos-400-italic": {
+   "family": "Tinos",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/tinos/Tinos-Italic.ttf",
+   "ttfPath": "tinos/Tinos-Italic.ttf"
+  },
+  "Tinos-400-normal": {
+   "family": "Tinos",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/tinos/Tinos-Regular.ttf",
+   "ttfPath": "tinos/Tinos-Regular.ttf"
+  },
+  "Tinos-700-normal": {
+   "family": "Tinos",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/tinos/Tinos-Bold.ttf",
+   "ttfPath": "tinos/Tinos-Bold.ttf"
+  },
+  "Arimo-400-italic": {
+   "family": "Arimo",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/arimo/Arimo[wght]-Italic.ttf",
+   "ttfPath": "arimo/Arimo[wght]-Italic.ttf"
+  },
+  "Arimo-500-normal": {
+   "family": "Arimo",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/arimo/Arimo[wght]-Medium.ttf",
+   "ttfPath": "arimo/Arimo[wght]-Medium.ttf"
+  },
+  "Arimo-600-normal": {
+   "family": "Arimo",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/arimo/Arimo[wght]-SemiBold.ttf",
+   "ttfPath": "arimo/Arimo[wght]-SemiBold.ttf"
+  },
+  "Bricolage Grotesque-400-normal": {
+   "family": "Bricolage Grotesque",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/bricolagegrotesque/BricolageGrotesque[opsz,wdth,wght]-Regular.ttf",
+   "ttfPath": "bricolage-grotesque/BricolageGrotesque[opsz,wdth,wght]-Regular.ttf"
+  },
+  "Bricolage Grotesque-500-normal": {
+   "family": "Bricolage Grotesque",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/bricolagegrotesque/BricolageGrotesque[opsz,wdth,wght]-Medium.ttf",
+   "ttfPath": "bricolage-grotesque/BricolageGrotesque[opsz,wdth,wght]-Medium.ttf"
+  },
+  "Bricolage Grotesque-600-normal": {
+   "family": "Bricolage Grotesque",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/bricolagegrotesque/BricolageGrotesque[opsz,wdth,wght]-SemiBold.ttf",
+   "ttfPath": "bricolage-grotesque/BricolageGrotesque[opsz,wdth,wght]-SemiBold.ttf"
+  },
+  "Bricolage Grotesque-700-normal": {
+   "family": "Bricolage Grotesque",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/bricolagegrotesque/BricolageGrotesque[opsz,wdth,wght]-Bold.ttf",
+   "ttfPath": "bricolage-grotesque/BricolageGrotesque[opsz,wdth,wght]-Bold.ttf"
+  },
+  "Cousine-400-italic": {
+   "family": "Cousine",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/cousine/Cousine-Italic.ttf",
+   "ttfPath": "cousine/Cousine-Italic.ttf"
+  },
+  "Cousine-700-normal": {
+   "family": "Cousine",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/cousine/Cousine-Bold.ttf",
+   "ttfPath": "cousine/Cousine-Bold.ttf"
+  },
+  "DM Sans-600-normal": {
+   "family": "DM Sans",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/dmsans/DMSans-SemiBold.ttf",
+   "ttfPath": "dm-sans/DMSans-SemiBold.ttf"
+  },
+  "Hanken Grotesk-400-italic": {
+   "family": "Hanken Grotesk",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/hankengrotesk/HankenGrotesk-Italic.ttf",
+   "ttfPath": "hanken-grotesk/HankenGrotesk-Italic.ttf"
+  },
+  "Hanken Grotesk-500-normal": {
+   "family": "Hanken Grotesk",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/hankengrotesk/HankenGrotesk-Medium.ttf",
+   "ttfPath": "hanken-grotesk/HankenGrotesk-Medium.ttf"
+  },
+  "Hanken Grotesk-600-normal": {
+   "family": "Hanken Grotesk",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/hankengrotesk/HankenGrotesk-SemiBold.ttf",
+   "ttfPath": "hanken-grotesk/HankenGrotesk-SemiBold.ttf"
+  },
+  "Hanken Grotesk-700-normal": {
+   "family": "Hanken Grotesk",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/hankengrotesk/HankenGrotesk-Bold.ttf",
+   "ttfPath": "hanken-grotesk/HankenGrotesk-Bold.ttf"
+  },
+  "IBM Plex Mono-400-italic": {
+   "family": "IBM Plex Mono",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexmono/IBMPlexMono-Italic.ttf",
+   "ttfPath": "ibm-plex-mono/IBMPlexMono-Italic.ttf"
+  },
+  "IBM Plex Mono-700-normal": {
+   "family": "IBM Plex Mono",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexmono/IBMPlexMono-Bold.ttf",
+   "ttfPath": "ibm-plex-mono/IBMPlexMono-Bold.ttf"
+  },
+  "IBM Plex Sans Condensed-400-italic": {
+   "family": "IBM Plex Sans Condensed",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexsanscondensed/IBMPlexSansCondensed-Italic.ttf",
+   "ttfPath": "ibm-plex-sans-condensed/IBMPlexSansCondensed-Italic.ttf"
+  },
+  "IBM Plex Sans Condensed-500-normal": {
+   "family": "IBM Plex Sans Condensed",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexsanscondensed/IBMPlexSansCondensed-Medium.ttf",
+   "ttfPath": "ibm-plex-sans-condensed/IBMPlexSansCondensed-Medium.ttf"
+  },
+  "IBM Plex Serif-500-normal": {
+   "family": "IBM Plex Serif",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexserif/IBMPlexSerif-Medium.ttf",
+   "ttfPath": "ibm-plex-serif/IBMPlexSerif-Medium.ttf"
+  },
+  "IBM Plex Serif-700-normal": {
+   "family": "IBM Plex Serif",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/ibmplexserif/IBMPlexSerif-Bold.ttf",
+   "ttfPath": "ibm-plex-serif/IBMPlexSerif-Bold.ttf"
+  },
+  "Inter-500-normal": {
+   "family": "Inter",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/inter/Inter_24pt-Medium.ttf",
+   "ttfPath": "inter/Inter_24pt-Medium.ttf"
+  },
+  "JetBrains Mono-400-italic": {
+   "family": "JetBrains Mono",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/jetbrainsmono/JetBrainsMono[wght]-Italic.ttf",
+   "ttfPath": "jetbrains-mono/JetBrainsMono[wght]-Italic.ttf"
+  },
+  "JetBrains Mono-600-normal": {
+   "family": "JetBrains Mono",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/jetbrainsmono/JetBrainsMono[wght]-SemiBold.ttf",
+   "ttfPath": "jetbrains-mono/JetBrainsMono[wght]-SemiBold.ttf"
+  },
+  "Lora-500-normal": {
+   "family": "Lora",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/lora/Lora-Medium.ttf",
+   "ttfPath": "lora/Lora-Medium.ttf"
+  },
+  "Lora-600-normal": {
+   "family": "Lora",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/lora/Lora-SemiBold.ttf",
+   "ttfPath": "lora/Lora-SemiBold.ttf"
+  },
+  "Noto Sans-500-normal": {
+   "family": "Noto Sans",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/notosans/NotoSans-Medium.ttf",
+   "ttfPath": "noto-sans/NotoSans-Medium.ttf"
+  },
+  "Public Sans-400-italic": {
+   "family": "Public Sans",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-Italic.ttf",
+   "ttfPath": "public-sans/PublicSans[wght]-Italic.ttf"
+  },
+  "Roboto Mono-400-italic": {
+   "family": "Roboto Mono",
+   "weight": 400,
+   "style": "italic",
+   "ttfUrl": "https://cdn.moda.app/msdf/robotomono/RobotoMono[wght]-Italic.ttf",
+   "ttfPath": "roboto-mono/RobotoMono[wght]-Italic.ttf"
+  },
+  "Roboto Mono-500-normal": {
+   "family": "Roboto Mono",
+   "weight": 500,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/robotomono/RobotoMono[wght]-Medium.ttf",
+   "ttfPath": "roboto-mono/RobotoMono[wght]-Medium.ttf"
+  },
+  "Roboto Mono-600-normal": {
+   "family": "Roboto Mono",
+   "weight": 600,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/robotomono/RobotoMono[wght]-SemiBold.ttf",
+   "ttfPath": "roboto-mono/RobotoMono[wght]-SemiBold.ttf"
+  },
+  "Roboto Mono-700-normal": {
+   "family": "Roboto Mono",
+   "weight": 700,
+   "style": "normal",
+   "ttfUrl": "https://cdn.moda.app/msdf/robotomono/RobotoMono[wght]-Bold.ttf",
+   "ttfPath": "roboto-mono/RobotoMono[wght]-Bold.ttf"
+  },
+  "STIX Two Math-400-normal": {
+   "family": "STIX Two Math",
+   "weight": 400,
+   "style": "normal",
+   "ttfUrl": "https://raw.githubusercontent.com/stipub/stixfonts/v2.13b171/fonts/static_ttf/STIXTwoMath-Regular.ttf",
+   "ttfPath": "stix-two-math/STIXTwoMath-Regular.ttf",
+   "vectorOnly": true
+  }
+ },
+ "files": {
+  "https://cdn.moda.app/msdf/inter/Inter_24pt-Regular.ttf": {
+   "path": "inter/Inter_24pt-Regular.ttf",
+   "sha256": "d2a4911506ea4e124a47ca044e5e79f671ddf8f1a55f1ab9a56c58d088124b63",
+   "bytes": 342732
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-Regular.ttf": {
+   "path": "noto-sans/NotoSans-Regular.ttf",
+   "sha256": "0f45126fddd78ca8352c5cc6322be07fc7cf47215e9193a92d4764f7f1ee01b3",
+   "bytes": 646160
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-Bold.ttf": {
+   "path": "noto-sans/NotoSans-Bold.ttf",
+   "sha256": "96b544d3badb8fa1d29b4abadd0d0ed15a98b609f4494ddd0a1102a8995ae9ab",
+   "bytes": 648316
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-Light.ttf": {
+   "path": "noto-sans/NotoSans-Light.ttf",
+   "sha256": "2fff58175aba511a7603329c900e991e195587b72615dd048db2021bd00a1220",
+   "bytes": 646852
+  },
+  "https://cdn.moda.app/msdf/inter/Inter_24pt-ExtraBold.ttf": {
+   "path": "inter/Inter_24pt-ExtraBold.ttf",
+   "sha256": "a39a597b8e9f869916603b935173e0b444298e012b08a5ed6ab9bbc4f4572212",
+   "bytes": 344800
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-ExtraBold.ttf": {
+   "path": "noto-sans/NotoSans-ExtraBold.ttf",
+   "sha256": "42a2bdb2f44120f51f6c20354890818834307a9c2560a7037c55d50c9edf74cf",
+   "bytes": 648616
+  },
+  "https://cdn.moda.app/msdf/inter/Inter_24pt-Bold.ttf": {
+   "path": "inter/Inter_24pt-Bold.ttf",
+   "sha256": "9a2a0b55e203727936212904dedea502e678ba0d6c27851cab1f5eec3d23ef98",
+   "bytes": 344032
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-SemiBold.ttf": {
+   "path": "noto-sans/NotoSans-SemiBold.ttf",
+   "sha256": "b8d50cada4c3b67d55ff7832796fc05e01573694af97f188e611d4984f103961",
+   "bytes": 648620
+  },
+  "https://cdn.moda.app/msdf/inter/Inter_24pt-Black.ttf": {
+   "path": "inter/Inter_24pt-Black.ttf",
+   "sha256": "532bb29b05672483bd431caf23173dcdff15fb15460597aa344b6467d9b01721",
+   "bytes": 344764
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-Black.ttf": {
+   "path": "noto-sans/NotoSans-Black.ttf",
+   "sha256": "19ba9c3e0402a57ce89989348647a0ca0db6e851d2b77e5828f6854f09612fd5",
+   "bytes": 647260
+  },
+  "https://cdn.moda.app/msdf/montserrat/Montserrat-Bold.ttf": {
+   "path": "montserrat/Montserrat-Bold.ttf",
+   "sha256": "58910732a74589a4d6f8d9f22ac8458bed437ceeeacd27d9244b042a09904abe",
+   "bytes": 374640
+  },
+  "https://cdn.moda.app/msdf/inter/Inter_24pt-Italic.ttf": {
+   "path": "inter/Inter_24pt-Italic.ttf",
+   "sha256": "ac395f7b58c68d2de44cd8e24ced00cf4ec6d4909230a2715751060f43537f06",
+   "bytes": 346580
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-Italic.ttf": {
+   "path": "noto-sans/NotoSans-Italic.ttf",
+   "sha256": "28d2982c8062d8b5c0a69ba7c913d17297021deeb59af77b3f0244f6fa4bc03d",
+   "bytes": 663496
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-BoldItalic.ttf": {
+   "path": "noto-sans/NotoSans-BoldItalic.ttf",
+   "sha256": "3848697d46fefa66836058d21f56b1c3c04b9a7277b80121cecb3277ce0cc59c",
+   "bytes": 665436
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-LightItalic.ttf": {
+   "path": "noto-sans/NotoSans-LightItalic.ttf",
+   "sha256": "4761831b52a3fd0b602f3ff3cc04970ea30591b3126fda1c5fae4e065ca00de8",
+   "bytes": 665040
+  },
+  "https://cdn.moda.app/msdf/fraunces/Fraunces[SOFT,WONK,opsz,wght]-Regular.ttf": {
+   "path": "fraunces/Fraunces[SOFT,WONK,opsz,wght]-Regular.ttf",
+   "sha256": "dc127abf0182030060a444a754ec39e2475563fa3f4d13176b1957bdf0119586",
+   "bytes": 72992
+  },
+  "https://cdn.moda.app/msdf/lato/Lato-Regular.ttf": {
+   "path": "lato/Lato-Regular.ttf",
+   "sha256": "d636e4683231f931eda222d588e944d082bfd3bdba02f928bee461c0f185b251",
+   "bytes": 656568
+  },
+  "https://cdn.moda.app/msdf/inter/Inter_24pt-Light.ttf": {
+   "path": "inter/Inter_24pt-Light.ttf",
+   "sha256": "4af699ea5add0ac0bdefa3a43b0df698e2c0055a445a1c29267525d8eb7862b7",
+   "bytes": 343440
+  },
+  "https://cdn.moda.app/msdf/inter/Inter_24pt-SemiBold.ttf": {
+   "path": "inter/Inter_24pt-SemiBold.ttf",
+   "sha256": "10238d4c2f85914e3899177426840bde80b078a612903066cf5c9afd17dbf023",
+   "bytes": 343640
+  },
+  "https://cdn.moda.app/msdf/notosansjp/NotoSansJP[wght]-Regular.ttf": {
+   "path": "noto-sans-jp/NotoSansJP[wght]-Regular.ttf",
+   "sha256": "2466ce6584a120f1898b577a054adb9d38251a73a067a036f24a52588bd99eb6",
+   "bytes": 378580,
+   "subsetOf": {
+    "sha256": "a7e299772fb5e66b17735dd83fa7759e0918eb2c64bffbd5317a6188e5ff61c3",
+    "bytes": 5766900
+   }
+  },
+  "https://cdn.moda.app/msdf/notosanskr/NotoSansKR[wght]-Regular.ttf": {
+   "path": "noto-sans-kr/NotoSansKR[wght]-Regular.ttf",
+   "sha256": "b670e9e0f8b9aa1064802bbbb4aad2dc6002a759d29e5b5dea0c999de3d61244",
+   "bytes": 470024,
+   "subsetOf": {
+    "sha256": "f3c6010319817ca5136da6e7edf41302acbd1092ff3ef2ddb2191f0e1518af46",
+    "bytes": 6224884
+   }
+  },
+  "https://cdn.moda.app/msdf/notosanssc/NotoSansSC[wght]-Regular.ttf": {
+   "path": "noto-sans-sc/NotoSansSC[wght]-Regular.ttf",
+   "sha256": "e8e48f8eff08110b3690514eca1a794a0b2ea504d0467767c3b34e5a74bdc84d",
+   "bytes": 535748,
+   "subsetOf": {
+    "sha256": "4b65c0e95181a21a4db1069b4ea586e7a86c8448ad6ec1fea96f5cad1d994a29",
+    "bytes": 10595948
+   }
+  },
+  "https://cdn.moda.app/msdf/notosanstc/NotoSansTC[wght]-Regular.ttf": {
+   "path": "noto-sans-tc/NotoSansTC[wght]-Regular.ttf",
+   "sha256": "67f19cd3b6f40e92d267db6a0ead8f3c8e2fa75a2bd76ce8a7c1e6e2fece8502",
+   "bytes": 412048,
+   "subsetOf": {
+    "sha256": "a802e94f597f8e118c481ed0553b8f08b01414d0f5da56a51112d0460847d496",
+    "bytes": 7149196
+   }
+  },
+  "https://cdn.moda.app/msdf/fraunces/Fraunces[SOFT,WONK,opsz,wght]-Bold.ttf": {
+   "path": "fraunces/Fraunces[SOFT,WONK,opsz,wght]-Bold.ttf",
+   "sha256": "93b808df59e6ac9791b93581c56f207d1e806a734eb7469615a8d0f43552a2f7",
+   "bytes": 73028
+  },
+  "https://cdn.moda.app/msdf/playfairdisplay/PlayfairDisplay-Bold.ttf": {
+   "path": "playfair-display/PlayfairDisplay-Bold.ttf",
+   "sha256": "181c3eac4008e761dc5811ba7fd83c1836aefceaee87263cf6dc9134dd2c2cd3",
+   "bytes": 194928
+  },
+  "https://cdn.moda.app/msdf/notosansarabic/NotoSansArabic[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-arabic/NotoSansArabic[wdth,wght]-Regular.ttf",
+   "sha256": "b08dbab965dcae6e8470a9604c0bf3a7dfb3d8ac417486f2ed17899cd02c6e7f",
+   "bytes": 194336
+  },
+  "https://cdn.moda.app/msdf/notosanshebrew/NotoSansHebrew[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-hebrew/NotoSansHebrew[wdth,wght]-Regular.ttf",
+   "sha256": "1e7530923a321a56fde8fd49a10a4b8d0770d283a8bb476e02ccfca535ff6a54",
+   "bytes": 47772
+  },
+  "https://cdn.moda.app/msdf/notosansdevanagari/NotoSansDevanagari[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-devanagari/NotoSansDevanagari[wdth,wght]-Regular.ttf",
+   "sha256": "3e1f94670ca3bdb5f11bb362469cab5ebda59b9653583c8328e58c007bab47ca",
+   "bytes": 222768
+  },
+  "https://cdn.moda.app/msdf/notosansbengali/NotoSansBengali[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-bengali/NotoSansBengali[wdth,wght]-Regular.ttf",
+   "sha256": "a5a3cca50a2618ece5c049f556228bbbf4449b91ac952657ba279ac402770bdb",
+   "bytes": 137420
+  },
+  "https://cdn.moda.app/msdf/notosansgurmukhi/NotoSansGurmukhi[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-gurmukhi/NotoSansGurmukhi[wdth,wght]-Regular.ttf",
+   "sha256": "06ab71b1d49286358600c724ce55bc26196d60fccc5fc2ec9e3f10e5844c6d56",
+   "bytes": 67264
+  },
+  "https://cdn.moda.app/msdf/notosansgujarati/NotoSansGujarati[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-gujarati/NotoSansGujarati[wdth,wght]-Regular.ttf",
+   "sha256": "d80619358fc3e05dfe7b5f7718a3b975115df585d5a40a991b5f95b263762fdf",
+   "bytes": 179052
+  },
+  "https://cdn.moda.app/msdf/notosansoriya/NotoSansOriya[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-oriya/NotoSansOriya[wdth,wght]-Regular.ttf",
+   "sha256": "75e611f7b42b7f26cee00ec681ca71e053c2ffc34737d9a5bc27f8ad4acf507f",
+   "bytes": 157312
+  },
+  "https://cdn.moda.app/msdf/notosanstamil/NotoSansTamil[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-tamil/NotoSansTamil[wdth,wght]-Regular.ttf",
+   "sha256": "0f38210c041d5cfc4585be87c6c9931edab28b9ef3bba7db9fb5bc1c7a0291d0",
+   "bytes": 82612
+  },
+  "https://cdn.moda.app/msdf/notosanstelugu/NotoSansTelugu[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-telugu/NotoSansTelugu[wdth,wght]-Regular.ttf",
+   "sha256": "1ce7d46b6714b6877734d124de7f94d96f4976116e302aeb4f7ecaeb9da6c1b5",
+   "bytes": 208876
+  },
+  "https://cdn.moda.app/msdf/notosanskannada/NotoSansKannada[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-kannada/NotoSansKannada[wdth,wght]-Regular.ttf",
+   "sha256": "7904726b6b3a606f142af84967d97a4a52b9220ec63125d924a36a97152dae98",
+   "bytes": 171468
+  },
+  "https://cdn.moda.app/msdf/notosansmalayalam/NotoSansMalayalam[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-malayalam/NotoSansMalayalam[wdth,wght]-Regular.ttf",
+   "sha256": "a2c7fb63598ca85ceffa4ea5899d5d9cefbe4406fe0f95a15e086eeabbe566cc",
+   "bytes": 111492
+  },
+  "https://cdn.moda.app/msdf/notosanssinhala/NotoSansSinhala[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-sinhala/NotoSansSinhala[wdth,wght]-Regular.ttf",
+   "sha256": "87126ad4a9189780336b2f3e1493874342c3d90f45ab16eeed4c0fe0ced3f85f",
+   "bytes": 247156
+  },
+  "https://cdn.moda.app/msdf/notosansthai/NotoSansThai[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-thai/NotoSansThai[wdth,wght]-Regular.ttf",
+   "sha256": "8b94954d3183ede34044b07a3c1928f21b35c343f06b5e85f834adf18f333ff6",
+   "bytes": 47788
+  },
+  "https://cdn.moda.app/msdf/notosanslao/NotoSansLao[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-lao/NotoSansLao[wdth,wght]-Regular.ttf",
+   "sha256": "a19e3dd4b6434d3215c7801eae668f885fd05f9ee65cceb87c9f542c81994f3e",
+   "bytes": 52828
+  },
+  "https://cdn.moda.app/msdf/notosanskhmer/NotoSansKhmer[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-khmer/NotoSansKhmer[wdth,wght]-Regular.ttf",
+   "sha256": "e02a699ade4963c2088e56b44d4d32b42fdfafd8e63d78e06d1585fdb6048c80",
+   "bytes": 105552
+  },
+  "https://cdn.moda.app/msdf/notosansmyanmar/NotoSansMyanmar[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-myanmar/NotoSansMyanmar[wdth,wght]-Regular.ttf",
+   "sha256": "d659452a82503e4e15f4c668f2254373dd1d280b3e4d8819b721b918625a029d",
+   "bytes": 186548
+  },
+  "https://cdn.moda.app/msdf/notoseriftibetan/NotoSerifTibetan[wght]-Regular.ttf": {
+   "path": "noto-serif-tibetan/NotoSerifTibetan[wght]-Regular.ttf",
+   "sha256": "abd63375a5033191e4e2cfee75419437286e907bb55edf1cb6d18a9b45aeed69",
+   "bytes": 746516
+  },
+  "https://cdn.moda.app/msdf/notosansethiopic/NotoSansEthiopic[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-ethiopic/NotoSansEthiopic[wdth,wght]-Regular.ttf",
+   "sha256": "2bba18e62a792ded8ec0a387be03763b52a1c3dd4c28562d651669f301822aca",
+   "bytes": 366000
+  },
+  "https://cdn.moda.app/msdf/notosansgeorgian/NotoSansGeorgian[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-georgian/NotoSansGeorgian[wdth,wght]-Regular.ttf",
+   "sha256": "e4c02c7c05227c17667acb605945757b985eaa71f52fffeb86d82a2dd9eed4a3",
+   "bytes": 65436
+  },
+  "https://cdn.moda.app/msdf/notosansarmenian/NotoSansArmenian[wdth,wght]-Regular.ttf": {
+   "path": "noto-sans-armenian/NotoSansArmenian[wdth,wght]-Regular.ttf",
+   "sha256": "4c558a3ae569a6ebf2571c795e5885a804cae72eb167f44e84157784164f9335",
+   "bytes": 49744
+  },
+  "https://notofonts.github.io/syriac/fonts/NotoSansSyriac/unhinted/ttf/NotoSansSyriac-Regular.ttf": {
+   "path": "noto-sans-syriac/NotoSansSyriac-Regular.ttf",
+   "sha256": "9c8cd60bd2384170211bb56f977c42f0fba8faf4a8aae0825bbb3482f9f4523c",
+   "bytes": 52068
+  },
+  "https://notofonts.github.io/thaana/fonts/NotoSansThaana/unhinted/ttf/NotoSansThaana-Regular.ttf": {
+   "path": "noto-sans-thaana/NotoSansThaana-Regular.ttf",
+   "sha256": "7c4ce069e088b0e76064fd8b0f01fce1c5d692b0862d040e5dd725576d0c78f4",
+   "bytes": 27300
+  },
+  "https://notofonts.github.io/nko/fonts/NotoSansNKo/unhinted/ttf/NotoSansNKo-Regular.ttf": {
+   "path": "noto-sans-nko/NotoSansNKo-Regular.ttf",
+   "sha256": "15d7ba308060c13228659a221b250889866b2cde20b5fd76c5d03f4cd487d2c9",
+   "bytes": 24820
+  },
+  "https://notofonts.github.io/samaritan/fonts/NotoSansSamaritan/unhinted/ttf/NotoSansSamaritan-Regular.ttf": {
+   "path": "noto-sans-samaritan/NotoSansSamaritan-Regular.ttf",
+   "sha256": "12b8385b5b6ddc957a0fdfb5c41cfc85d412d96a94374856859aa1959ad2a001",
+   "bytes": 11292
+  },
+  "https://notofonts.github.io/mandaic/fonts/NotoSansMandaic/unhinted/ttf/NotoSansMandaic-Regular.ttf": {
+   "path": "noto-sans-mandaic/NotoSansMandaic-Regular.ttf",
+   "sha256": "5806cbb3597c3a992ec56deea69d8b243ec88bdb6af5c7bdf95ebc6f70a3c6a2",
+   "bytes": 19112
+  },
+  "https://notofonts.github.io/adlam/fonts/NotoSansAdlam/unhinted/ttf/NotoSansAdlam-Regular.ttf": {
+   "path": "noto-sans-adlam/NotoSansAdlam-Regular.ttf",
+   "sha256": "f189ffc3c9a285ad9c0552955285112a2d5992bf2cf4479c259c9cd0dc00760f",
+   "bytes": 60276
+  },
+  "https://notofonts.github.io/mongolian/fonts/NotoSansMongolian/unhinted/ttf/NotoSansMongolian-Regular.ttf": {
+   "path": "noto-sans-mongolian/NotoSansMongolian-Regular.ttf",
+   "sha256": "c5fd24f39222c4e5aa97a6864126fd164b6a5bd0a93d9efe95c7fb950dd2df41",
+   "bytes": 253932
+  },
+  "https://notofonts.github.io/brahmi/fonts/NotoSansBrahmi/unhinted/ttf/NotoSansBrahmi-Regular.ttf": {
+   "path": "noto-sans-brahmi/NotoSansBrahmi-Regular.ttf",
+   "sha256": "9a9f0057fbbb8742611c046d2fb9359ddab0e0de201b5aaae3bee2911b4b53ff",
+   "bytes": 45624
+  },
+  "https://notofonts.github.io/limbu/fonts/NotoSansLimbu/unhinted/ttf/NotoSansLimbu-Regular.ttf": {
+   "path": "noto-sans-limbu/NotoSansLimbu-Regular.ttf",
+   "sha256": "c322f3223352fd37efd01a4d9756aeae86694b429cf4289f2a39df4e43dc0f37",
+   "bytes": 13068
+  },
+  "https://notofonts.github.io/tai-tham/fonts/NotoSansTaiTham/unhinted/ttf/NotoSansTaiTham-Regular.ttf": {
+   "path": "noto-sans-tai-tham/NotoSansTaiTham-Regular.ttf",
+   "sha256": "03bdb77ade5d15af62d39a389ff331f3a83dfad1e9d5f441e4c28e824773a4f5",
+   "bytes": 112668
+  },
+  "https://notofonts.github.io/hanifi-rohingya/fonts/NotoSansHanifiRohingya/unhinted/ttf/NotoSansHanifiRohingya-Regular.ttf": {
+   "path": "noto-sans-hanifi-rohingya/NotoSansHanifiRohingya-Regular.ttf",
+   "sha256": "4d56429b29379d2caa1d717827a1f73af9deed03372019add0f9fa4370ad9bf8",
+   "bytes": 19404
+  },
+  "https://cdn.moda.app/msdf/inter/Inter_24pt-Medium.ttf": {
+   "path": "inter/Inter_24pt-Medium.ttf",
+   "sha256": "fa6b009d7b921ccd070b8d039da23b5663e1a87600a179c0512c347565998ac5",
+   "bytes": 342936
+  },
+  "https://cdn.moda.app/msdf/inter/Inter_24pt-MediumItalic.ttf": {
+   "path": "inter/Inter_24pt-MediumItalic.ttf",
+   "sha256": "13522fa9e5a7a213556a5443a95c9446898abe4acf1faf1f5a36e99cc0bd832a",
+   "bytes": 347000
+  },
+  "https://cdn.moda.app/msdf/montserrat/Montserrat-Regular.ttf": {
+   "path": "montserrat/Montserrat-Regular.ttf",
+   "sha256": "538f11947bc027a889fa3bf87e62ee7b0766ec10093facf7bcf7b2cf95bfa516",
+   "bytes": 374500
+  },
+  "https://cdn.moda.app/msdf/montserrat/Montserrat-Medium.ttf": {
+   "path": "montserrat/Montserrat-Medium.ttf",
+   "sha256": "95dc23b29b54008722cd668929c835777d5f3bb70f5b17c3b1e282f8f15717a0",
+   "bytes": 374312
+  },
+  "https://cdn.moda.app/msdf/montserrat/Montserrat-SemiBold.ttf": {
+   "path": "montserrat/Montserrat-SemiBold.ttf",
+   "sha256": "6417d9d7dd038a4d03ac3fa399cb36e59938e80ef19572198a7805437a7079c9",
+   "bytes": 374624
+  },
+  "https://cdn.moda.app/msdf/montserrat/Montserrat-Italic.ttf": {
+   "path": "montserrat/Montserrat-Italic.ttf",
+   "sha256": "e04724cf671f68c14e876c2c5c686222ba23cd6f6c73e91c15453684dbeeeff7",
+   "bytes": 384612
+  },
+  "https://cdn.moda.app/msdf/lato/Lato-Medium.ttf": {
+   "path": "lato/Lato-Medium.ttf",
+   "sha256": "d3ac182a6833e005745dd75679fbad081c0b12535df4e93ad8ed57817a31a338",
+   "bytes": 636396
+  },
+  "https://cdn.moda.app/msdf/lato/Lato-SemiBold.ttf": {
+   "path": "lato/Lato-SemiBold.ttf",
+   "sha256": "71b8b7decbe75a881ed267be539d402bd1e9420b799658aada4e0d1bd5af803c",
+   "bytes": 668548
+  },
+  "https://cdn.moda.app/msdf/lato/Lato-Bold.ttf": {
+   "path": "lato/Lato-Bold.ttf",
+   "sha256": "8a0aace75d33794eece4b28187bfc1df0bbd2888b5d8a56e01788c8d65d16be1",
+   "bytes": 656544
+  },
+  "https://cdn.moda.app/msdf/lato/Lato-Italic.ttf": {
+   "path": "lato/Lato-Italic.ttf",
+   "sha256": "e399c44efe1387100531d26c7e4800c5d12251b890d6654a3098c7c679cb1786",
+   "bytes": 722900
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-Medium.ttf": {
+   "path": "noto-sans/NotoSans-Medium.ttf",
+   "sha256": "0b6c30d32e9ec7a1623f534074cd0e92e6546911c8191fce904f88a806bef9dc",
+   "bytes": 648308
+  },
+  "https://cdn.moda.app/msdf/notosans/NotoSans-MediumItalic.ttf": {
+   "path": "noto-sans/NotoSans-MediumItalic.ttf",
+   "sha256": "6c3f5330218f33e40e191ecec047de628a12c9d3b01dff29d5257b884d39b4e8",
+   "bytes": 665312
+  },
+  "https://cdn.moda.app/msdf/notosansmath/NotoSansMath-Regular.ttf": {
+   "path": "noto-sans-math/NotoSansMath-Regular.ttf",
+   "sha256": "3f495fe933c06786e4d5f6d86b8ee70b6753a68ee3b9d87528726de0f6e2c47d",
+   "bytes": 1015396
+  },
+  "https://cdn.moda.app/msdf/notosanssymbols2/NotoSansSymbols2-Regular.ttf": {
+   "path": "noto-sans-symbols-2/NotoSansSymbols2-Regular.ttf",
+   "sha256": "7d5fb73b7ca67a6798101741f5d280a3d016a56a197afcd4199dbb57b4b82a21",
+   "bytes": 1233128
+  },
+  "https://cdn.moda.app/msdf/arimo/Arimo[wght]-Regular.ttf": {
+   "path": "arimo/Arimo[wght]-Regular.ttf",
+   "sha256": "06bea607074d2be4d131cabae008bd2e9932c7948db54e2cbaf46249a2fedad3",
+   "bytes": 321316
+  },
+  "https://cdn.moda.app/msdf/arimo/Arimo[wght]-Bold.ttf": {
+   "path": "arimo/Arimo[wght]-Bold.ttf",
+   "sha256": "e798b7c4ed9405fe4e704757dfe79587e0d268a8408b4a2b30b8751cd859cec8",
+   "bytes": 321892
+  },
+  "https://cdn.moda.app/msdf/bricolagegrotesque/BricolageGrotesque[opsz,wdth,wght]-ExtraBold.ttf": {
+   "path": "bricolage-grotesque/BricolageGrotesque[opsz,wdth,wght]-ExtraBold.ttf",
+   "sha256": "dc50d6cb7a4cccb2f3d462f588f11d699f52566b60dfd1eac3592f9167a6290c",
+   "bytes": 90732
+  },
+  "https://cdn.moda.app/msdf/cousine/Cousine-Regular.ttf": {
+   "path": "cousine/Cousine-Regular.ttf",
+   "sha256": "69e1ea59eb770014204e5174f805750f9a793db4a2531e6516b30b7460d470b3",
+   "bytes": 308360
+  },
+  "https://cdn.moda.app/msdf/dmsans/DMSans-Italic.ttf": {
+   "path": "dm-sans/DMSans-Italic.ttf",
+   "sha256": "4d5bc08ebf6e65278568465a6b75b2216996dcc8c57c60ab4f0fdf671d794cbd",
+   "bytes": 61184
+  },
+  "https://cdn.moda.app/msdf/dmsans/DMSans-Regular.ttf": {
+   "path": "dm-sans/DMSans-Regular.ttf",
+   "sha256": "a7f7908087f3e4eaaeead0b1856278e21bdd06b16b263f82906f1a0831a43c40",
+   "bytes": 56748
+  },
+  "https://cdn.moda.app/msdf/dmsans/DMSans-Medium.ttf": {
+   "path": "dm-sans/DMSans-Medium.ttf",
+   "sha256": "1dafe60cbebb87f22ef0cacb85833328960094434a9537d0e815cd2b5c46ebf2",
+   "bytes": 56840
+  },
+  "https://cdn.moda.app/msdf/dmsans/DMSans-Bold.ttf": {
+   "path": "dm-sans/DMSans-Bold.ttf",
+   "sha256": "7390b3d853aac11d76f2b4e0bfe1a72829e2e842c7e54c8f9699611a7aa4d62b",
+   "bytes": 56816
+  },
+  "https://cdn.moda.app/msdf/hankengrotesk/HankenGrotesk-Regular.ttf": {
+   "path": "hanken-grotesk/HankenGrotesk-Regular.ttf",
+   "sha256": "c475e5fa8edebbe9840f122c9ef3c3162920196609e0e95466356ee989143fe1",
+   "bytes": 67892
+  },
+  "https://cdn.moda.app/msdf/ibmplexmono/IBMPlexMono-Regular.ttf": {
+   "path": "ibm-plex-mono/IBMPlexMono-Regular.ttf",
+   "sha256": "6a3412f058c7d8dfd9170c41e85ade48e5156ecb89356110ca57a0a27734af46",
+   "bytes": 135580
+  },
+  "https://cdn.moda.app/msdf/ibmplexmono/IBMPlexMono-Medium.ttf": {
+   "path": "ibm-plex-mono/IBMPlexMono-Medium.ttf",
+   "sha256": "a9b4c49bb299e05b5f6c481e7fb5e78943d2793249a0c8874ab574a2d1ea6755",
+   "bytes": 136704
+  },
+  "https://cdn.moda.app/msdf/ibmplexmono/IBMPlexMono-SemiBold.ttf": {
+   "path": "ibm-plex-mono/IBMPlexMono-SemiBold.ttf",
+   "sha256": "d3c38e55c78f5b0f28009fddba4834ec503278936a5986032424c9bd2d23aa46",
+   "bytes": 140216
+  },
+  "https://cdn.moda.app/msdf/ibmplexsanscondensed/IBMPlexSansCondensed-Regular.ttf": {
+   "path": "ibm-plex-sans-condensed/IBMPlexSansCondensed-Regular.ttf",
+   "sha256": "e7437c072eef2ef592ae6f2beb0000446287385907abb57ac1cf07bcbaa2aa33",
+   "bytes": 111236
+  },
+  "https://cdn.moda.app/msdf/ibmplexsanscondensed/IBMPlexSansCondensed-SemiBold.ttf": {
+   "path": "ibm-plex-sans-condensed/IBMPlexSansCondensed-SemiBold.ttf",
+   "sha256": "a081ca60548aea14100757a2d6fe71ca60fd90ebce779c9a8ae5a0c8fb4526d4",
+   "bytes": 111476
+  },
+  "https://cdn.moda.app/msdf/ibmplexsanscondensed/IBMPlexSansCondensed-Bold.ttf": {
+   "path": "ibm-plex-sans-condensed/IBMPlexSansCondensed-Bold.ttf",
+   "sha256": "b65492d86cdd5cd9d43d2671b55d5d36fec36859fc8b08bc6aba78e441d6c849",
+   "bytes": 112228
+  },
+  "https://cdn.moda.app/msdf/ibmplexserif/IBMPlexSerif-Italic.ttf": {
+   "path": "ibm-plex-serif/IBMPlexSerif-Italic.ttf",
+   "sha256": "4b75b38be4673527231f49c48818d090c913d5042dd5c747b525bf6185d29ecb",
+   "bytes": 173004
+  },
+  "https://cdn.moda.app/msdf/ibmplexserif/IBMPlexSerif-Regular.ttf": {
+   "path": "ibm-plex-serif/IBMPlexSerif-Regular.ttf",
+   "sha256": "e882efa9c41949a528ac2369079ec5ef050c1c996bbd0bacce3c3326d44cf80d",
+   "bytes": 163068
+  },
+  "https://cdn.moda.app/msdf/ibmplexserif/IBMPlexSerif-SemiBold.ttf": {
+   "path": "ibm-plex-serif/IBMPlexSerif-SemiBold.ttf",
+   "sha256": "27ce4d105591b48f666b228e1e399838a704594efea22b730000951bea700a60",
+   "bytes": 164528
+  },
+  "https://cdn.moda.app/msdf/instrumentserif/InstrumentSerif-Italic.ttf": {
+   "path": "instrument-serif/InstrumentSerif-Italic.ttf",
+   "sha256": "08939b8bdf534afec24ae0ef5e03f948940cd9a8fe08e7fecbad040e62327385",
+   "bytes": 71592
+  },
+  "https://cdn.moda.app/msdf/instrumentserif/InstrumentSerif-Regular.ttf": {
+   "path": "instrument-serif/InstrumentSerif-Regular.ttf",
+   "sha256": "498efd461f6ddfcb7a111bf9a565709d2085d48201d501ead960d93e84ffbb88",
+   "bytes": 70012
+  },
+  "https://cdn.moda.app/msdf/jetbrainsmono/JetBrainsMono[wght]-Regular.ttf": {
+   "path": "jetbrains-mono/JetBrainsMono[wght]-Regular.ttf",
+   "sha256": "9a266ecdb674179a8b079ddd41352e7acb4c2c1cb5ccfb044a9f385b4cd62ec5",
+   "bytes": 115152
+  },
+  "https://cdn.moda.app/msdf/jetbrainsmono/JetBrainsMono[wght]-Medium.ttf": {
+   "path": "jetbrains-mono/JetBrainsMono[wght]-Medium.ttf",
+   "sha256": "7c8f512945aff9cdae6976386b6e0a3659846f63d327a7c1b0e18fe3e18a7019",
+   "bytes": 115172
+  },
+  "https://cdn.moda.app/msdf/jetbrainsmono/JetBrainsMono[wght]-Bold.ttf": {
+   "path": "jetbrains-mono/JetBrainsMono[wght]-Bold.ttf",
+   "sha256": "c1522e559f7d92346a84f78cf8d9118d9b6b99154c614a1d512c7caa355f80a4",
+   "bytes": 115108
+  },
+  "https://cdn.moda.app/msdf/lora/Lora-Italic.ttf": {
+   "path": "lora/Lora-Italic.ttf",
+   "sha256": "f5635e27fc61bf2742f6d65ec94e424f5cc297ae3dbde54818f79374b7f7440f",
+   "bytes": 140864
+  },
+  "https://cdn.moda.app/msdf/lora/Lora-Regular.ttf": {
+   "path": "lora/Lora-Regular.ttf",
+   "sha256": "84466e241bfc4fd387fb0bcc9eb1cc21c263d0c3617aac57aa7932b037154be3",
+   "bytes": 135264
+  },
+  "https://cdn.moda.app/msdf/lora/Lora-Bold.ttf": {
+   "path": "lora/Lora-Bold.ttf",
+   "sha256": "339061421f5a360645097d7e78f46ca9126a07f49acadf5b1f559242fba21c23",
+   "bytes": 134944
+  },
+  "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-ThinItalic.ttf": {
+   "path": "public-sans/PublicSans[wght]-ThinItalic.ttf",
+   "sha256": "5998fa2113d5ceea8aec3f4ce9eaafa469a4094d4f63f26db4519735465706d5",
+   "bytes": 63332
+  },
+  "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-Regular.ttf": {
+   "path": "public-sans/PublicSans[wght]-Regular.ttf",
+   "sha256": "8755b95bacc96cee819970bea250e8f89b403986c6d5b4b422c19697f6206c60",
+   "bytes": 61232
+  },
+  "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-Medium.ttf": {
+   "path": "public-sans/PublicSans[wght]-Medium.ttf",
+   "sha256": "a76d38485f615ae5f6a0e65edcbb3cf98f6352dee89468382cfc124fec6c68c4",
+   "bytes": 61200
+  },
+  "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-SemiBold.ttf": {
+   "path": "public-sans/PublicSans[wght]-SemiBold.ttf",
+   "sha256": "3a11f4f4455dc446fb75498b7cae96d8f4f2100bb03cf003e479d10eb8a70615",
+   "bytes": 61272
+  },
+  "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-Bold.ttf": {
+   "path": "public-sans/PublicSans[wght]-Bold.ttf",
+   "sha256": "d5098423d2cab7afdcc54efb796399faad0405b0626af3316e19de0589aa570c",
+   "bytes": 61444
+  },
+  "https://cdn.moda.app/msdf/robotomono/RobotoMono[wght]-Regular.ttf": {
+   "path": "roboto-mono/RobotoMono[wght]-Regular.ttf",
+   "sha256": "0c1ba23e1dcb891c7d39092229442bbecd38f8ba7195ba478c41516cf3e8f751",
+   "bytes": 88120
+  },
+  "https://cdn.moda.app/msdf/tinos/Tinos-Italic.ttf": {
+   "path": "tinos/Tinos-Italic.ttf",
+   "sha256": "751c979043c9641dad389ab9c680c2c9ffb0a0c7352153f48b9ebd958e8963d8",
+   "bytes": 455400
+  },
+  "https://cdn.moda.app/msdf/tinos/Tinos-Regular.ttf": {
+   "path": "tinos/Tinos-Regular.ttf",
+   "sha256": "1061395ac6775f3cea27dc9ef3d7a3b9cc34c2b4a2d97aa649411294d5165990",
+   "bytes": 475288
+  },
+  "https://cdn.moda.app/msdf/tinos/Tinos-Bold.ttf": {
+   "path": "tinos/Tinos-Bold.ttf",
+   "sha256": "6a0afe87068ba5ddeb6a9bb7b9d0dc41666966c044767df69de3efb7e33f5af8",
+   "bytes": 451516
+  },
+  "https://cdn.moda.app/msdf/arimo/Arimo[wght]-Italic.ttf": {
+   "path": "arimo/Arimo[wght]-Italic.ttf",
+   "sha256": "7dd9d1f5f6b61d400c3f379d678028724ad2178ce62a47c3c69bc83829e90709",
+   "bytes": 345104
+  },
+  "https://cdn.moda.app/msdf/arimo/Arimo[wght]-Medium.ttf": {
+   "path": "arimo/Arimo[wght]-Medium.ttf",
+   "sha256": "6c19287853ce5043dd93c7679e63a4d8f6cd2a2a7d59205a22d5bbe6fb5d2bd1",
+   "bytes": 324236
+  },
+  "https://cdn.moda.app/msdf/arimo/Arimo[wght]-SemiBold.ttf": {
+   "path": "arimo/Arimo[wght]-SemiBold.ttf",
+   "sha256": "dd4a28941a62f42324467d1b2df2e2b1936fcae4fe7036b5d0b7e9fff352cfd7",
+   "bytes": 325236
+  },
+  "https://cdn.moda.app/msdf/bricolagegrotesque/BricolageGrotesque[opsz,wdth,wght]-Regular.ttf": {
+   "path": "bricolage-grotesque/BricolageGrotesque[opsz,wdth,wght]-Regular.ttf",
+   "sha256": "388f8a8c7df7ddc5d45068d57bc1abf21cf2b8c07e15dd07c7dd8fc10816eff2",
+   "bytes": 90744
+  },
+  "https://cdn.moda.app/msdf/bricolagegrotesque/BricolageGrotesque[opsz,wdth,wght]-Medium.ttf": {
+   "path": "bricolage-grotesque/BricolageGrotesque[opsz,wdth,wght]-Medium.ttf",
+   "sha256": "f27d66ed9ed0dbbb25ea9ce1bca7cb97572ff4eba89da11caa0bad96a437a0cb",
+   "bytes": 90860
+  },
+  "https://cdn.moda.app/msdf/bricolagegrotesque/BricolageGrotesque[opsz,wdth,wght]-SemiBold.ttf": {
+   "path": "bricolage-grotesque/BricolageGrotesque[opsz,wdth,wght]-SemiBold.ttf",
+   "sha256": "a4697b93f937c3daf58d59842a538f41ec85cf608b3ca367e713fb0933d5da1e",
+   "bytes": 90792
+  },
+  "https://cdn.moda.app/msdf/bricolagegrotesque/BricolageGrotesque[opsz,wdth,wght]-Bold.ttf": {
+   "path": "bricolage-grotesque/BricolageGrotesque[opsz,wdth,wght]-Bold.ttf",
+   "sha256": "5a75d0d6704ea59c78200bcbfc0f79f3a0f1457dcf551acb67ba8e3c1e5ddced",
+   "bytes": 90744
+  },
+  "https://cdn.moda.app/msdf/cousine/Cousine-Italic.ttf": {
+   "path": "cousine/Cousine-Italic.ttf",
+   "sha256": "9b2b98e5d389fe74968af2abb440ac4b6fcd24e2a1aba5ed895b0337b6b0b5e6",
+   "bytes": 269840
+  },
+  "https://cdn.moda.app/msdf/cousine/Cousine-Bold.ttf": {
+   "path": "cousine/Cousine-Bold.ttf",
+   "sha256": "42d14baaf1802f8edf7659346a8574b41c4c78e264eb81cdb0891ca6686354ce",
+   "bytes": 296624
+  },
+  "https://cdn.moda.app/msdf/dmsans/DMSans-SemiBold.ttf": {
+   "path": "dm-sans/DMSans-SemiBold.ttf",
+   "sha256": "d324c4503962afa753c8d7b5f949c5810b909a1bd6b9b1a14efe88a0da63d222",
+   "bytes": 56812
+  },
+  "https://cdn.moda.app/msdf/hankengrotesk/HankenGrotesk-Italic.ttf": {
+   "path": "hanken-grotesk/HankenGrotesk-Italic.ttf",
+   "sha256": "e372bbc6eeec1eb6d3187c30f8ba99a015fb83a1b4c657071845e07da1b7e402",
+   "bytes": 70808
+  },
+  "https://cdn.moda.app/msdf/hankengrotesk/HankenGrotesk-Medium.ttf": {
+   "path": "hanken-grotesk/HankenGrotesk-Medium.ttf",
+   "sha256": "50874cdbfa269d66247ffdb0539cdac4c47a5c9ed5abf14a4363ddac116aadbb",
+   "bytes": 67880
+  },
+  "https://cdn.moda.app/msdf/hankengrotesk/HankenGrotesk-SemiBold.ttf": {
+   "path": "hanken-grotesk/HankenGrotesk-SemiBold.ttf",
+   "sha256": "51895572043b4ca3766809b0a42797a8a0fc3fdae56ea5a720cd805fafaee5fd",
+   "bytes": 67816
+  },
+  "https://cdn.moda.app/msdf/hankengrotesk/HankenGrotesk-Bold.ttf": {
+   "path": "hanken-grotesk/HankenGrotesk-Bold.ttf",
+   "sha256": "76d60346209b2d6045626e71377a8721415c350963178160f3b71ecf2c9f1efd",
+   "bytes": 67840
+  },
+  "https://cdn.moda.app/msdf/ibmplexmono/IBMPlexMono-Italic.ttf": {
+   "path": "ibm-plex-mono/IBMPlexMono-Italic.ttf",
+   "sha256": "3362fc791b0652193328b862c1c5f23a789bc7288b1617fa63302f88689a2a34",
+   "bytes": 143920
+  },
+  "https://cdn.moda.app/msdf/ibmplexmono/IBMPlexMono-Bold.ttf": {
+   "path": "ibm-plex-mono/IBMPlexMono-Bold.ttf",
+   "sha256": "ac27abd6450a64dd94467580a02fe6235156d5b92f2926ebbc8e7489df64e0be",
+   "bytes": 137784
+  },
+  "https://cdn.moda.app/msdf/ibmplexsanscondensed/IBMPlexSansCondensed-Italic.ttf": {
+   "path": "ibm-plex-sans-condensed/IBMPlexSansCondensed-Italic.ttf",
+   "sha256": "a0320e60c17926c4e210dfdb3b1a346991f35f83b471daf55537ee79cbcb7c7f",
+   "bytes": 117128
+  },
+  "https://cdn.moda.app/msdf/ibmplexsanscondensed/IBMPlexSansCondensed-Medium.ttf": {
+   "path": "ibm-plex-sans-condensed/IBMPlexSansCondensed-Medium.ttf",
+   "sha256": "426350c298277f7f9d1a93956572799ca3d16e2d43e7f60eec8382bcd795ec30",
+   "bytes": 111176
+  },
+  "https://cdn.moda.app/msdf/ibmplexserif/IBMPlexSerif-Medium.ttf": {
+   "path": "ibm-plex-serif/IBMPlexSerif-Medium.ttf",
+   "sha256": "32925e73e5b4a441df9d23e847f2b8c4046c1fc3db094e90bad8883157811509",
+   "bytes": 164104
+  },
+  "https://cdn.moda.app/msdf/ibmplexserif/IBMPlexSerif-Bold.ttf": {
+   "path": "ibm-plex-serif/IBMPlexSerif-Bold.ttf",
+   "sha256": "534c02c295999dd86e770457ece1d43db0de9256dd98bf741426f63ae904209e",
+   "bytes": 163800
+  },
+  "https://cdn.moda.app/msdf/jetbrainsmono/JetBrainsMono[wght]-Italic.ttf": {
+   "path": "jetbrains-mono/JetBrainsMono[wght]-Italic.ttf",
+   "sha256": "0f8329e76a0bad459b11b80def4382c9cb108e3f57ef7eaeda56d7cce819d083",
+   "bytes": 117964
+  },
+  "https://cdn.moda.app/msdf/jetbrainsmono/JetBrainsMono[wght]-SemiBold.ttf": {
+   "path": "jetbrains-mono/JetBrainsMono[wght]-SemiBold.ttf",
+   "sha256": "1f7949f1a4c652bdfb5809993c93e8c91f318399e5393c30ae83a5c9906979a7",
+   "bytes": 115084
+  },
+  "https://cdn.moda.app/msdf/lora/Lora-Medium.ttf": {
+   "path": "lora/Lora-Medium.ttf",
+   "sha256": "c1674f195d34dd75e40cea9aff14cd89adfc3053d2d4b3eae38d69fffd14c6fa",
+   "bytes": 135348
+  },
+  "https://cdn.moda.app/msdf/lora/Lora-SemiBold.ttf": {
+   "path": "lora/Lora-SemiBold.ttf",
+   "sha256": "18ef9a39cc8c2ee3b97849c1af570be84b1903b8811febd20b9217654e7365e4",
+   "bytes": 135444
+  },
+  "https://cdn.moda.app/msdf/publicsans/PublicSans[wght]-Italic.ttf": {
+   "path": "public-sans/PublicSans[wght]-Italic.ttf",
+   "sha256": "9f0f0bcb01b1101d0d60869315862e205a16a3f8a7a6c99d52e8219d6eecf079",
+   "bytes": 63448
+  },
+  "https://cdn.moda.app/msdf/robotomono/RobotoMono[wght]-Italic.ttf": {
+   "path": "roboto-mono/RobotoMono[wght]-Italic.ttf",
+   "sha256": "01b3df73644049c328301d97ecd5f894506915ca1279910ad89930ad94b07e4a",
+   "bytes": 95180
+  },
+  "https://cdn.moda.app/msdf/robotomono/RobotoMono[wght]-Medium.ttf": {
+   "path": "roboto-mono/RobotoMono[wght]-Medium.ttf",
+   "sha256": "ebdb69f91498a756c3e8a082bccc61199c6abaf630aeb1b8151bd641c3078a35",
+   "bytes": 88024
+  },
+  "https://cdn.moda.app/msdf/robotomono/RobotoMono[wght]-SemiBold.ttf": {
+   "path": "roboto-mono/RobotoMono[wght]-SemiBold.ttf",
+   "sha256": "42a49962b65f580830371d6e4e9213d348261d7c9531be132cdb7f7d3d4ffd3b",
+   "bytes": 88292
+  },
+  "https://cdn.moda.app/msdf/robotomono/RobotoMono[wght]-Bold.ttf": {
+   "path": "roboto-mono/RobotoMono[wght]-Bold.ttf",
+   "sha256": "eed37582d6925b65fbb292e5ece76dc3b37c2f9e7f59564370a8b5ef229bfbbc",
+   "bytes": 88260
+  },
+  "https://raw.githubusercontent.com/stipub/stixfonts/v2.13b171/fonts/static_ttf/STIXTwoMath-Regular.ttf": {
+   "path": "stix-two-math/STIXTwoMath-Regular.ttf",
+   "sha256": "49b22767985171bce579307b21d98f4d35012fa39e316acc4ffcab8644dfb69b",
+   "bytes": 1518116
+  }
+ },
+ "_vector_fallbacks_note": "CJK fallback variants merged by --vector-fallbacks (http://localhost:8000 canvas=f89bf2ec-3c80-48ad-ad2d-614018a8962a team=7a8b6548-58a3-4aa2-a6c4-df98423596a4) at 2026-07-30T18:42:26.435Z",
+ "_variant_gap_ttf_note": "Fraunces-700-normal TTF merged (files-only, NO keys[] entry) for the vector text lane of fixtures/scenes/text/variant-gap (task #72 / Q-115): the browser vector engine renders bold Fraunces from the catalog TTF, so the linebox oracle + native vector engine need the bytes; the MSDF ATLAS for 700-normal stays deliberately unvendored — that gap is exactly what the fixture pins (FontMissing scream + text:variant-gap manifest).",
+ "_script_fallbacks_note": "Broad-script vector fallback variants (Noto Sans <script> / Noto Serif Tibetan, 400-normal TTF + BMFont metrics, atlasPaths:null) merged for the vector text lane — mirrors the CJK --vector-fallbacks structure so uncovered non-Latin scripts render natively instead of blank/browser-fallback. Sourced from the platform font catalog.",
+ "_complex_script_fallbacks_note": "Rare complex-script Noto fallback faces (Syriac, Thaana, N'Ko, Samaritan, Mandaic, Adlam, Mongolian, Brahmi, Limbu, Tai Tham, Hanifi Rohingya) vendored TTF-only (vectorOnly=true, metricsPath=null, no MSDF atlas) so the cosmic-text (degraded) lane resolves them by coverage and shapes them correctly — completing complex-script coverage to 100% (the #7275 residual). Sourced from notofonts.github.io unhinted TTFs (OFL-1.1). These blocks route to cosmic via moda_text::complex_script and are never MSDF-atlas'd, so AtlasStore::load_from_manifest skips vectorOnly keys.",
+ "_common_family_weights_note": "Additional common-weight TTFs (files-only, no keys[] entry — like the Fraunces-700 variant-gap TTF) vendored byte-identically from the platform CDN (cdn.moda.app, the same bytes the browser loads) so the warm vector lane resolves the full common-weight range (400/500/600/700 + 400 italic) of the baked common families in NATIVE_RENDER_BAKED_FONT_FAMILIES (Inter, Noto Sans, Montserrat, Lato) directly from /opt/moda/native/fonts — no per-canvas fetch.",
+ "_faces_note": "explicit faces merged by --faces (from-json local_catalog.json) at 2026-09-11T05:59:37.512Z",
+ "_cjk_subset_note": "Noto Sans JP/KR/SC/TC 400 TTFs are vendored as glyph-id-preserving SUBSETS (files[].subsetOf records the full CDN file's sha256/bytes): the glyphs oracle-vector/glyph-curves.json pins plus the scene corpus's characters, so the repo stays small. Regenerate with scripts/oracle/subset-cjk-fonts.py <dir of full CDN TTFs>. Their MSDF metrics JSONs are the full CDN files.",
+ "_stix_two_math_note": "STIX Two Math 2.13 b171 (OFL-1.1, stix-two-math/OFL.txt), the unmodified upstream TTF at stipub/stixfonts tag v2.13b171, vendored TTF-only (vectorOnly, no MSDF): the last face of the symbol fallback chains (scriptFallback.ts / script_fallback.rs), for symbols neither Noto Sans Math nor Noto Sans Symbols 2 has (U+2301, U+2613, ...). The same bytes as packages/editor/public/fonts/stix/."
+}

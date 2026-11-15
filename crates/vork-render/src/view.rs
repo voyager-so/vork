@@ -2,6 +2,7 @@
 use crate::*;
 /// Immutable resources and recorded bindings for one installed view/ring variant.
 pub struct View {
+    pub(crate) diagnostic_name: String,
     pub(crate) decoupled: Option<passes::decoupled::View>,
     pub(crate) aov_resolve: Option<crate::aov::Resolve>,
     pub(crate) aovs: Vec<vork_scene::v2::Aov>,
@@ -65,7 +66,7 @@ pub(crate) struct ViewLighting {
     pub(crate) active: bool,
     pub(crate) uniform: wgpu::Buffer,
     pub(crate) lights: wgpu::Buffer,
-    pub(crate) path_light_tree: Option<wgpu::Buffer>,
+    pub(crate) analytic_light_tree: wgpu::Buffer,
     pub(crate) cluster_config: wgpu::Buffer,
     pub(crate) cluster_lights: wgpu::Buffer,
     pub(crate) clusters: Option<(wgpu::ComputePipeline, wgpu::BindGroup, [u32; 3])>,
@@ -76,11 +77,10 @@ impl ViewLighting {
         if !self.active || lights.is_empty() { return Ok(()); }
         let bytes = bytemuck::cast_slice(lights);
         changes.upload(&self.lights, 0, bytes);
-        if let Some(tree) = &self.path_light_tree {
-            changes.derive_upload(crate::values::ChangeKey::LightTree(tree.clone()), bytes, tree, 0, || {
-                Ok((0u32, bytemuck::cast_slice(&crate::lights::distribution::nodes(lights)?).to_vec()))
-            })?;
-        }
+        let tree = &self.analytic_light_tree;
+        changes.derive_upload(crate::values::ChangeKey::LightTree(tree.clone()), bytes, tree, 0, || {
+            Ok((0u32, bytemuck::cast_slice(&crate::lights::distribution::nodes(lights)?).to_vec()))
+        })?;
         Ok(())
     }
 }
@@ -146,7 +146,7 @@ impl ViewState {
         let [iw, ih] = internal;
         ensure!(
             w <= d.limits().max_texture_dimension_2d && h <= d.limits().max_texture_dimension_2d,
-            "{}", crate::gpu_memory::limit_message("render resolution", format_args!("{w}x{h} pixels"), format_args!("max_texture_dimension_2d={} pixels per axis",d.limits().max_texture_dimension_2d), "reduce render.resolution")
+            crate::gpu_memory::device_limit("render resolution", format_args!("{w}x{h} pixels"), format_args!("max_texture_dimension_2d={} pixels per axis",d.limits().max_texture_dimension_2d), "reduce render.resolution")
         );
         let float_output = precision == ReadbackPrecision::Float;
         let aov_base = if float_output {
@@ -172,7 +172,7 @@ impl ViewState {
             ("catcher radiance sums",if s.has_catchers && view_graph.runs(Pass::Path) {pixels*48} else {48}),
             (
                 "packed output",
-                output_pixels * 4 * u64::from(output_planes),
+                output_pixels * 4 * u64::from(output_planes) + crate::frame::invalid_pixel_bitmap_bytes(output_pixels),
             ),
             (
                 "linear sample accumulation",
@@ -187,15 +187,15 @@ impl ViewState {
             ensure!(
                 bytes <= d.limits().max_storage_buffer_binding_size
                     && bytes <= d.limits().max_buffer_size,
-                "{}", crate::gpu_memory::limit_message(format_args!("render.aovs: {} declared; {name}",s.render.aovs.len()), format_args!("{bytes} bytes at {w}x{h}"), format_args!("max_storage_buffer_binding_size={} bytes, max_buffer_size={} bytes",d.limits().max_storage_buffer_binding_size,d.limits().max_buffer_size), "reduce resolution or the number of render.aovs")
+                crate::gpu_memory::device_limit(format_args!("render.aovs: {} declared; {name}",s.render.aovs.len()), format_args!("{bytes} bytes at {w}x{h}"), format_args!("max_storage_buffer_binding_size={} bytes, max_buffer_size={} bytes",d.limits().max_storage_buffer_binding_size,d.limits().max_buffer_size), "reduce resolution or the number of render.aovs")
             );
         }
         if s.pipelines.denoise && view_graph.runs(Pass::Denoise) {
             let guide_bytes = pixels * 32;
             ensure!(guide_bytes <= d.limits().max_storage_buffer_binding_size && guide_bytes <= d.limits().max_buffer_size,
-                "{}", crate::gpu_memory::limit_message("OIDN guides", format_args!("{guide_bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",d.limits().max_storage_buffer_binding_size,d.limits().max_buffer_size), "reduce resolution or disable denoising with --set denoise=false"));
+                crate::gpu_memory::device_limit("OIDN guides", format_args!("{guide_bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",d.limits().max_storage_buffer_binding_size,d.limits().max_buffer_size), "reduce resolution or disable denoising with --set denoise=false"));
             ensure!(pixels * 48 <= d.limits().max_buffer_size,
-                "{}", crate::gpu_memory::limit_message("OIDN staging", format_args!("{} bytes",pixels*48), format_args!("max_buffer_size={} bytes",d.limits().max_buffer_size), "reduce resolution or disable denoising with --set denoise=false"));
+                crate::gpu_memory::device_limit("OIDN staging", format_args!("{} bytes",pixels*48), format_args!("max_buffer_size={} bytes",d.limits().max_buffer_size), "reduce resolution or disable denoising with --set denoise=false"));
         }
         let uniform = crate::gpu_memory::buffer(&d, &wgpu::BufferDescriptor {
             label: Some(&label),
@@ -242,8 +242,8 @@ impl ViewState {
                            lights: &wgpu::Buffer,
                            config: &wgpu::Buffer,
                            mask: &wgpu::Buffer,
-                           objects: &wgpu::Buffer| {
-            global(s, d, uniform, lights, config, mask, objects, shared.points)
+                           objects: &wgpu::Buffer, tree: Option<&wgpu::Buffer>| {
+            global(s, d, uniform, lights, config, mask, objects, shared.points, tree)
         };
         let dummy_lights = init(
             d,
@@ -251,7 +251,7 @@ impl ViewState {
             bytemuck::bytes_of(&Light::zeroed()),
             wgpu::BufferUsages::STORAGE,
         );
-        let global = make_global(&uniform, &dummy_lights, &no_clusters, &empty_mask, &objects);
+        let global = make_global(&uniform, &dummy_lights, &no_clusters, &empty_mask, &objects, None);
         let forward_global;
         // Compute work the pass modules record for this view's graph steps.
         let mut work = crate::graph::Recorder::default();
@@ -275,8 +275,9 @@ impl ViewState {
         let shadow_bind = shared.shadow_bind;
         let deforms = shared.deforms;
         let frame_materials = shared.materials;
-        let visibility = decoupled_enabled.then(|| passes::decoupled::Sampling::new(d, [iw, ih], visibility_samples));
-        let fragments = decoupled_enabled.then(|| passes::decoupled::Fragments::new(s, r, [iw, ih], visibility_samples, visibility.as_ref().unwrap(), &deforms)).transpose()?;
+        let software_resources=s.pipelines.software_raster && raster;
+        let visibility = (decoupled_enabled || software_resources).then(|| passes::decoupled::Sampling::new(d, [iw, ih], visibility_samples));
+        let fragments = (decoupled_enabled || software_resources).then(|| passes::decoupled::Fragments::new(s, r, [iw, ih], visibility_samples, visibility.as_ref().unwrap(), &deforms)).transpose()?;
         let fragments_bind = fragments.as_ref().and_then(|f| f.bind.clone());
         let fragments_geometry = fragments.as_ref().and_then(|f| f.geometry.clone());
         let recorder = crate::bundles::Recorder {
@@ -319,11 +320,11 @@ impl ViewState {
                 &vec![0; if scene_work {batch.nodes.len().max(1)} else {1} * std::mem::size_of::<Light>()],
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             );
-            let path_light_tree = (view_graph.runs(Pass::Path) || view_graph.runs(Pass::Ao)).then(|| init(
-                d, "path spatial light tree",
-                &vec![0; crate::lights::distribution::node_count(batch.nodes.len()) * std::mem::size_of::<crate::lights::tree::Node>()],
+            let analytic_light_tree = init(
+                d, "analytic spatial light tree",
+                &vec![0; crate::lights::distribution::node_count(if scene_work {batch.nodes.len()} else {0}) * std::mem::size_of::<crate::lights::tree::Node>()],
                 wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
-            ));
+            );
             let list_stride = batch.nodes.len() as u32 + constants::CLUSTER_LIST_HEADER;
             let max_bytes = u64::from(d.limits().max_storage_buffer_binding_size)
                 .min(d.limits().max_buffer_size);
@@ -376,14 +377,14 @@ impl ViewState {
             } else {
                 None
             };
-            let global = make_global(&batch_uniform, &lights, &config, &mask, &objects);
+            let global = make_global(&batch_uniform, &lights, &config, &mask, &objects, Some(&analytic_light_tree));
             controls_bundle = recorder.record("opaque controls plan", Kind::Controls, &global, camera_cull.commands(), None)?;
             forward_global = global;
             lighting = ViewLighting {
                 active: scene_work,
                 uniform: batch_uniform,
                 lights,
-                path_light_tree,
+                analytic_light_tree,
                 cluster_config: config,
                 cluster_lights: mask,
                 clusters,
@@ -408,6 +409,7 @@ impl ViewState {
             &targets.resolved,
             &lighting.uniform,
             &lighting.lights,
+            &lighting.analytic_light_tree,
             objects,
             &lighting.cluster_config,
             &lighting.cluster_lights,
@@ -423,6 +425,8 @@ impl ViewState {
         // While feature variants compile in the background, keep what re-recording
         // the shading bundles needs; the first frame after they land switches.
         let recording = Rerecord {
+            fragments: fragments_bind.clone(),
+            fragments_geometry: fragments_geometry.clone(),
             shadow_bind: shadow_bind.clone(),
             compute: shared.compute.cloned(),
             subset: subset.map(|s| (s.draws.clone(), s.objects.clone())),
@@ -435,7 +439,7 @@ impl ViewState {
         let ao = passes::ao::Resources::new(
             s, d, &lighting.uniform,
             ao_guides, [targets.resolved.texture().width(), targets.resolved.texture().height()], &targets.post_ambient, &targets.diffuse_response,
-            shared.rays, &lighting.lights, lighting.path_light_tree.as_ref(), objects, &lighting.cluster_config, &lighting.cluster_lights,
+            shared.rays, &lighting.lights, Some(&lighting.analytic_light_tree), objects, &lighting.cluster_config, &lighting.cluster_lights,
             frame_materials.as_ref().map_or_else(|| s.material_table.bind(), |m| &m.bind), visibility_samples, view_graph.runs(Pass::Ao), &mut work,
         )?;
         let (mut post, output_bind) = passes::resolve::Resources::new(
@@ -444,7 +448,7 @@ impl ViewState {
             &lighting.uniform,
             ao_guides,
             &lighting.lights,
-            lighting.path_light_tree.as_ref(),
+            &lighting.analytic_light_tree,
             &lighting.cluster_config,
             &lighting.cluster_lights,
             frame_materials
@@ -486,12 +490,17 @@ impl ViewState {
         }
         let aov_resolve=if view_graph.runs(Pass::AovResolve) {crate::aov::Resolve::new(s,r,&uniform,&targets.aov_values,&post.pixels,[w,h],[iw,ih],aov_base)?} else {None};
         let publication = if let crate::views::ViewKind::Image { render, .. } = &desc.kind {
+            // Native Metal does not expose StructuredBuffer.GetDimensions.
+            let settings = init(d, "render image publication offset",
+                bytemuck::cast_slice(&[(post.invalid_bitmap.start / 4) as u32, 0, 0, 0]),
+                wgpu::BufferUsages::UNIFORM);
             Some(d.create_bind_group(&wgpu::BindGroupDescriptor {
                 label: Some("render image publication"),
                 layout: &render.pipeline.get_bind_group_layout(0),
                 entries: &[
                     entry(0, post.pixels.as_entire_binding()),
                     entry(1, wgpu::BindingResource::TextureView(&render.level_zero)),
+                    entry(2, settings.as_entire_binding()),
                 ],
             }))
         } else {
@@ -515,6 +524,10 @@ impl ViewState {
             None => (std::sync::OnceLock::from(bundles), None),
         };
         let result = View {
+            diagnostic_name: match &desc.kind {
+                crate::views::ViewKind::Camera(_) => "camera".into(),
+                crate::views::ViewKind::Image { name, .. } => format!("image:{name}"),
+            },
             decoupled,
             camera_cull,
             aov_resolve,
@@ -582,6 +595,8 @@ impl ViewState {
 /// Owned recorder inputs for the one-time switch from superset to variant pipelines.
 #[derive(Clone)]
 pub(crate) struct Rerecord {
+    fragments: Option<wgpu::BindGroup>,
+    fragments_geometry: Option<wgpu::BindGroup>,
     compute: Option<wgpu::Buffer>,
     subset: Option<(Vec<bool>, Vec<bool>)>,
     deforms: Vec<Option<EvaluatedGeometry>>,
@@ -651,8 +666,8 @@ impl View {
             included_objects: p.subset.as_ref().map(|s| s.1.as_slice()),
             fibre_capture: None,
             visibility: None,
-            fragments: self.decoupled.as_ref().and_then(|v|v.fragments.bind.as_ref()),
-            fragments_geometry: self.decoupled.as_ref().and_then(|v|v.fragments.geometry.as_ref()),
+            fragments: p.fragments.as_ref(),
+            fragments_geometry: p.fragments_geometry.as_ref(),
             material_bind: &p.material_bind,
             s,
             deforms: &p.deforms,
@@ -680,14 +695,18 @@ pub(crate) fn global(
     mask: &wgpu::Buffer,
     object_buffer: &wgpu::Buffer,
     points: &wgpu::Buffer,
+    tree: Option<&wgpu::Buffer>,
 ) -> wgpu::BindGroup {
+    let empty_tree = tree.is_none().then(|| init(d, "empty analytic tree", bytemuck::bytes_of(&crate::lights::tree::Node::zeroed()), wgpu::BufferUsages::STORAGE));
+    let tree = tree.or(empty_tree.as_ref()).expect("analytic tree binding");
     d.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("frame bindings"),
         layout: &s.pipelines.global_layout,
         entries: &[
             entry(0, uniform.as_entire_binding()),
             entry(1, object_buffer.as_entire_binding()),
-            entry(10, points.as_entire_binding()),
+            entry(11, points.as_entire_binding()),
+            entry(10, tree.as_entire_binding()),
             entry(2, lights.as_entire_binding()),
             entry(7, config.as_entire_binding()),
             entry(8, mask.as_entire_binding()),
@@ -892,7 +911,7 @@ fn light_grid(
 ) -> Result<([u32; 3], u32, u64)> {
     ensure!(
         u64::from(stride) * 4 <= max_bytes,
-        "{}", crate::gpu_memory::limit_message("one cluster light list", format_args!("{} bytes",u64::from(stride)*4), format_args!("{max_bytes} bytes"), "reduce light count")
+        crate::gpu_memory::device_limit("one cluster light list", format_args!("{} bytes",u64::from(stride)*4), format_args!("{max_bytes} bytes"), "reduce light count")
     );
     let mut tile = constants::CLUSTER_TILE_PIXELS;
     let mut slices = constants::CLUSTER_DEPTH_SLICES;

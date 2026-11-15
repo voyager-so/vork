@@ -439,8 +439,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn sample_owner_preserves_packed_uploads_interop_and_final_fence() -> anyhow::Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let finish = CommandFinish::new();
         let expected: Vec<u32> = (0..32).map(|sample| sample * 1664525 + 1013904223).collect();
         let source = r.device.create_buffer(&wgpu::BufferDescriptor {
@@ -508,8 +509,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn recordings_with_more_passes_than_native_admission_complete_in_order() -> anyhow::Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let finish = CommandFinish::new();
         let source = r.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None, contents: bytemuck::cast_slice(&(0..64u32).collect::<Vec<_>>()),
@@ -608,8 +610,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn streaming_groups_publish_before_the_sample_finishes() -> anyhow::Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let source = r.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: None, contents: bytemuck::cast_slice(&[11u32, 29]),
             usage: wgpu::BufferUsages::COPY_SRC,
@@ -645,8 +648,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn read_only_depth_across_native_cuts_preserves_contents() -> anyhow::Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let depth = r.device.create_texture(&wgpu::TextureDescriptor {
             label: Some("read-only depth across native cuts"),
             size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -696,8 +700,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn many_native_recording_cuts_preserve_barriers_and_fence() -> anyhow::Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let values: Vec<u32> = (0..1024).collect();
         let source = r.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("native cut values"),
@@ -746,10 +751,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn abandoned_batches_and_native_boundaries_preserve_order() -> anyhow::Result<()> {
-        let Some(renderer) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let renderer = crate::test_renderer()?;
         let finish = CommandFinish::new();
         let source = renderer
             .device

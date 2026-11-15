@@ -10,7 +10,7 @@ fn read(r:&Renderer,buffer:&wgpu::Buffer)->Result<Vec<f32>> {
 }
 fn document()->serde_json::Value {
     serde_json::json!({"version":2,
-        "render":{"resolution":[16,16],"fps":1,"duration":2,"settings":{"integrator":"path","denoiser":null,"samples":2},"display":{"program":"std/standard"}},
+        "composition":{"space":"3d","view":{"program":"std/standard"}},"render":{"resolution":[16,16],"fps":1,"duration":2,"settings":{"integrator":"path","denoiser":null,"samples":2}},
         "buffers":{
             "p":{"type":"vec3","data":[[0,0,0],[1,0,0],[0,1,0],[2,0,0],[4,0,0],[2,2,0],[5,0,0],[5,0,0],[5,0,0]]},
             "n":{"type":"vec3","data":[[0,0,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1],[0,0,1]]},
@@ -66,6 +66,7 @@ import vork_sampling;
 [[vk::binding(2,0)]] StructuredBuffer<uint> support;
 struct Geometry : IHitGeometry {
     StructuredBuffer<uint> support;
+    __init(StructuredBuffer<uint> support) {this.support=support;}
     uint word(uint i) {return support[i];}
     uint load(uint buffer,uint i) {return 0u;}
 }

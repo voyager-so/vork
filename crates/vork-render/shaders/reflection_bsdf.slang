@@ -28,7 +28,13 @@ ReflectionBsdf reflection_bsdf(Closure base,Closure outer,float3 scale,float thr
     r.data[6]=float4(outer.geometry_coat_normal,outer.coat_roughness);
     r.data[7]=float4(outer.coat_weight,outer.coat_ior,throughput*visibility,0.);
     r.data[10]=float4(compensation,0.);
-    r.data[9]=float4(base.transmission_weight,base.geometry_thin_walled ? 1. : 0.,0.,0.);
+    r.data[11]=float4(outer.geometry_coat_tangent,outer.coat_roughness_anisotropy);
+#ifdef VORK_UNIT_IOR
+    let optical=base.specular_ior;
+#else
+    let optical=base.optical_ior;
+#endif
+    r.data[9]=float4(base.transmission_weight,base.geometry_thin_walled ? 1. : 0.,optical,0.);
     r.data[8]=float4(1.,1.,1.,0.); // composition transmittance, independent of material visibility
     return r;
 }
@@ -40,7 +46,8 @@ Closure reflection_bsdf_closure(ReflectionBsdf r,bool coat) {
     var c=(Closure)0;
     if(coat) {
         c.geometry_normal=normalize(r.data[6].xyz);c.specular_roughness=r.data[6].w;
-        c.specular_ior=r.data[7].y;c.specular_color=float3(1.);c.specular_weight=r.data[7].x;
+        c.specular_ior=r.data[7].y;c.specular_color=float3(1.);c.specular_weight=1.;
+        c.geometry_tangent=r.data[11].xyz;c.specular_roughness_anisotropy=r.data[11].w;
     } else {
         c.transmission_weight=r.data[9].x;c.geometry_thin_walled=r.data[9].y!=0.;
         c.base_color=r.data[0].xyz;c.base_weight=1.;
@@ -48,6 +55,12 @@ Closure reflection_bsdf_closure(ReflectionBsdf r,bool coat) {
         c.geometry_normal=normalize(r.data[2].xyz);c.specular_roughness=r.data[2].w;
         c.geometry_tangent=r.data[3].xyz;c.specular_roughness_anisotropy=r.data[3].w;
         c.base_metalness=r.data[4].x;c.specular_ior=r.data[4].y;
+#ifdef VORK_UNIT_IOR
+        // Shipped and runtime shaders share this prepared-optics record.
+        if(r.data[9].z>0.) c.specular_ior=r.data[9].z;
+#else
+        c.optical_ior=r.data[9].z;
+#endif
         c.thin_film_weight=r.data[4].z;c.thin_film_thickness=r.data[4].w;c.thin_film_ior=r.data[5].w;
     }
     return c;
@@ -82,7 +95,7 @@ float3 reflection_bsdf_evaluate(ReflectionBsdf r,float3 view,float3 light,out fl
     let coat=r.data[7].x>0.;
     for(uint i=0u;i<(coat ? 2u : 1u);i++) {
         let c=reflection_bsdf_closure(r,i!=0u);
-        var scale=i==0u ? r.data[5].xyz : float3(r.data[7].z);
+        var scale=i==0u ? r.data[5].xyz : float3(r.data[7].x*r.data[7].z);
         if(coat && i==0u) {scale*=coat_transmission(r.data[7].x,dot(normalize(r.data[6].xyz),light),r.data[7].y);}
         let nv=dot(c.geometry_normal,view);let nl=dot(c.geometry_normal,light);
         if(nv<=0. || nl<=0.) {continue;}

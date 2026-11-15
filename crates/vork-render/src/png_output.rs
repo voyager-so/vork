@@ -7,7 +7,6 @@ use std::{
     thread,
 };
 
-use crate::constants::CONTROL_PNG_COMPRESSION;
 
 /// Blender ImageFormatSettings.color_depth for PNG colour: 8 or 16 bits per component.
 /// Both carry the same exposure and display transform; control channels keep their own depths.
@@ -104,6 +103,8 @@ impl Outputs {
     }
 }
 enum Input {
+    Canvas { frame: usize, rgba: Arc<Vec<u8>>, lease: Arc<crate::ring::Lease> },
+    CanvasFloat { frame: usize, rgba: Arc<Vec<[f32; 4]>>, lease: Arc<crate::ring::Lease> },
     Frame {
         frame: usize,
         pixels: FrameReadback,
@@ -120,6 +121,8 @@ enum Input {
     Finish,
 }
 enum Job {
+    Canvas { order: usize, frame: usize, rgba: Arc<Vec<u8>>, lease: Arc<crate::ring::Lease> },
+    CanvasFloat { order: usize, frame: usize, rgba: Arc<Vec<[f32; 4]>>, lease: Arc<crate::ring::Lease> },
     Unpack {
         frame: usize,
         pixels: FrameReadback,
@@ -134,7 +137,42 @@ enum Job {
     },
 }
 type Files = Vec<(String, Vec<u8>)>;
-fn encode(w: u32, h: u32, p: &FrameOutput, outputs: &Outputs, png_depth: PngDepth) -> Result<Files> {
+/// Whether a writer's destination is one still: a `.png` path. Anything else is a directory of frames.
+fn one_still(out: &std::path::Path) -> bool {
+    !crate::shot::directory_marked(out) && out.extension().is_some_and(|e| e.eq_ignore_ascii_case("png"))
+}
+/// Every PNG vork writes uses the fast setting: canvas or world, still or sequence frame, colour or control
+/// channel. One policy, no split by kind: the smaller file the default setting gives costs far more time than
+/// it saves bytes (about 1.8 s on a 4K still). Lossless either way.
+const COMPRESSION: png::Compression = png::Compression::Fast;
+fn encode_canvas(w: u32, h: u32, rgba: &[u8], display: vork_scene::v2::OutputDisplay) -> Result<Files> {
+    let mut bytes = Vec::new();
+    {
+        let mut encoder = png::Encoder::new(&mut bytes, w, h);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        encoder.set_compression(COMPRESSION);
+        // The picture names its display, as a world's does.
+        let cicp = cicp(display);
+        if cicp.is_none() { encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual); }
+        let mut writer = encoder.write_header()?;
+        if let Some(cicp) = cicp { writer.write_chunk(png::chunk::ChunkType(*b"cICP"), &cicp)?; }
+        writer.write_image_data(rgba)?;
+    }
+    Ok(vec![(".png".to_owned(), bytes)])
+}
+/// The cICP chunk (PNG Third Edition) naming a colour picture's display: H.273 primaries and transfer, RGB,
+/// full range. An sRGB picture carries the sRGB chunk instead.
+fn cicp(display: vork_scene::v2::OutputDisplay) -> Option<[u8; 4]> {
+    use vork_scene::v2::OutputDisplay::*;
+    match display {
+        Srgb => None,
+        DisplayP3 => Some([12, 13, 0, 1]),
+        Rec2100Pq => Some([9, 16, 0, 1]),
+        Rec2100Hlg => Some([9, 18, 0, 1]),
+    }
+}
+fn encode(w: u32, h: u32, p: &FrameOutput, outputs: &Outputs, png_depth: PngDepth, display: vork_scene::v2::OutputDisplay) -> Result<Files> {
     use png::{
         BitDepth::{Eight, Sixteen},
         ColorType::{Grayscale, Rgb, Rgba},
@@ -146,8 +184,13 @@ fn encode(w: u32, h: u32, p: &FrameOutput, outputs: &Outputs, png_depth: PngDept
             let mut encoder = png::Encoder::new(&mut bytes, w, h);
             encoder.set_color(color);
             encoder.set_depth(depth);
-            encoder.set_compression(CONTROL_PNG_COMPRESSION);
-            encoder.write_header()?.write_image_data(data)?;
+            encoder.set_compression(COMPRESSION);
+            // The colour picture names its display; control channels are data.
+            let cicp = if suffix == ".png" { cicp(display) } else { None };
+            if suffix == ".png" && cicp.is_none() {encoder.set_source_srgb(png::SrgbRenderingIntent::Perceptual);}
+            let mut writer = encoder.write_header()?;
+            if let Some(cicp) = cicp { writer.write_chunk(png::chunk::ChunkType(*b"cICP"), &cicp)?; }
+            writer.write_image_data(data)?;
         }
         files.push((suffix.to_owned(), bytes));
         Ok(())
@@ -207,9 +250,27 @@ fn float_channels<'a, const N: usize>(
 /// OpenEXR stores linear HDR and unquantized control signals; RGBA is premultiplied.
 #[cfg(test)]
 fn encode_exr(w: u32, h: u32, p: &FrameOutput, outputs: &Outputs, codec: crate::ExrCodec) -> Result<Files> {
-    encode_exr_clock(w,h,p,outputs,codec,None)
+    encode_exr_clock(w,h,p,outputs,codec,None,Default::default())
 }
-fn encode_exr_clock(w: u32, h: u32, p: &FrameOutput, outputs: &Outputs, codec: crate::ExrCodec, fps: Option<(i32,u32)>) -> Result<Files> {
+/// A picture's associated RGBA as the default layer's R, G, B and A channels, its colour in the storage space.
+fn beauty_channels(pixels: &[[f32; 4]], color: crate::output_device::RawColor) -> Vec<(&'static str, Vec<f32>)> {
+    let mut channels: [Vec<f32>; 4] = std::array::from_fn(|_| Vec::with_capacity(pixels.len()));
+    for &pixel in pixels {
+        for (channel, value) in channels.iter_mut().zip(color.store_associated(pixel)) { channel.push(value); }
+    }
+    ["R", "G", "B", "A"].into_iter().zip(channels).collect()
+}
+/// A canvas's EXR frame: its picture after its view (associated RGBA, sRGB code values), through the
+/// writer a world's frame takes.
+fn encode_exr_canvas(w: u32, h: u32, rgba: &[[f32; 4]], codec: crate::ExrCodec, fps: (i32, u32), color: crate::output_device::RawColor) -> Result<Files> {
+    anyhow::ensure!(rgba.len() == (w * h) as usize, "EXR channel size mismatch");
+    let channels = beauty_channels(rgba, color).into_iter().map(|(channel, values)|
+        exr::prelude::AnyChannel::new(exr::meta::attribute::Text::from_slice_unchecked(channel.as_bytes()), exr::prelude::FlatSamples::F32(values))).collect();
+    write_exr(w, h, channels, codec, Some(fps), color)
+}
+/// `color`: the storage space of the file's colour (beauty and colour AOVs), which the file names in its
+/// chromaticities and `vork:color_space`. Alpha, depth, indices, normals, motion and value AOVs are not colour.
+fn encode_exr_clock(w: u32, h: u32, p: &FrameOutput, outputs: &Outputs, codec: crate::ExrCodec, fps: Option<(i32,u32)>, color: crate::output_device::RawColor) -> Result<Files> {
     use exr::prelude::*;
     let mut all_channels = Vec::new();
     let count = (w * h) as usize;
@@ -217,10 +278,10 @@ fn encode_exr_clock(w: u32, h: u32, p: &FrameOutput, outputs: &Outputs, codec: c
         // Plain OpenEXR: beauty R,G,B,A and depth Z in the default layer; every other
         // channel is <name>.<channel>.
         let (name, channels): (&str, Vec<(&str, Vec<f32>)>) = match output {
-            Output::Color => (
-                "",
-                float_channels(["R", "G", "B", "A"], &p.linear_rgba)?,
-            ),
+            Output::Color => {
+                let pixels = p.linear_rgba.as_ref().ok_or_else(|| anyhow!("EXR channels require float readback"))?;
+                ("", beauty_channels(pixels, color))
+            },
             Output::Depth => (
                 "",
                 vec![(
@@ -238,7 +299,9 @@ fn encode_exr_clock(w: u32, h: u32, p: &FrameOutput, outputs: &Outputs, codec: c
             Output::Aov(name) => {
                 let aov=p.aovs.get(name).ok_or_else(||anyhow!("missing AOV {name}"))?;
                 let labels:&[&str]=if aov.kind==vork_scene::v2::AovType::Value {&["X"]} else {&["R","G","B"]};
-                (name.as_str(),labels.iter().enumerate().map(|(i,label)|(*label,aov.pixels.iter().map(|v|v[i]).collect())).collect())
+                // shadow_catcher is a ratio of radiances, not a radiance: it stays in the working space.
+                let stored=aov.kind==vork_scene::v2::AovType::Color && name!="shadow_catcher";
+                (name.as_str(),labels.iter().enumerate().map(|(i,label)|(*label,aov.pixels.iter().map(|v|if stored {color.store([v[0],v[1],v[2]])[i]} else {v[i]}).collect())).collect())
             },
         };
         anyhow::ensure!(
@@ -252,14 +315,27 @@ fn encode_exr_clock(w: u32, h: u32, p: &FrameOutput, outputs: &Outputs, codec: c
             )
         }));
     }
+    write_exr(w, h, all_channels, codec, fps, color)
+}
+/// The one EXR file writer: the channels as one layer, with the names of the file's colour.
+fn write_exr(w: u32, h: u32, all_channels: Vec<exr::prelude::AnyChannel<exr::prelude::FlatSamples>>, codec: crate::ExrCodec, fps: Option<(i32,u32)>,
+    color: crate::output_device::RawColor) -> Result<Files> {
+    use exr::prelude::*;
     let mut files = Vec::new();
     if !all_channels.is_empty() {
-        let image = Image::from_layer(Layer::new(
+        let mut image = Image::from_layer(Layer::new(
             (w as usize, h as usize),
             LayerAttributes {frames_per_second:fps,..Default::default()},
             codec.encoding(),
             AnyChannels::sort(all_channels.into()),
         ));
+        // The file says what its colour is: the storage space's primaries and white, its name, and the
+        // picture's reference domain: scene (a world's raw picture bypasses the view) or display (a canvas's
+        // picture after its view).
+        let [red, green, blue, white] = color.storage.chromaticities().map(|[x, y]| Vec2(x, y));
+        image.attributes.chromaticities = Some(exr::meta::attribute::Chromaticities { red, green, blue, white });
+        image.layer_data.attributes.other.insert(Text::from("vork:color_space"), AttributeValue::Text(Text::from(color.storage.name())));
+        image.layer_data.attributes.other.insert(Text::from("vork:reference_domain"), AttributeValue::Text(Text::from(color.reference_domain())));
         let mut bytes = std::io::Cursor::new(Vec::new());
         image.write().non_parallel().to_buffered(&mut bytes)?;
         files.push((".exr".into(), bytes.into_inner()));
@@ -277,6 +353,25 @@ pub struct FrameOutputWriter {
     pub worker_count: usize,
 }
 impl FrameOutputWriter {
+    pub(crate) fn canvas(out: PathBuf, w: u32, h: u32, pending_frames: usize, first_frame: usize, display: vork_scene::v2::OutputDisplay) -> Self {
+        Self::new(out, w, h, Outputs(vec![Output::Color]), false, crate::ExrCodec::default(),
+            PngDepth::Eight, pending_frames, first_frame, (1, 1), display, Default::default())
+    }
+    pub(crate) fn push_canvas(&self, frame: usize, rgba: Arc<Vec<u8>>, lease: Arc<crate::ring::Lease>) -> Result<()> {
+        self.jobs.send(Input::Canvas { frame, rgba, lease })
+            .map_err(|_| anyhow!("frame output workers stopped"))
+    }
+    /// A canvas's EXR destination (`x.%06d.exr`): one file per frame, its colour stored as `raw` says.
+    pub(crate) fn canvas_exr(out: PathBuf, w: u32, h: u32, exr_codec: crate::ExrCodec, pending_frames: usize, first_frame: usize, fps: (i32, u32),
+        raw: crate::output_device::RawColor) -> Self {
+        Self::new(out, w, h, Outputs(vec![Output::Color]), true, exr_codec, PngDepth::Eight, pending_frames, first_frame, fps,
+            vork_scene::v2::OutputDisplay::Srgb, raw)
+    }
+    /// One frame of a canvas's picture after its view: associated RGBA, sRGB code values.
+    pub(crate) fn push_canvas_float(&self, frame: usize, rgba: Arc<Vec<[f32; 4]>>, lease: Arc<crate::ring::Lease>) -> Result<()> {
+        self.jobs.send(Input::CanvasFloat { frame, rgba, lease })
+            .map_err(|_| anyhow!("frame output workers stopped"))
+    }
     pub fn new(
         out: PathBuf,
         w: u32,
@@ -289,6 +384,10 @@ impl FrameOutputWriter {
         // Absolute index of the first pushed frame; output order counts from it.
         first_frame: usize,
         fps: (i32,u32),
+        // The display colour PNGs are encoded for, which they name.
+        display: vork_scene::v2::OutputDisplay,
+        // The storage space of an EXR's colour, which it names.
+        raw: crate::output_device::RawColor,
     ) -> Self {
         let plane_count = if exr { 1 } else { outputs.0.len() };
         let worker_count = thread::available_parallelism()
@@ -310,14 +409,30 @@ impl FrameOutputWriter {
                             break;
                         };
                         match job {
+                            Job::Canvas { order, frame, rgba, lease } => {
+                                let started = std::time::Instant::now();
+                                let files = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode_canvas(w, h, &rgba, display)))
+                                    .unwrap_or_else(|_| Err(anyhow!("frame compression worker panicked")));
+                                crate::timing::encoded(started);
+                                if done.send((order, frame, files, Some(lease))).is_err() { break; }
+                            }
+                            Job::CanvasFloat { order, frame, rgba, lease } => {
+                                let started = std::time::Instant::now();
+                                let files = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| encode_exr_canvas(w, h, &rgba, exr_codec, fps, raw)))
+                                    .unwrap_or_else(|_| Err(anyhow!("frame compression worker panicked")));
+                                crate::timing::encoded(started);
+                                if done.send((order, frame, files, Some(lease))).is_err() { break; }
+                            }
                             Job::Unpack { frame, pixels } => {
                                 let lease = pixels.credit.clone();
+                                let started = std::time::Instant::now();
                                 let pixels =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                         pixels.unpack()
                                     }))
                                     .map_err(|_| anyhow!("readback unpack worker panicked"))
                                     .and_then(|result| result).map(Arc::new);
+                                crate::timing::encoded(started);
                                 if requests
                                     .send(Input::Unpacked {
                                         frame,
@@ -337,17 +452,19 @@ impl FrameOutputWriter {
                                 pixels,
                                 lease,
                             } => {
+                                let started = std::time::Instant::now();
                                 let files =
                                     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                                         if exr {
-                                            encode_exr_clock(w, h, &pixels, &outputs, exr_codec,Some(fps))
+                                            encode_exr_clock(w, h, &pixels, &outputs, exr_codec,Some(fps),raw)
                                         } else {
-                                            encode(w, h, &pixels, &outputs, png_depth)
+                                            encode(w, h, &pixels, &outputs, png_depth, display)
                                         }
                                     }))
                                     .unwrap_or_else(|_| {
                                         Err(anyhow!("frame compression worker panicked"))
                                     });
+                                crate::timing::encoded(started);
                                 if done.send((order, frame, files, lease)).is_err() {
                                     break;
                                 }
@@ -364,6 +481,12 @@ impl FrameOutputWriter {
             let mut finished = false;
             for request in input {
                 match request {
+                    Input::Canvas { frame, rgba, lease } => {
+                        jobs.send(Job::Canvas { order: frame - first_frame, frame, rgba, lease })?;
+                    }
+                    Input::CanvasFloat { frame, rgba, lease } => {
+                        jobs.send(Job::CanvasFloat { order: frame - first_frame, frame, rgba, lease })?;
+                    }
                     Input::Frame { frame, pixels } => {
                         unpacking += 1;
                         jobs.send(Job::Unpack { frame, pixels })?;
@@ -419,13 +542,14 @@ impl FrameOutputWriter {
             for (order, frame, files, lease) in results {
                 pending.insert(order, (frame, files, lease));
                 while let Some((frame, files, _lease)) = pending.remove(&next) {
+                    let started = std::time::Instant::now();
                     let written = files.and_then(|files| {
                         for (suffix, bytes) in files {
                             let path = if exr {
                                 let stem = out.file_stem().unwrap().to_string_lossy();
                                 let stem = stem.replace("%06d", &format!("{frame:06}"));
                                 out.with_file_name(format!("{stem}{suffix}"))
-                            } else if !crate::shot::directory_marked(&out) && out.extension().is_some_and(|e| e.eq_ignore_ascii_case("png")) {
+                            } else if one_still(&out) {
                                 // A one-still PNG destination: colour at the path, other channels beside it.
                                 if suffix == ".png" {
                                     out.clone()
@@ -440,6 +564,7 @@ impl FrameOutputWriter {
                         }
                         Ok(())
                     });
+                    crate::timing::encoded(started);
                     if let Err(e) = written {
                         if error.is_none() {
                             error = Some(e);
@@ -499,15 +624,16 @@ impl FrameOutputWriter {
 mod exr_tests {
     use super::*;
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn rendered_png16_preserves_precision_and_scales_dither() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         assert!(!crate::InstallOptions::default().readback.color16);
         let readback = ReadbackOutputs { color: true, color16: true, ..Default::default() };
         let scene = serde_json::from_value(serde_json::json!({
             "version": 2, "nodes": [{"type": "camera"}],
-            "render": {"resolution": [16,16], "background": [0.25,0.25,0.25],
-                "settings": {"samples": 1}, "display": {"program": "display"}},
-            "programs": {"display": {"source": "import std.display; struct Inputs {}; float3 display(DisplayContext ctx, Inputs i) {return finish_display(ctx.color,ctx,1.,1.);}"}}
+            "composition":{"space":"3d","view":{"program": "display"}},"render": {"resolution": [16,16], "background": [0.25,0.25,0.25],
+                "settings": {"samples": 1}},
+            "programs": {"display": {"source": "import std.view; struct Inputs {}; import std.view; ViewResult view(ViewContext ctx, Inputs i) {return finish_view(ctx.color,ctx,1.);}"}}
         }))?;
         let installed = r.install_with_options(scene, std::path::Path::new("."), crate::InstallOptions {
             readback, gpu_color: false, ..Default::default()
@@ -523,7 +649,7 @@ mod exr_tests {
             // A constant 0.25 input must not retain 8-bit dither in RGBA16.
             assert!((f32::from(high[0])/65535. - 0.25).abs() <= 1.5/65535.);
         }
-        let files = encode(16,16,&pixels,&Outputs::new(vec![Output::Color]),PngDepth::Sixteen)?;
+        let files = encode(16,16,&pixels,&Outputs::new(vec![Output::Color]),PngDepth::Sixteen,Default::default())?;
         let path = std::env::temp_dir().join(format!("vork-png16-{}.png",std::process::id()));
         std::fs::write(&path,&files[0].1)?;
         let bytes = std::fs::read(&path)?;
@@ -534,6 +660,16 @@ mod exr_tests {
         assert_eq!(info.bit_depth,png::BitDepth::Sixteen);
         let expected: Vec<u8> = pixels.rgba16.iter().flatten().flat_map(|v|v.to_be_bytes()).collect();
         assert_eq!(&decoded[..info.buffer_size()],expected.as_slice());
+        Ok(())
+    }
+    #[test]
+    fn every_png_uses_the_fast_setting_and_decodes_to_its_pixels() -> Result<()> {
+        assert!(matches!(COMPRESSION, png::Compression::Fast));
+        let rgba: Vec<u8> = (0..64 * 64 * 4).map(|i| (i * 7 % 251) as u8).collect();
+        let mut reader = png::Decoder::new(std::io::Cursor::new(encode_canvas(64, 64, &rgba, Default::default())?.remove(0).1)).read_info()?;
+        let mut pixels = vec![0; reader.output_buffer_size().unwrap()];
+        let info = reader.next_frame(&mut pixels)?;
+        assert_eq!(&pixels[..info.buffer_size()], rgba.as_slice());
         Ok(())
     }
     #[test]
@@ -590,18 +726,104 @@ mod exr_tests {
                 nonfinite: None,
                 dropped_light_samples: 0,
                 dropped_path_samples: 0,
+                invalid_pixels: Default::default(),
                 terminated_medium_paths: 0,
                 discarded_medium_radiance: 0.,
                 gpu_elapsed_ms: 0.,
                 timing_source: "unmeasured",
                 gpu_spans_ms: vec![],
                 sample_count: 1,
+                variants_pending: false,
+                path_kernel: None,
             },
         };
+        // Raw storage converts colour only: beauty and colour AOVs. Alpha, indices, value AOVs and the catcher
+        // ratio keep their values, and the file names its primaries, white point, space and reference domain.
+        // The second beauty pixel is light without coverage (a bloom halo on transparent film): it keeps its energy.
+        {
+            use vork_scene::v2::{AovType, WorkingColorSpace as S};
+            let world: vork_scene::v2::Scene = serde_json::from_value(serde_json::json!({"version":2,"nodes":[{"type":"camera"}]}))?;
+            let mut raw = pixels.clone();
+            raw.linear_rgba = Some(vec![[2., -0.25, 0.5, 0.5], [0.5, 0.25, 0.125, 0.]]);
+            let colour = [[2., -0.25, 0.5, 1.], [0.5, 0.25, 0.125, 0.]];
+            for name in ["tint", "shadow_catcher"] {
+                raw.aovs.insert(name.into(), crate::frame::AovPixels { kind: AovType::Color, pixels: colour.to_vec() });
+            }
+            let outputs = Outputs(vec![Output::Color, Output::ObjectIndex, Output::Aov("heat".into()), Output::Aov("tint".into()), Output::Aov("shadow_catcher".into())]);
+            let mut default_bytes = None;
+            for (storage, expected) in [
+                (None, [2., -0.25, 0.5]),
+                (Some(S::LinearRec709), [2., -0.25, 0.5]),
+                (Some(S::LinearRec2020), [1.19414353, -0.08600947, 0.45857722]),
+                (Some(S::ACEScg), [1.16500378, -0.08197488, 0.44874606]),
+            ] {
+                let destination = vork_scene::v2::OutputDestination { color_space: storage, .."raw.%06d.exr".into() };
+                let color = crate::output_device::RawColor::of(&world, &destination);
+                let storage = storage.unwrap_or(S::LinearRec709);
+                assert_eq!(color.storage, storage);
+                let encoded = encode_exr_clock(1, 2, &raw, &outputs, crate::ExrCodec::default(), Some((24, 1)), color)?;
+                let decoded = read().no_deep_data().largest_resolution_level().all_channels().all_layers().all_attributes()
+                    .from_buffered(std::io::Cursor::new(&encoded[0].1))?;
+                let layer = &decoded.layer_data[0];
+                let channel = |name: &str| layer.channel_data.list.iter().find(|c| c.name.to_string() == name).unwrap().sample_data.values_as_f32().collect::<Vec<_>>();
+                let halo = color.store([0.5, 0.25, 0.125]);
+                for (i, name) in ["R", "G", "B"].into_iter().enumerate() {
+                    for prefix in ["", "tint."] {
+                        let values = channel(&format!("{prefix}{name}"));
+                        assert!((values[0] - expected[i]).abs() < 2e-6 && values[1] == halo[i], "{storage:?} {prefix}{name}: {values:?}");
+                    }
+                    assert_eq!(channel(&format!("shadow_catcher.{name}")), vec![colour[0][i], colour[1][i]], "the catcher ratio is not converted");
+                }
+                assert_eq!(channel("A"), vec![0.5, 0.]);
+                assert_eq!(channel("object_index.X"), vec![65535., 0.]);
+                assert_eq!(channel("heat.X"), vec![0.25, 0.75]);
+                let [red, green, blue, white] = storage.chromaticities().map(|[x, y]| Vec2(x, y));
+                assert_eq!(decoded.attributes.chromaticities, Some(exr::meta::attribute::Chromaticities { red, green, blue, white }));
+                assert_eq!(layer.attributes.other[&Text::from("vork:color_space")], AttributeValue::Text(Text::from(storage.name())));
+                assert_eq!(layer.attributes.other[&Text::from("vork:reference_domain")], AttributeValue::Text(Text::from("scene")));
+                assert_eq!(layer.attributes.frames_per_second, Some((24, 1)));
+                // The working space stores the samples as they are, named or omitted: the same file.
+                if storage == S::LinearRec709 {
+                    assert_eq!([channel("R")[0], channel("G")[0], channel("B")[0]].map(f32::to_bits), [2f32, -0.25, 0.5].map(f32::to_bits));
+                    assert_eq!(default_bytes.get_or_insert_with(|| encoded[0].1.clone()), &encoded[0].1);
+                }
+            }
+        }
+        // A canvas's EXR: its picture after its view, associated sRGB code values, through the
+        // same writer. It is display-referred; omitted storage keeps the code values as they are, and a linear
+        // space takes display-linear light, converted on unassociated colour.
+        {
+            use vork_scene::v2::WorkingColorSpace as S;
+            let canvas: vork_scene::v2::Scene = serde_json::from_value(serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[]}))?;
+            let picture = [[0.25, 0.25, 0.25, 0.5], [1.5, -0.25, 0.5, 1.]];
+            for (storage, expected) in [(None, picture), (Some(S::Srgb), picture),
+                (Some(S::LinearRec709), [[0.21404114 * 0.5, 0.21404114 * 0.5, 0.21404114 * 0.5, 0.5], [2.5371552, -0.019349845, 0.21404114, 1.]])] {
+                let destination = vork_scene::v2::OutputDestination { color_space: storage, .."frames.%06d.exr".into() };
+                let color = crate::output_device::RawColor::of(&canvas, &destination);
+                let encoded = encode_exr_canvas(1, 2, &picture, crate::ExrCodec::default(), (24, 1), color)?;
+                let decoded = read().no_deep_data().largest_resolution_level().all_channels().all_layers().all_attributes()
+                    .from_buffered(std::io::Cursor::new(&encoded[0].1))?;
+                let layer = &decoded.layer_data[0];
+                let channel = |name: &str| layer.channel_data.list.iter().find(|c| c.name.to_string() == name).unwrap().sample_data.values_as_f32().collect::<Vec<_>>();
+                for (i, name) in ["R", "G", "B", "A"].into_iter().enumerate() {
+                    let values = channel(name);
+                    for pixel in 0..2 {
+                        if storage == Some(S::LinearRec709) { assert!((values[pixel] - expected[pixel][i]).abs() < 2e-5, "{name}: {values:?}"); }
+                        else { assert_eq!(values[pixel].to_bits(), expected[pixel][i].to_bits(), "{name}: {values:?}"); }
+                    }
+                }
+                let storage = storage.unwrap_or(S::Srgb);
+                let [red, green, blue, white] = storage.chromaticities().map(|[x, y]| Vec2(x, y));
+                assert_eq!(decoded.attributes.chromaticities, Some(exr::meta::attribute::Chromaticities { red, green, blue, white }));
+                assert_eq!(layer.attributes.other[&Text::from("vork:color_space")], AttributeValue::Text(Text::from(storage.name())));
+                assert_eq!(layer.attributes.other[&Text::from("vork:reference_domain")], AttributeValue::Text(Text::from("display")));
+                assert_eq!(layer.attributes.frames_per_second, Some((24, 1)));
+            }
+        }
         // The public PNG protocol uses network byte order, including the zero
         // blue component of the RGB16 motion image. Decode the actual files so
         // this also checks their PNG type, depth and dimensions.
-        let pngs = encode(1, 2, &pixels, &Outputs(vec![Output::Depth, Output::ObjectIndex, Output::Motion]), PngDepth::Eight)?;
+        let pngs = encode(1, 2, &pixels, &Outputs(vec![Output::Depth, Output::ObjectIndex, Output::Motion]), PngDepth::Eight, Default::default())?;
         for (suffix, color, expected) in [
             (".depth.png", png::ColorType::Grayscale, vec![0, 100, 0, 0]),
             (".object_index.png", png::ColorType::Grayscale, vec![255, 255, 0, 0]),
@@ -609,6 +831,7 @@ mod exr_tests {
         ] {
             let bytes = &pngs.iter().find(|(name, _)| name == suffix).unwrap().1;
             let mut reader = png::Decoder::new(std::io::Cursor::new(bytes)).read_info()?;
+            assert!(reader.info().srgb.is_none(), "control channels are data");
             let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
             let info = reader.next_frame(&mut decoded)?;
             assert_eq!((info.width, info.height, info.color_type, info.bit_depth), (1, 2, color, png::BitDepth::Sixteen));
@@ -619,15 +842,46 @@ mod exr_tests {
             (PngDepth::Eight, png::BitDepth::Eight, vec![128, 128, 255, 128, 0, 0, 0, 0]),
             (PngDepth::Sixteen, png::BitDepth::Sixteen, vec![1, 2, 128, 0, 255, 255, 127, 255, 0, 0, 0, 0, 0, 0, 0, 0]),
         ] {
-            let files = encode(1, 2, &pixels, &Outputs(vec![Output::Color]), depth)?;
+            let files = encode(1, 2, &pixels, &Outputs(vec![Output::Color]), depth, Default::default())?;
             assert_eq!(files.len(), 1);
             assert_eq!(files[0].0, ".png");
             let mut reader = png::Decoder::new(std::io::Cursor::new(&files[0].1)).read_info()?;
+            assert_eq!(reader.info().srgb,Some(png::SrgbRenderingIntent::Perceptual));
             let mut decoded = vec![0; reader.output_buffer_size().unwrap()];
             let info = reader.next_frame(&mut decoded)?;
             assert_eq!((info.width, info.height, info.color_type, info.bit_depth), (1, 2, png::ColorType::Rgba, bit_depth));
             assert_eq!(&decoded[..info.buffer_size()], &expected, "{depth:?}");
         }
+        // A picture for another display names it in cICP and carries no sRGB chunk; its pixels are the same
+        // plane, and control channels beside it stay untagged data.
+        let chunks = |bytes: &[u8]| {
+            let (mut chunks, mut offset) = (Vec::new(), 8);
+            while offset < bytes.len() {
+                let length = u32::from_be_bytes(bytes[offset..offset + 4].try_into().unwrap()) as usize;
+                chunks.push((bytes[offset + 4..offset + 8].to_vec(), bytes[offset + 8..offset + 8 + length].to_vec()));
+                offset += 12 + length;
+            }
+            chunks
+        };
+        let srgb = encode(1, 2, &pixels, &Outputs(vec![Output::Color]), PngDepth::Eight, Default::default())?;
+        assert!(chunks(&srgb[0].1).iter().all(|(name, _)| name != b"cICP"));
+        let wide = encode(1, 2, &pixels, &Outputs(vec![Output::Color, Output::Depth]), PngDepth::Eight, vork_scene::v2::OutputDisplay::DisplayP3)?;
+        let tagged = chunks(&wide[0].1);
+        assert_eq!(tagged.iter().find(|(name, _)| name == b"cICP").map(|(_, data)| data.as_slice()), Some(&[12, 13, 0, 1][..]));
+        assert!(tagged.iter().all(|(name, _)| !matches!(name.as_slice(), b"sRGB" | b"gAMA" | b"cHRM" | b"iCCP")));
+        let position = |name: &[u8]| tagged.iter().position(|(chunk, _)| chunk == name).unwrap();
+        assert!(position(b"cICP") < position(b"IDAT"));
+        assert!(chunks(&wide[1].1).iter().all(|(name, _)| !matches!(name.as_slice(), b"cICP" | b"sRGB")));
+        assert_eq!(png::Decoder::new(std::io::Cursor::new(&wide[0].1)).read_info()?.info().srgb, None);
+        for (display, expected) in [(vork_scene::v2::OutputDisplay::Rec2100Pq, [9, 16, 0, 1]), (vork_scene::v2::OutputDisplay::Rec2100Hlg, [9, 18, 0, 1])] {
+            assert_eq!(cicp(display), Some(expected));
+        }
+        // A canvas's picture names its display the same way.
+        let canvas = encode_canvas(1, 1, &[1, 2, 3, 255], vork_scene::v2::OutputDisplay::DisplayP3)?;
+        let tagged = chunks(&canvas[0].1);
+        assert_eq!(tagged.iter().find(|(name, _)| name == b"cICP").map(|(_, data)| data.as_slice()), Some(&[12, 13, 0, 1][..]));
+        assert!(tagged.iter().all(|(name, _)| name != b"sRGB"));
+        assert!(chunks(&encode_canvas(1, 1, &[1, 2, 3, 255], Default::default())?[0].1).iter().any(|(name, _)| name == b"sRGB"));
         let files = encode_exr(
             1,
             2,
@@ -719,7 +973,7 @@ mod exr_tests {
             if count>0 {
                 let selection: Output = format!("aov:a{}",count-1).parse().unwrap();
                 let selected = Outputs::new(vec![selection]);
-                let png = encode(1,2,&pixels,&selected,PngDepth::Eight)?;
+                let png = encode(1,2,&pixels,&selected,PngDepth::Eight,Default::default())?;
                 assert_eq!(png.len(),1);
                 assert_eq!(png[0].0,format!(".aov.a{}.png",count-1));
                 let files = encode_exr(1,2,&pixels,&selected,crate::ExrCodec::default())?;
@@ -729,5 +983,61 @@ mod exr_tests {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod canvas_writer_tests {
+    use super::*;
+
+    fn read(path: &std::path::Path, expected: &[u8]) {
+        let mut decoder = png::Decoder::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+            .read_info().unwrap();
+        assert_eq!(decoder.info().srgb, Some(png::SrgbRenderingIntent::Perceptual));
+        let mut pixels = vec![0; decoder.output_buffer_size().unwrap()];
+        let info = decoder.next_frame(&mut pixels).unwrap();
+        assert_eq!(info.color_type, png::ColorType::Rgba);
+        assert_eq!(&pixels[..info.buffer_size()], expected);
+    }
+
+    #[test]
+    fn canvas_writer_preserves_pixels_indices_and_shared_credits() {
+        let root = std::env::temp_dir().join(format!("vork-canvas-writer-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("a")).unwrap();
+        std::fs::create_dir_all(root.join("b")).unwrap();
+        let writers: Vec<_> = ["a", "b"].into_iter().map(|p| FrameOutputWriter::canvas(root.join(p), 2, 1, 2, 7, Default::default())).collect();
+        let credits: [Arc<crate::ring::Credit>; 2] = Default::default();
+        let pixels = |frame: usize| Arc::new(vec![frame as u8, 34, 56, 78, 90, 123, 210, 255]);
+        // More frames than credits exercises backpressure and Finish accounting for ready inputs.
+        for frame in 7..13 {
+            let lease = Arc::new(credits[frame % 2].acquire());
+            let rgba = pixels(frame);
+            for writer in &writers { writer.push_canvas(frame, rgba.clone(), lease.clone()).unwrap(); }
+        }
+        for writer in writers { writer.finish().unwrap(); }
+        for destination in ["a", "b"] {
+            for frame in 7..13 { read(&root.join(destination).join(format!("{frame:06}.png")), &pixels(frame)); }
+        }
+        let still = FrameOutputWriter::canvas(root.join("still.png"), 2, 1, 1, 42, Default::default());
+        still.push_canvas(42, pixels(42), Arc::new(credits[0].acquire())).unwrap();
+        still.finish().unwrap();
+        read(&root.join("still.png"), &pixels(42));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn canvas_writer_failure_releases_shared_credit() {
+        let root = std::env::temp_dir().join(format!("vork-canvas-writer-failure-{}", std::process::id()));
+        std::fs::create_dir_all(root.join("blocked.png")).unwrap();
+        let credit: Arc<crate::ring::Credit> = Default::default();
+        let writer = FrameOutputWriter::canvas(root.join("blocked.png"), 1, 1, 1, 0, Default::default());
+        writer.push_canvas(0, Arc::new(vec![1, 2, 3, 255]), Arc::new(credit.acquire())).unwrap();
+        assert!(writer.finish().is_err());
+        assert_eq!(Arc::strong_count(&credit), 1, "all writer leases were released");
+        let writer = FrameOutputWriter::canvas(root.join("invalid.png"), 2, 2, 1, 0, Default::default());
+        writer.push_canvas(0, Arc::new(vec![1]), Arc::new(credit.acquire())).unwrap();
+        assert!(writer.finish().is_err());
+        assert_eq!(Arc::strong_count(&credit), 1);
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

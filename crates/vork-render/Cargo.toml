@@ -4,13 +4,28 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 [dependencies]
+vork-audio = { path = "../vork-audio" }
+urlencoding = "2"
 vork-time = { path = "../vork-time" }
 vork-std = { path = "../vork-std" }
 vork-mesh = { path = "../vork-mesh" }
+vork-splat = { path = "../vork-splat" }
 vork-scene = { path = "../vork-scene" }
 vork-slang = { path = "../vork-slang" }
+# The 2D canvas's text: Moda's text engine and its GPU drawing (crates/moda-text, crates/moda-text-draw).
+moda-text = { path = "../moda-text" }
+moda-plain-text = { path = "../moda-plain-text" }
+moda-text-draw = { path = "../moda-text-draw" }
+# The 2D canvas's drawing: Moda's 2D engine and the scene and asset layers it reads (crates/moda-engine, moda-scene,
+# moda-assets); vork writes each frame as a Moda document.
+moda-engine = { path = "../moda-engine" }
+moda-scene = { path = "../moda-scene" }
+moda-assets = { path = "../moda-assets" }
 anyhow = "1"
+svgtypes = "0.16"
 wgpu = { version = "29", features = ["noop"] }
+# Serialize detached worker bind-group descriptors without enabling wgpu tracing.
+wgpu-types = { version = "29", features = ["serde"] }
 glam = { version = "0.30", features = ["bytemuck"] }
 bytemuck = { version = "1", features = ["derive"] }
 gltf = { version = "1.4", features = ["extras", "KHR_lights_punctual", "KHR_texture_transform", "extensions", "KHR_materials_transmission", "KHR_materials_volume", "KHR_materials_ior", "KHR_materials_emissive_strength"] }
@@ -19,18 +34,21 @@ blake3 = "1"
 lz4_flex = { version = "0.11", default-features = false, features = ["std", "safe-decode", "checked-decode"] }
 memmap2 = "0.9"
 pollster = "0.4"
-serde_json = "1"
+serde_json = { package = "vork-json", path = "../vork-json" }
 png = "0.18"
+moxcms = { version = "=0.8.1", features = ["extended_range"] }
 exr = { version = "1.74", default-features = false }
 libc = "0.2"
 libloading = "0.8"
 vork-encode = { path = "../vork-encode" }
-serde = "1"
+serde = { version = "1", features = ["derive"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "hdr", "exr", "tiff"] }
 half = "2"
 basisu_c_sys = { version = "0.9.1", features = ["encoder", "extra"] }
+lzma-rs = { version = "0.3", default-features = false }
 
 [dev-dependencies]
+texture2ddecoder = "0.1.2"
 winit = { version = "0.30.13", default-features = false, features = ["rwh_06", "x11"] }
 serde = { version = "1", features = ["derive"] }
 proptest = { version = "1", default-features = false, features = ["std"] }
@@ -45,8 +63,9 @@ ash = "0.38"
 objc2-metal = "0.3"
 
 [build-dependencies]
+vork-slang = { path = "../vork-slang" }
 blake3 = "1"
-serde_json = "1"
+serde_json = { package = "vork-json", path = "../vork-json" }
 
 [dev-dependencies.vork-scene]
 path = "../vork-scene"

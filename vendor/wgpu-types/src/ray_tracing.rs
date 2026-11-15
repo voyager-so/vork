@@ -26,10 +26,25 @@ pub struct BlasTriangleGeometrySizeDescriptor {
     pub flags: AccelerationStructureGeometryFlags,
 }
 
+/// Size and flags of procedural geometry bounded by axis-aligned boxes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
+pub struct BlasAabbGeometrySizeDescriptor {
+    /// Number of boxes, one per procedural primitive.
+    pub count: u32,
+    /// Geometry flags. Procedural candidates require shader intersection tests.
+    pub flags: AccelerationStructureGeometryFlags,
+}
+
 #[derive(Clone, Debug)]
 #[cfg_attr(feature = "serde", derive(Serialize, Deserialize))]
 /// Descriptor for all size defining attributes of all geometries inside a bottom level acceleration structure.
 pub enum BlasGeometrySizeDescriptors {
+    /// Procedural geometry bounded by six float32 values per box (min, max).
+    Aabbs {
+        /// Descriptor for each AABB geometry.
+        descriptors: Vec<BlasAabbGeometrySizeDescriptor>,
+    },
     /// Triangle geometry version.
     Triangles {
         /// Descriptor for each triangle geometry.

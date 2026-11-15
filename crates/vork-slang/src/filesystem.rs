@@ -437,8 +437,17 @@ mod tests {
         }
         let work = Workspace::new()?;
         let executable = work.0.join("test-runner");
-        fs::copy(std::env::current_exe()?, &executable)?;
-        fs::copy(adapter()?, work.0.join("vork-slang-filesystem"))?;
+        // Keep writable executable descriptors out of this multithreaded
+        // process: another test's fork can inherit one until exec and make
+        // our immediate launch fail with ETXTBSY, even with close-on-exec.
+        // Waiting for a separate copier closes its descriptors before launch.
+        for (source, destination) in [
+            (std::env::current_exe()?, executable.clone()),
+            (adapter()?, work.0.join("vork-slang-filesystem")),
+        ] {
+            let copied = Command::new("cp").arg(source).arg(destination).status()?;
+            ensure!(copied.success(), "copy test executable: {copied}");
+        }
         let result = Command::new(executable)
             .args([
                 "--exact",

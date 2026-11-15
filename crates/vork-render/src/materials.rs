@@ -24,6 +24,11 @@ pub(crate) struct MaterialRecord {
     pub(crate) values: [f32; VALUE_WORDS],
 }
 impl MaterialRecord {
+    /// Screen exits have no attributes for evaluating spatial glTF base colour.
+    pub(crate) fn screen_exit_needs_color(&self, vertex_color: bool) -> bool {
+        self.tag[2] & constants::FLAG_VERTEX_COLOR != 0
+            && (vertex_color || self.bound("base_color"))
+    }
     fn get(&self, name: &str) -> &[f32] {
         let (index, p) = param(name);
         let word = value_word(index);
@@ -303,8 +308,8 @@ fn frame_materials(
 }
 // The install-time capability key is defined beside the Slang variant it selects.
 pub(crate) use crate::forward_variant::{
-    FeatureMask, FEATURE_ANISOTROPY, FEATURE_FILM, FEATURE_COAT, FEATURE_ELLIPSE, FEATURE_FINITE, FEATURE_FUZZ, FEATURE_RECTANGLE, FEATURE_LIGHT_SHIFT, FEATURE_LIGHT_TYPES,
-    FEATURE_SHADOW_RAYS, FEATURE_TRANSMISSION, FEATURE_SOLID_TRANSMISSION, FEATURE_LIT, FEATURE_LOBES, FEATURE_MASK, FEATURE_PUNCTUAL, FEATURE_SIDED, FEATURE_SPECIALIZED, FEATURE_TINT,
+    FeatureMask, FEATURE_ANISOTROPY, FEATURE_COAT_ANISOTROPY, FEATURE_FILM, FEATURE_SUBSURFACE, FEATURE_HAIR, FEATURE_INSTALLED, FEATURE_WEIGHTED_IOR, FEATURE_GLTF_TINT, FEATURE_COAT, FEATURE_ELLIPSE, FEATURE_FINITE, FEATURE_FUZZ, FEATURE_RECTANGLE, FEATURE_LIGHT_SHIFT, FEATURE_LIGHT_TYPES,
+    FEATURE_SHADOW_RAYS, FEATURE_TRANSMISSION, FEATURE_SOLID_TRANSMISSION, FEATURE_LIT, FEATURE_LOBES, FEATURE_MASK, FEATURE_PUNCTUAL, FEATURE_SPECIALIZED, FEATURE_TINT,
     SHADING_LAYERS, SHADING_METAL,
 };
 const _: () = assert!(OCCLUSION_INPUT + 1 == crate::forward_variant::TEXTURE_FEATURES);
@@ -335,6 +340,18 @@ pub(crate) fn bound_features(
         }
     }
 }
+/// The key of a kernel any installed material can reach (path transport): the
+/// union of every material's key and of the material facts no single raster key
+/// carries. One rule for every scene; a material that is installed but never
+/// drawn still counts, so the key follows the scene and not the view.
+pub(crate) fn installed_features(materials: &[Material]) -> FeatureMask {
+    materials.iter().fold(FEATURE_SPECIALIZED | FEATURE_INSTALLED, |union, m| {
+        union | m.features
+            | if m.subsurface { FEATURE_SUBSURFACE } else { 0 }
+            | if m.hair { FEATURE_HAIR } else { 0 }
+            | if m.null_connection { crate::forward_variant::FEATURE_NULL_CONNECTION } else { 0 }
+    })
+}
 /// One OpenPBR input's texture capability in the installed shading key.
 pub(crate) fn texture_feature(input: &str) -> FeatureMask {
     1 << (param(input).0 + 2)
@@ -349,6 +366,9 @@ pub(crate) struct Material {
     pub(crate) hair: bool,
     /// May select physical fibre scattering; diffuse-only Hair is excluded.
     pub(crate) physical_hair: bool,
+    /// A returned closure can have a subsurface lobe: the weight is nonzero,
+    /// textured or tracked, or a program's proofs leave it possible.
+    pub(crate) subsurface: bool,
     pub(crate) features: FeatureMask,
     pub(crate) transparent: bool,
     /// Any possible transmission (thin or solid), independent of alpha coverage.
@@ -359,6 +379,8 @@ pub(crate) struct Material {
     pub(crate) solid_absorption: bool,
     /// May produce a thin sheet, including program or animated closures.
     pub(crate) thin_transmission: bool,
+    /// See `PendingMaterial::null_connection`.
+    pub(crate) null_connection: bool,
     #[cfg(test)]
     pub(crate) shadow_coverage: bool,
     /// Cutout or blended surface coverage, independently of transparent shadows.
@@ -370,6 +392,9 @@ pub(crate) struct Material {
     /// raster entries read SV_PrimitiveID (forward_variant::FEATURE_DITHERED).
     pub(crate) dithered: bool,
     pub(crate) double_sided: bool,
+    /// Native solid material groups retain opaque exit faces. glTF uses each
+    /// material's sidedness; its finite volumes are already double-sided.
+    pub(crate) preserve_solid_backfaces: bool,
 }
 
 // Texture installation precedes the single scene-wide material-record upload.
@@ -387,6 +412,7 @@ pub(crate) struct PendingMaterial {
     pub(crate) taps: Vec<[u32; constants::MATERIAL_TAP_WORDS]>,
     alpha_mask: bool,
     double_sided: bool,
+    preserve_solid_backfaces: bool,
     transparent: bool,
     opacity_animated: bool,
     // Reserves shader features even when their initial weights are zero.
@@ -405,7 +431,15 @@ pub(crate) struct PendingMaterial {
 }
 // Records hold table indices, so record bytes identify a material.
 pub(crate) type MaterialKey = Vec<u8>;
+
 impl PendingMaterial {
+    /// Vertex colour multiplication uses the imported record flag directly. Only
+    /// transmission and unlit emission need the optional glTF closure state.
+    pub(crate) fn gltf_tint(&self) -> bool {
+        self.record.tag[2] & constants::FLAG_VERTEX_COLOR != 0
+            && (self.transmissive || self.record.tag[2] & vork_slang::registry::FLAG_GLTF_UNLIT != 0)
+    }
+
     /// Static unbound zero coverage needs no draw. Vertex-alpha draws retain
     /// ordinary coverage when their sampling policy could vary.
     fn zero_opacity(&self) -> bool {
@@ -427,11 +461,12 @@ impl PendingMaterial {
             taps: Vec::new(),
             alpha_mask: false,
             double_sided: false,
+            preserve_solid_backfaces: true,
             transparent: false,
             opacity_animated: false,
             shading: 0,
             response_animated: 0,
-            response_program: if id != 0 {FEATURE_ANISOTROPY|FEATURE_FILM|FEATURE_COAT|FEATURE_FUZZ|FEATURE_TINT} else {0},
+            response_program: if id != 0 {FEATURE_ANISOTROPY|FEATURE_COAT_ANISOTROPY|FEATURE_FILM|FEATURE_COAT|FEATURE_FUZZ|FEATURE_TINT|FEATURE_WEIGHTED_IOR|FEATURE_SUBSURFACE} else {0},
             unique: None,
             transmissive: false,
             lobes: false,
@@ -491,6 +526,7 @@ impl PendingMaterial {
         let mut key = bytemuck::bytes_of(&self.record).to_vec();
         key.extend_from_slice(bytemuck::cast_slice(&self.taps));
         key.extend_from_slice(bytemuck::cast_slice(&self.uv_sources));
+        key.push(u8::from(self.preserve_solid_backfaces));
         if let Some(name) = &self.unique {
             key.extend_from_slice(name.as_bytes());
         }
@@ -513,12 +549,31 @@ impl PendingMaterial {
             || (self.record.values[value_word(input)]!=0.)==thin
             || self.record.inputs[input]&constants::MATERIAL_TAP_INDEX_MASK!=0)
     }
+    /// Whether a covered point of this material can pass a straight path
+    /// connection: bsdf.slang `transport_null_boundary` can hold for one of its
+    /// closures. That needs transmission, and then either a thin sheet (whose
+    /// delta depends on roughness and the incident medium, known per crossing)
+    /// or a solid whose prepared index equals one. A solid with unit specular
+    /// weight, no dispersion and a constant index other than one always
+    /// refracts, so it blocks. Programs, tracks and bound inputs stay possible.
+    pub(crate) fn null_connection(&self) -> bool {
+        self.wall_transmission(true) || self.transmissive && (self.weighted_ior()
+            || self.record.bound("specular_ior") || self.record.get("specular_ior")[0]==1.
+            || self.record.bound("transmission_dispersion_scale") || self.record.get("transmission_dispersion_scale")[0]>0.)
+    }
     fn emits(&self) -> bool {
         if self.record.tag[0]!=0 {self.source_emission} else {
             self.emission_animated || (self.record.get("emission_luminance")[0]>0. && self.record.get("emission_color")!=[0.;3])
         }
     }
     pub(crate) fn physical_emitter(&self) -> bool {self.emits() && !self.transparent && !self.zero_opacity()}
+
+    pub(crate) fn weighted_ior(&self) -> bool {
+        (self.response_program & FEATURE_WEIGHTED_IOR != 0)
+            || self.response_animated & FEATURE_WEIGHTED_IOR != 0
+            || self.record.get("specular_weight")[0] != 1.
+            || self.record.bound("specular_weight")
+    }
 
     pub(crate) fn finish(self) -> Material {
         let value = |name| self.record.values[value_word(param(name).0)];
@@ -552,18 +607,23 @@ impl PendingMaterial {
         // fields. Their Chiang roughness/coat and diffuse fallback do not use
         // the ordinary surface anisotropy or thin-film response.
         let programmed_response = if self.hair {0} else {self.response_program};
-        for (input, capability) in [("specular_roughness_anisotropy", FEATURE_ANISOTROPY), ("thin_film_weight", FEATURE_FILM)] {
+        for (input, capability) in [("specular_roughness_anisotropy", FEATURE_ANISOTROPY),("coat_roughness_anisotropy",FEATURE_COAT_ANISOTROPY), ("thin_film_weight", FEATURE_FILM)] {
             let i = param(input).0;
             if (self.response_animated | programmed_response) & capability != 0 || value(input) > 0.
                 || self.record.inputs[i] & constants::MATERIAL_TAP_INDEX_MASK != 0 {
                 features |= capability;
             }
         }
+        if features & FEATURE_COAT_ANISOTROPY != 0 {features |= FEATURE_ANISOTROPY;}
+        // The same three sources as the responses above. A material fact, not a
+        // key bit: only a transport kernel's scene union reads it (installed_features).
+        let subsurface = (self.response_animated | self.response_program) & FEATURE_SUBSURFACE != 0
+            || value("subsurface_weight") > 0.
+            || self.record.inputs[param("subsurface_weight").0] & constants::MATERIAL_TAP_INDEX_MASK != 0;
+        if self.weighted_ior() {features |= FEATURE_WEIGHTED_IOR;}
+        if self.gltf_tint() {features |= FEATURE_GLTF_TINT;}
         if self.alpha_mask {
             features |= FEATURE_MASK;
-        }
-        if !self.double_sided {
-            features |= FEATURE_SIDED;
         }
         if self.lobes {
             features |= FEATURE_LOBES;
@@ -594,6 +654,7 @@ impl PendingMaterial {
             source_emission,
             hair: self.hair,
             physical_hair: self.physical_hair,
+            subsurface,
             features: features | FeatureMask::from(shading),
             #[cfg(test)]
             shadow_coverage: self.surface_coverage(),
@@ -602,9 +663,11 @@ impl PendingMaterial {
             alpha_mask: self.alpha_mask,
             dithered: self.record.extra[1]==2.,
             double_sided: self.double_sided,
+            preserve_solid_backfaces: self.preserve_solid_backfaces,
             transparent: self.transparent,
             transmissive: self.transmissive,
             thin_transmission: self.wall_transmission(true),
+            null_connection: self.null_connection(),
             solid_transmission: self.solid_transmission(),
             solid_absorption: self.solid_absorption(),
         }
@@ -628,6 +691,10 @@ pub(crate) struct TextureInstaller<'a> {
     pub(crate) cache_hits: std::cell::Cell<usize>,
     pub(crate) r: &'a Renderer,
     pub(crate) footage: std::collections::BTreeMap<String, crate::footage::Installed>,
+    /// The media sources the document open read; a standalone installer reads its own.
+    pub(crate) opened: crate::footage::Opened,
+    /// The pictures of canvas nodes, by image name.
+    pub(crate) canvases: std::collections::BTreeMap<String, crate::canvas_world::Picture>,
     pub(crate) fps: vork_time::Time,
     pub(crate) render_images: &'a std::collections::BTreeMap<String, usize>,
     pub(crate) pipeline_ms: std::cell::Cell<f64>,
@@ -635,7 +702,7 @@ pub(crate) struct TextureInstaller<'a> {
         std::cell::RefCell<std::collections::HashMap<(blake3::Hash, bool, bool), wgpu::TextureView>>,
     /// glTF sampler codes; the last field marks spec §2 (anisotropic) program samplers.
     samplers: std::collections::HashMap<(u32, u32, Option<u32>, Option<u32>, bool), wgpu::Sampler>,
-    file_views: std::collections::HashMap<(std::path::PathBuf, bool), wgpu::TextureView>,
+    file_views: std::collections::HashMap<(std::path::PathBuf, bool, Option<::vork_scene::v2::ColorSpace>), wgpu::TextureView>,
     // The scene material table: one entry per distinct view and sampler.
     table: Table<TextureSlot>,
     sampler_table: Table<wgpu::Sampler>,
@@ -801,7 +868,7 @@ impl<'a> TextureInstaller<'a> {
         Self {
             r,
             render_images,
-            footage: Default::default(), fps: vork_scene::v2::Render::default().fps,
+            footage: Default::default(), opened: Default::default(), canvases: Default::default(), fps: vork_scene::v2::Render::default().fps,
             upload_ms: std::cell::Cell::new(0.),
             cache_hits: std::cell::Cell::new(0),
             pipeline_ms: std::cell::Cell::new(0.),
@@ -883,7 +950,10 @@ impl<'a> TextureInstaller<'a> {
     /// Upload a program image file with its v2 colour space and sampler. Channels
     /// keep their file precision (see `upload`); IES retains linear half-float strength.
     pub(crate) fn file_image(&mut self, path: PathBuf, srgb: bool) -> Result<wgpu::TextureView> {
-        let memo = (path.clone(), srgb);
+        self.file_image_color(path, srgb, Some(if srgb {::vork_scene::v2::ColorSpace::Srgb} else {::vork_scene::v2::ColorSpace::NonColor}))
+    }
+    fn file_image_color(&mut self, path: PathBuf, srgb: bool, color_space: Option<::vork_scene::v2::ColorSpace>) -> Result<wgpu::TextureView> {
+        let memo = (path.clone(), srgb, color_space);
         if let Some(view) = self.file_views.get(&memo) {
             return Ok(view.clone());
         }
@@ -903,19 +973,21 @@ impl<'a> TextureInstaller<'a> {
             key.update(b"ies-cycles-linear-v1");
         }
         key.update(&source);
+        key.update(&serde_json::to_vec(&(srgb, color_space))?);
         key.update(path.extension().unwrap_or_default().as_encoded_bytes());
         let key = key.finalize();
-        let cached_path = self.r.disk_cache.path("native-decoded-texture", 4, key);
+        let cached_path = self.r.disk_cache.path("native-decoded-texture", 5, key);
         let data = if let Some(data) = read_decoded(&cached_path) {
             data
         } else {
             let data = decoded_data(
-                crate::texture_source::decode(
+                crate::texture_source::decode_color(
                     &path,
                     &source,
                     self.r.device.limits().max_texture_dimension_2d,
+                    color_space, crate::texture_source::upload(srgb),
                 )
-                .with_context(|| format!("decode image {}; restore a valid image or correct its path", path.display()))?,
+                .map_err(|error| crate::texture_source::decode_context(error, "decode image", &path))?,
             )?;
             let _ = write_decoded(&cached_path, &data);
             data
@@ -938,14 +1010,25 @@ impl<'a> TextureInstaller<'a> {
         base: &Path,
     ) -> Result<(TextureSlot, wgpu::Sampler)> {
         let descriptor = crate::programs::Image {
+            image: name.into(),
             input: String::new(),
             source: crate::texture_source::TextureSource::scene(name, image),
             srgb: image.is_srgb(),
+            color_space: image.color_space,
             sampler: image.sampler(),
         };
         self.program_image(&descriptor, base)
     }
+    /// The slot and sampler of a scene image a program reads. Every installer of one comes through here, so a
+    /// refusal of the file's colour description names the image whoever asked.
     pub(crate) fn program_image(
+        &mut self,
+        image: &crate::programs::Image,
+        base: &Path,
+    ) -> Result<(TextureSlot, wgpu::Sampler)> {
+        self.program_image_slot(image, base).map_err(|error| crate::texture_source::for_image(error, &image.image))
+    }
+    fn program_image_slot(
         &mut self,
         image: &crate::programs::Image,
         base: &Path,
@@ -954,11 +1037,18 @@ impl<'a> TextureInstaller<'a> {
         use ::vork_scene::v2::{MagFilter, MinFilter, Wrap};
         let view = match &image.source {
             crate::texture_source::TextureSource::File(path) => {
-                self.file_image(base.join(path), image.srgb)?.into()
+                self.file_image_color(base.join(path), image.srgb, image.color_space)?.into()
             }
             crate::texture_source::TextureSource::Media {name,file,time} => {
                 if !self.footage.contains_key(name) {
-                    self.footage.insert(name.clone(), crate::footage::Installed::new(self.r,name,&base.join(file),time.clone(),image.srgb,self.fps)?);
+                    self.footage.insert(name.clone(), crate::footage::Installed::new(self.r,name,&base.join(file),time.clone(),image.srgb,image.color_space,self.fps,&self.opened)?);
+                }
+                self.footage[name].view.clone().into()
+            }
+            crate::texture_source::TextureSource::Canvas(name) => {
+                if !self.footage.contains_key(name) {
+                    let picture = self.canvases.get(name).with_context(|| format!("image {name}: its canvas was not installed"))?.clone();
+                    self.footage.insert(name.clone(), crate::footage::Installed::canvas(self.r, name, picture)?);
                 }
                 self.footage[name].view.clone().into()
             }
@@ -1329,7 +1419,7 @@ pub(crate) fn install_gltf(
     use gltf::material::AlphaMode;
     let mut b = RecordBuilder::openpbr();
     // glTF's own defaults where it has them (OpenPBR's differ): white base, metal 1,
-    // roughness 1, IOR 1.5, emission off, double-sided for primitives without a material.
+    // roughness 1, IOR 1.5, emission off, single-sided even without an assigned material.
     let pbr = mat.map(|m| m.pbr_metallic_roughness());
     let base = pbr.as_ref().map_or([1.; 4], |p| p.base_color_factor());
     let unlit = mat.is_some_and(|m| m.extension_value("KHR_materials_unlit").is_some());
@@ -1343,7 +1433,11 @@ pub(crate) fn install_gltf(
         "specular_roughness",
         &[pbr.as_ref().map_or(1., |p| p.roughness_factor())],
     );
-    b.set("specular_ior", &[mat.and_then(|m| m.ior()).unwrap_or(1.5)]);
+    let ior = mat.and_then(|m| m.ior()).unwrap_or(1.5);
+    // KHR_materials_ior reserves zero for positive infinity; it is not a
+    // physical zero index and must never reach Fresnel or relative-IOR math.
+    ensure!(ior >= 1., "KHR_materials_ior: infinite or sub-unit IOR is unsupported; use a finite ior of at least 1; see vork help upgrade");
+    b.set("specular_ior", &[ior]);
     b.set(
         "emission_color",
         &mat.map_or([0.; 3], |m| m.emissive_factor()),
@@ -1446,8 +1540,8 @@ pub(crate) fn install_gltf(
             b.bind_index(OCCLUSION_INPUT, occlusion_tap, 0)?;
             extra[2] = occlusion.strength();
         }
-        // KHR_materials_transmission and _volume: transmission is tinted by the base colour,
-        // or by the interior's attenuation colour over its distance when the volume has one.
+        // glTF base colour tints each surface crossing after texture/vertex evaluation.
+        // Keep the independent volume attenuation in the transmission colour/depth slots.
         let transmission = mat.and_then(|m| m.transmission());
         let volume = mat.and_then(|m| m.volume());
         weight = transmission
@@ -1471,18 +1565,6 @@ pub(crate) fn install_gltf(
         if let Some((color, distance)) = attenuation {
             b.set("transmission_color", &color);
             b.set("transmission_depth", &[distance]);
-        } else if weight > 0. {
-            b.set("transmission_color", &base[..3]);
-            if let Some(info) = pbr.as_ref().and_then(|p| p.base_color_texture()) {
-                let base_tap = tap(
-                    info.texture(),
-                    info.tex_coord(),
-                    info_transform(&info).as_ref(),
-                    true,
-                    alpha,
-                )?;
-                b.bind("transmission_color", base_tap, CHANNEL_RGB)?;
-            }
         }
         // glTF surfaces are thin unless KHR_materials_volume gives them thickness.
         let thin = volume.as_ref().is_none_or(|v| v.thickness_factor() <= 0.);
@@ -1581,7 +1663,9 @@ pub(crate) fn install_gltf(
         .then(|| mat.and_then(|m| m.alpha_cutoff()).unwrap_or(0.5))
         .unwrap_or(-1.);
     let blend = alpha_mode == AlphaMode::Blend;
-    let double_sided = mat.is_none_or(|m| m.double_sided());
+    // KHR_materials_volume boundaries ignore doubleSided, even at zero transmission.
+    let volume_boundary = !unlit && mat.and_then(|m| m.volume()).is_some_and(|v| v.thickness_factor() > 0.);
+    let double_sided = volume_boundary || mat.is_some_and(|m| m.double_sided());
     b.set("alpha_cutoff", &[cutoff]);
     b.record.extra = extra;
     b.record.tag[2] = u32::from(double_sided) * FLAG_DOUBLE_SIDED
@@ -1603,6 +1687,7 @@ pub(crate) fn install_gltf(
         response_program: 0,
         unique: None,
         double_sided,
+        preserve_solid_backfaces: false,
         transparent: !unlit && weight > 0.,
         opacity_animated: false,
         transmissive: !unlit && weight > 0.,
@@ -1718,7 +1803,7 @@ impl ImageDecoders {
         for handle in std::mem::take(&mut self.handles) {
             let result = handle
                 .join()
-                .unwrap_or_else(|_| Err(anyhow::anyhow!("image decoder worker panicked")));
+                .unwrap_or_else(|panic| Err(crate::failure::panicked("image decoder worker", panic)));
             if let Err(error) = result {
                 failures.push(error);
             }
@@ -2167,7 +2252,7 @@ fn compact_decoded_roundtrip() {
 #[cfg(test)]
 #[test]
 fn missing_sampled_images_substitute_but_corrupt_images_and_ies_refuse() -> Result<()> {
-    let renderer = pollster::block_on(Renderer::create(|_| Ok(true), true))?;
+    let renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
     let root = std::env::temp_dir().join(format!("vork-missing-images-{}", std::process::id()));
     std::fs::create_dir_all(&root)?;
     let collector = crate::warnings::Collector::default();
@@ -2568,7 +2653,7 @@ pub(crate) fn openpbr_values(
             .with_context(|| format!("material {name}: unknown image {image}"))?;
         // The file default decodes PNG/JPEG as sRGB; data inputs need linear values.
         ensure!(
-            p.kind == OpenPbrKind::Color3 || !image_def.is_srgb(),
+            p.kind == OpenPbrKind::Color3 || (!image_def.is_srgb() && matches!(image_def.color_space,None|Some(vork_scene::v2::ColorSpace::NonColor|vork_scene::v2::ColorSpace::LinearRec709))),
             "material {name}: {input} reads data, so image {image} needs color_space \"Non-Color\""
         );
         let channel = if p.kind == OpenPbrKind::Float { 0 } else { CHANNEL_RGB };
@@ -2646,6 +2731,7 @@ fn openpbr_pending(
         taps: values.builder.taps,
         alpha_mask: false,
         double_sided: false,
+        preserve_solid_backfaces: true,
         transparent: values.transmissive,
         opacity_animated: animated.contains("geometry_opacity") || animated.contains("alpha_cutoff"),
         transmissive: values.transmissive,
@@ -2656,7 +2742,10 @@ fn openpbr_pending(
         shading: values.shading,
         response_program: 0,
         response_animated: if animated.contains("specular_roughness_anisotropy") {FEATURE_ANISOTROPY} else {0}
-            | if animated.contains("thin_film_weight") {FEATURE_FILM} else {0},
+            | if animated.contains("coat_roughness_anisotropy") {FEATURE_COAT_ANISOTROPY} else {0}
+            | if animated.contains("thin_film_weight") {FEATURE_FILM} else {0}
+            | if animated.contains("subsurface_weight") {FEATURE_SUBSURFACE} else {0}
+            | if animated.contains("specular_weight") {FEATURE_WEIGHTED_IOR} else {0},
         unique: name.filter(|_| !animated.is_empty()).map(str::to_owned),
     };
     pending.coverage(
@@ -2684,7 +2773,7 @@ pub(crate) fn input_slang() -> [(&'static str, String); 2] {
          static const uint MATERIAL_OPACITY={}u;static const uint MATERIAL_OPACITY_WORD={}u;\n\
          static const uint MATERIAL_CUTOFF={}u;static const uint MATERIAL_CUTOFF_WORD={}u;\n\
          static const uint MATERIAL_THIN={}u;static const uint MATERIAL_THIN_WORD={}u;static const uint MATERIAL_TRANSMISSION={}u;static const uint MATERIAL_TRANSMISSION_WORD={}u;\n\
-         static const uint MATERIAL_COAT_NORMAL={}u;static const uint MATERIAL_COAT_NORMAL_WORD={}u;static const uint MATERIAL_NORMAL={}u;static const uint MATERIAL_NORMAL_WORD={}u;static const uint MATERIAL_TANGENT={}u;static const uint MATERIAL_TANGENT_WORD={}u;static const uint MATERIAL_OCCLUSION={}u;\n",
+         static const uint MATERIAL_COAT_NORMAL={}u;static const uint MATERIAL_COAT_NORMAL_WORD={}u;static const uint MATERIAL_NORMAL={}u;static const uint MATERIAL_NORMAL_WORD={}u;static const uint MATERIAL_TANGENT={}u;static const uint MATERIAL_TANGENT_WORD={}u;static const uint MATERIAL_COAT_TANGENT={}u;static const uint MATERIAL_COAT_TANGENT_WORD={}u;static const uint MATERIAL_OCCLUSION={}u;\n",
         constants::MATERIAL_INPUT_WORDS / 4,
         VALUE_WORDS / 4,
         index("geometry_opacity"),
@@ -2700,6 +2789,7 @@ pub(crate) fn input_slang() -> [(&'static str, String); 2] {
         word("geometry_normal"),
         index("geometry_tangent"),
         word("geometry_tangent"),
+        index("geometry_coat_tangent"),word("geometry_coat_tangent"),
         OCCLUSION_INPUT
     );
     let mut s = String::from(
@@ -2717,6 +2807,7 @@ pub(crate) fn input_slang() -> [(&'static str, String); 2] {
         };
         let line = match p.name {
             "specular_roughness_anisotropy" => format!("V.has_anisotropy ? {line} : 0."),
+            "coat_roughness_anisotropy" => format!("V.has_coat_anisotropy ? {line} : 0."),
             "thin_film_weight" => format!("V.has_film ? {line} : 0."),
             _ => line,
         };
@@ -2736,11 +2827,12 @@ pub(crate) fn input_slang() -> [(&'static str, String); 2] {
         };
         let value=match p.name {
             "specular_roughness_anisotropy"=>format!("V.has_anisotropy ? {value} : 0."),
+            "coat_roughness_anisotropy"=>format!("V.has_coat_anisotropy ? {value} : 0."),
             "thin_film_weight"=>format!("V.has_film ? {value} : 0."),_=>value,
         };
         writeln!(camera,"    c.{}={value};",p.name).unwrap();
     }
-    writeln!(camera,"    // Runtime sockets share one texture evaluator; no per-input lighting or shader variants.\n    [loop] for(uint input=0u;input<=MATERIAL_OPACITY;input++) {{\n        let b=material_byte<V>(r,input);if((b&REG_MATERIAL_TAP_INDEX_MASK)==0u) {{continue;}}\n        if((input=={}u && !V.has_anisotropy) || (input=={}u && !V.has_film)) {{continue;}}\n        let texel=material_sample(material_tap(r,b&REG_MATERIAL_TAP_INDEX_MASK,m));\n        let scalar=texel[min(b>>28u,3u)];let color=select((b>>28u)==4u,texel.rgb,float3(scalar));\n        switch(input) {{",index("specular_roughness_anisotropy"),index("thin_film_weight")).unwrap();
+    writeln!(camera,"    // Runtime sockets share one texture evaluator; no per-input lighting or shader variants.\n    [loop] for(uint input=0u;input<=MATERIAL_OPACITY;input++) {{\n        let b=material_byte<V>(r,input);if((b&REG_MATERIAL_TAP_INDEX_MASK)==0u) {{continue;}}\n        if((input=={}u && !V.has_anisotropy) || (input=={}u && !V.has_coat_anisotropy) || (input=={}u && !V.has_film)) {{continue;}}\n        let texel=material_sample(material_tap(r,b&REG_MATERIAL_TAP_INDEX_MASK,m));\n        let scalar=texel[min(b>>28u,3u)];let color=select((b>>28u)==4u,texel.rgb,float3(scalar));\n        switch(input) {{",index("specular_roughness_anisotropy"),index("coat_roughness_anisotropy"),index("thin_film_weight")).unwrap();
     for (i,p) in OPENPBR.iter().enumerate().filter(|(_,p)| p.closure) {
         let multiplier=match p.kind {OpenPbrKind::Float=>"scalar",OpenPbrKind::Color3=>"color",_=>continue};
         writeln!(camera,"        case {i}u:c.{}*={multiplier};break;",p.name).unwrap();
@@ -2779,8 +2871,9 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn mip_chain_preserves_odd_extent_premultiplied_coverage() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let (pipelines,sampler)=mip_resources(&r);
         let pipeline=&pipelines[2];
         let readback=crate::gpu_memory::buffer(&r.device,&wgpu::BufferDescriptor {
@@ -2818,10 +2911,36 @@ mod tests {
     }
 
     #[test]
+    fn gltf_ior_sentinel_is_refused_before_shading() -> Result<()> {
+        // The no-op device runs the actual importer without opening a GPU.
+        let renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        let render_images = Default::default();
+        let mut textures = TextureInstaller::new(&renderer, &render_images);
+        let witness: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/gltf-conventions/s15/witness.gltf"
+        ))?;
+        for ior in [0., 0.5, 1., 1.33, 1.5, 2.42] {
+            let mut input = witness.clone();
+            input["materials"][0]["extensions"]["KHR_materials_ior"]["ior"] = serde_json::json!(ior);
+            let doc = gltf::Gltf::from_slice(&serde_json::to_vec(&input)?)?.document;
+            let material = doc.materials().next().unwrap();
+            let result = install_gltf(&mut textures, &doc, Some(&material), &[], &[]);
+            if ior < 1. {
+                let error = result.err().expect("glTF IOR sentinel must not enter the shading model");
+                assert_eq!(error.to_string(), "KHR_materials_ior: infinite or sub-unit IOR is unsupported; use a finite ior of at least 1; see vork help upgrade");
+            } else {
+                assert_eq!(result?.record.get("specular_ior"), &[ior]);
+            }
+        }
+        let doc = gltf::Gltf::from_slice(br#"{"asset":{"version":"2.0"}}"#)?.document;
+        assert_eq!(install_gltf(&mut textures, &doc, None, &[], &[])?.record.get("specular_ior"), &[1.5]);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn gltf_alpha_modes_keep_coverage_and_distinct_residency() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let r = crate::test_renderer()?;
         let render_images = Default::default();
         let mut textures = TextureInstaller::new(&r, &render_images);
         let doc = gltf::Gltf::from_slice(
@@ -2901,6 +3020,130 @@ mod tests {
             ))
         );
     }
+    #[test]
+    fn sidedness_changes_material_data_without_changing_shader_features() -> Result<()> {
+        // Native table and authored-program sidedness is material data, not code.
+        let native_scene = scene(serde_json::json!({
+            "paint":{}, "front":{"double_sided":false}, "both":{"double_sided":true}}));
+        let front = openpbr_pending(&native_scene, Some("front"), &Default::default(), values(&native_scene, "front")?).finish();
+        let both = openpbr_pending(&native_scene, Some("both"), &Default::default(), values(&native_scene, "both")?).finish();
+        assert_eq!(front.features, both.features);
+        assert_eq!(PendingMaterial::program(1, false).finish().features,
+                   PendingMaterial::program(1, true).finish().features);
+
+        // Adding a material-less glTF must not introduce a single-sided variant.
+        let renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        let render_images = Default::default();
+        let mut textures = TextureInstaller::new(&renderer, &render_images);
+        let mut input: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/gltf-conventions/s06/witness.gltf"))?;
+        let document = gltf::Gltf::from_slice(&serde_json::to_vec(&input)?)?.document;
+        let missing = install_gltf(&mut textures, &document, None, &[], &[])?;
+        assert_eq!(missing.record.tag[2] & FLAG_DOUBLE_SIDED, 0);
+        let features = missing.finish().features;
+        input["materials"] = serde_json::json!([{"doubleSided":true}]);
+        let document = gltf::Gltf::from_slice(&serde_json::to_vec(&input)?)?.document;
+        let material = document.materials().next().unwrap();
+        let both = install_gltf(&mut textures, &document, Some(&material), &[], &[])?;
+        assert_ne!(both.record.tag[2] & FLAG_DOUBLE_SIDED, 0);
+        assert_eq!(features, both.finish().features);
+        Ok(())
+    }
+
+    #[test]
+    fn gltf_missing_material_uses_single_sided_defaults() -> Result<()> {
+        let renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        let render_images = Default::default();
+        let mut textures = TextureInstaller::new(&renderer, &render_images);
+        let original: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/gltf-conventions/s06/witness.gltf"))?;
+        let document = gltf::Gltf::from_slice(&serde_json::to_vec(&original)?)?.document;
+        let missing = install_gltf(&mut textures, &document, None, &[], &[])?;
+        let default_key = missing.key();
+        assert!(!missing.double_sided);
+        assert!(!missing.preserve_solid_backfaces);
+        assert_eq!(missing.record.tag[2] & FLAG_DOUBLE_SIDED, 0);
+        for material in [serde_json::json!({}), serde_json::json!({"doubleSided":false}),
+                         serde_json::json!({"doubleSided":true})] {
+            let double_sided = material.get("doubleSided").and_then(|v|v.as_bool()).unwrap_or(false);
+            let mut input = original.clone();
+            input["materials"] = serde_json::json!([material]);
+            input["meshes"][0]["primitives"][0]["material"] = serde_json::json!(0);
+            let document = gltf::Gltf::from_slice(&serde_json::to_vec(&input)?)?.document;
+            let material = document.materials().next().unwrap();
+            let pending = install_gltf(&mut textures, &document, Some(&material), &[], &[])?;
+            assert_eq!(pending.double_sided, double_sided);
+            assert!(!pending.preserve_solid_backfaces);
+            assert_eq!(pending.record.tag[2] & FLAG_DOUBLE_SIDED != 0, double_sided);
+            if !double_sided { assert_eq!(pending.key(), default_key); }
+        }
+        let native: ::vork_scene::v2::Material = serde_json::from_value(serde_json::json!({}))?;
+        assert!(native.double_sided, "native authored materials retain their own default");
+        assert!(PendingMaterial::program(1, false).finish().preserve_solid_backfaces);
+        let native_scene = scene(serde_json::json!({"paint":{"double_sided":false}}));
+        assert!(openpbr_pending(&native_scene, Some("paint"), &Default::default(), values(&native_scene, "paint")?).finish().preserve_solid_backfaces);
+        // The volume extension overrides surface sidedness, independently of
+        // transmission weight; unlit ignores the other material extensions.
+        for thickness in [0., 1.] {
+            for transmission in [0., 1.] {
+                for unlit in [false, true] {
+                    let mut input = original.clone();
+                    input["extensionsUsed"] = serde_json::json!(["KHR_materials_volume", "KHR_materials_transmission"]);
+                    let mut extensions = serde_json::json!({
+                        "KHR_materials_volume":{"thicknessFactor":thickness},
+                        "KHR_materials_transmission":{"transmissionFactor":transmission}});
+                    if unlit {
+                        extensions["KHR_materials_unlit"] = serde_json::json!({});
+                        input["extensionsUsed"].as_array_mut().unwrap().push("KHR_materials_unlit".into());
+                    }
+                    input["materials"] = serde_json::json!([{"doubleSided":false,"extensions":extensions}]);
+                    input["meshes"][0]["primitives"][0]["material"] = serde_json::json!(0);
+                    let document = gltf::Gltf::from_slice(&serde_json::to_vec(&input)?)?.document;
+                    let material = document.materials().next().unwrap();
+                    let pending = install_gltf(&mut textures, &document, Some(&material), &[], &[])?;
+                    let both = thickness > 0. && !unlit;
+                    assert_eq!(pending.double_sided, both);
+                    assert!(!pending.preserve_solid_backfaces);
+                    assert_eq!(pending.record.tag[2] & FLAG_DOUBLE_SIDED != 0, both);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn gltf_surface_tint_and_volume_absorption_have_independent_inputs() -> Result<()> {
+        let renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        let render_images = Default::default();
+        let mut textures = TextureInstaller::new(&renderer, &render_images);
+        for witness in [
+            include_str!("../tests/fixtures/gltf-conventions/s09/witness.gltf"),
+            include_str!("../tests/fixtures/gltf-conventions/s10/witness.gltf"),
+        ] {
+            let mut input: serde_json::Value = serde_json::from_str(witness)?;
+            for base in [[1., 0., 0., 1.], [0.25, 0.5, 0.75, 1.]] {
+                input["materials"][0]["pbrMetallicRoughness"]["baseColorFactor"] = serde_json::json!(base);
+                for absorption in [None, Some([1., 1., 1.]), Some([0.5, 0.75, 0.25])] {
+                    let extensions = input["materials"][0]["extensions"].as_object_mut().unwrap();
+                    extensions.remove("KHR_materials_volume");
+                    if let Some(color) = absorption {
+                        extensions.insert("KHR_materials_volume".into(), serde_json::json!({
+                            "thicknessFactor": 1, "attenuationDistance": 2, "attenuationColor": color
+                        }));
+                    }
+                    let doc = gltf::Gltf::from_slice(&serde_json::to_vec(&input)?)?.document;
+                    let material = doc.materials().next().unwrap();
+                    let installed = install_gltf(&mut textures, &doc, Some(&material), &[], &[])?;
+                    assert_eq!(installed.record.get("base_color"), &base[..3]);
+                    assert_eq!(installed.record.get("transmission_color"), &absorption.unwrap_or([1.; 3]));
+                    assert_eq!(installed.record.get("transmission_depth"), &[if absorption.is_some() {2.} else {0.}]);
+                    assert_ne!(installed.record.tag[2] & constants::FLAG_VERTEX_COLOR, 0);
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn gltf_source_uv_indices_resolve_independently_of_packed_channels() -> Result<()> {
         let mut sources = GltfUvSources::default();
@@ -3004,6 +3247,37 @@ mod tests {
     }
 
     #[test]
+    fn null_connections_omit_only_proven_refracting_solids() {
+        let material=|transmission:bool,thin:bool,ior:f32,weight:f32,dispersion:f32,program:bool,animated:bool,mapped:Option<&str>| {
+            let mut pending=PendingMaterial::program(u32::from(program),false);
+            let mut builder=RecordBuilder::openpbr();
+            builder.set("geometry_thin_walled",&[f32::from(thin)]);builder.set("specular_ior",&[ior]);
+            builder.set("specular_weight",&[weight]);builder.set("transmission_dispersion_scale",&[dispersion]);
+            pending.record.values=builder.record.values;pending.transmissive=transmission;
+            if animated {pending.unique=Some("animated".into());}
+            if let Some(field)=mapped {pending.record.inputs[param(field).0]|=1;}
+            let fact=pending.null_connection();
+            assert_eq!(pending.finish().null_connection,fact);
+            fact
+        };
+        // Without transmission nothing passes, whatever else is unknown.
+        assert!(!material(false,false,1.,0.,1.,true,true,Some("specular_ior")));
+        assert!(!material(false,true,1.5,1.,0.,false,false,None));
+        // A constant refracting solid blocks; every unknown keeps the evaluation.
+        assert!(!material(true,false,1.5,1.,0.,false,false,None));
+        assert!(!material(true,false,0.75,1.,0.,false,false,None));
+        assert!(material(true,false,1.,1.,0.,false,false,None));
+        assert!(material(true,false,1.5,0.5,0.,false,false,None));
+        assert!(material(true,false,1.5,1.,0.25,false,false,None));
+        assert!(material(true,true,1.5,1.,0.,false,false,None));
+        assert!(material(true,false,1.5,1.,0.,true,false,None));
+        assert!(material(true,false,1.5,1.,0.,false,true,None));
+        for field in ["geometry_thin_walled","specular_ior","specular_weight","transmission_dispersion_scale"] {
+            assert!(material(true,false,1.5,1.,0.,false,false,Some(field)),"{field}");
+        }
+    }
+
+    #[test]
     fn previs_scalar_alpha_changes_only_its_material_slot() -> Result<()> {
         let mut s=scene(serde_json::json!({
             "opaque":{"inputs":{}},
@@ -3088,6 +3362,29 @@ mod tests {
         );
     }
     #[test]
+    fn gltf_closure_state_is_independent_of_vertex_colour_multiplication() {
+        for imported in [false,true] {
+            for transmissive in [false,true] {
+                for unlit in [false,true] {
+                    let mut material=PendingMaterial::program(0,false);
+                    material.transmissive=transmissive;
+                    material.record.tag[2] |= if imported {constants::FLAG_VERTEX_COLOR} else {0}
+                        | if unlit {vork_slang::registry::FLAG_GLTF_UNLIT} else {0};
+                    let needed=imported && (transmissive || unlit);
+                    assert_eq!(material.gltf_tint(),needed);
+                    assert_eq!(material.clone().finish().features & FEATURE_GLTF_TINT != 0,needed);
+                    // Even default-white glTF colour must retain its multiply:
+                    // interpolated barycentric weights need not sum to exactly one.
+                    assert_eq!(material.record.tag[2] & constants::FLAG_VERTEX_COLOR != 0,imported);
+                    if imported && transmissive {
+                        assert!(material.record.screen_exit_needs_color(true));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn specialization_keeps_dynamic_and_program_capabilities() {
         let s = scene(serde_json::json!({
             "paint": {},
@@ -3117,7 +3414,7 @@ mod tests {
         program.integrate_opacity(Some(vork_scene::Opacity::Coverage),false,false);
         let program = program.finish().features;
         let required =
-            FEATURE_COAT | FEATURE_FUZZ | FEATURE_TINT | FEATURE_MASK | FEATURE_SIDED | 3;
+            FEATURE_COAT | FEATURE_FUZZ | FEATURE_TINT | FEATURE_MASK | 3;
         assert_eq!(program & required, required);
         assert_eq!(program & FEATURE_LOBES, 0);
         assert_eq!(program & (FEATURE_ANISOTROPY | FEATURE_FILM), FEATURE_ANISOTROPY | FEATURE_FILM);
@@ -3132,7 +3429,7 @@ mod tests {
         tracked.unique = Some("paint".into());
         assert_eq!(
             tracked.finish().features & required,
-            required & !(FEATURE_MASK | FEATURE_SIDED)
+            required & !FEATURE_MASK
         );
     }
 
@@ -3247,8 +3544,33 @@ mod tests {
             let animated=if tracked {["subsurface_weight".to_owned()].into_iter().collect()} else {Default::default()};
             let values=openpbr_values(&scene,Some(name),&animated,|_|Ok(0)).unwrap();
             assert_eq!(values.capabilities.subsurface,expected);
-
+            let material=openpbr_pending(&scene,Some(name),&animated,values).finish();
+            assert_eq!(material.subsurface,expected,"{name}, tracked {tracked}");
+            assert_eq!(material.features & (FEATURE_SUBSURFACE|FEATURE_HAIR),0,"scene unions are never raster keys");
+            assert_eq!(installed_features(&[material]) & FEATURE_SUBSURFACE != 0,expected,"{name}, tracked {tracked}");
         }
+    }
+
+    #[test]
+    fn installed_features_are_the_union_of_every_material() {
+        // An unproven program keeps every lobe; its proofs remove them.
+        let unproven=PendingMaterial::program(1,false);
+        let mut proven=unproven.clone();proven.response_program=0;
+        let mut fibre=proven.clone();fibre.hair=true;
+        let mut coated=proven.clone();coated.response_program=FEATURE_COAT;
+        assert!(unproven.clone().finish().subsurface);
+        assert!(!proven.clone().finish().subsurface);
+        let plain=installed_features(&[proven.clone().finish()]);
+        assert_eq!(plain & (FEATURE_SUBSURFACE|FEATURE_HAIR|FEATURE_COAT),0);
+        assert_eq!(plain & (FEATURE_SPECIALIZED|FEATURE_INSTALLED),FEATURE_SPECIALIZED|FEATURE_INSTALLED);
+        // No material's own key claims to be the scene's.
+        assert_eq!(proven.clone().finish().features & FEATURE_INSTALLED,0);
+        let union=installed_features(&[proven.clone().finish(),fibre.finish(),coated.finish(),unproven.finish()]);
+        assert_eq!(union & (FEATURE_SUBSURFACE|FEATURE_HAIR|FEATURE_COAT),FEATURE_SUBSURFACE|FEATURE_HAIR|FEATURE_COAT);
+        // Order never changes the key: the same scene always gets the same kernel.
+        let mut reversed=[proven.clone().finish(),PendingMaterial::program(1,false).finish()];
+        let forward=installed_features(&reversed);reversed.reverse();
+        assert_eq!(forward,installed_features(&reversed));
     }
 
     #[test]
@@ -3273,10 +3595,63 @@ mod tests {
         assert_eq!(anisotropy_track.finish().features & (FEATURE_ANISOTROPY|FEATURE_FILM),FEATURE_ANISOTROPY);
         let mut film_track=plain;film_track.response_animated=FEATURE_FILM;
         assert_eq!(film_track.finish().features & (FEATURE_ANISOTROPY|FEATURE_FILM),FEATURE_FILM);
-        for (input,capability) in [("specular_roughness_anisotropy",FEATURE_ANISOTROPY),("thin_film_weight",FEATURE_FILM)] {
+        for (input,capability) in [("specular_roughness_anisotropy",FEATURE_ANISOTROPY),("coat_roughness_anisotropy",FEATURE_COAT_ANISOTROPY),("thin_film_weight",FEATURE_FILM)] {
             let mut pending=PendingMaterial::program(0,false);
             pending.record.values[value_word(param(input).0)]=0.5;
             assert_ne!(pending.finish().features&capability,0);
+        }
+    }
+
+    #[test]
+    fn coat_anisotropy_capability_is_independent_of_base() {
+        let plain=PendingMaterial::program(0,false);
+        let mut base=plain.clone();base.record.values[value_word(param("specular_roughness_anisotropy").0)]=0.7;
+        assert_eq!(base.finish().features & FEATURE_COAT_ANISOTROPY,0);
+        for source in 0..4 {
+            let mut coat=plain.clone();
+            match source {
+                0 => coat.record.values[value_word(param("coat_roughness_anisotropy").0)]=0.7,
+                1 => coat.response_animated=FEATURE_COAT_ANISOTROPY,
+                2 => coat.response_program=FEATURE_COAT_ANISOTROPY,
+                _ => coat.record.inputs[param("coat_roughness_anisotropy").0]=1,
+            }
+            let mask=FEATURE_ANISOTROPY|FEATURE_COAT_ANISOTROPY;
+            assert_eq!(coat.finish().features & mask,mask,"source {source}");
+        }
+    }
+
+    #[test]
+    fn unit_ior_proof_reserves_nonunit_bound_animated_and_unknown_weights() {
+        let plain=PendingMaterial::program(0,false);
+        assert!(!plain.weighted_ior());
+        for weight in [0.,0.25,0.999,2.] {
+            let mut material=plain.clone();material.record.values[value_word(param("specular_weight").0)]=weight;
+            assert!(material.weighted_ior());
+        }
+        let mut bound=plain.clone();bound.record.inputs[param("specular_weight").0]=1;
+        assert!(bound.weighted_ior());
+        let mut animated=plain.clone();animated.response_animated=FEATURE_WEIGHTED_IOR;
+        assert!(animated.weighted_ior());
+        let mut color_track=plain;color_track.unique=Some("paint".into());
+        assert!(!color_track.weighted_ior());
+        let mut program=PendingMaterial::program(1,false);
+        assert!(program.weighted_ior());
+        program.response_program=0;
+        assert!(!program.weighted_ior());
+    }
+
+    #[test]
+    fn coat_frame_parameters_use_spec_metadata_and_defaults() {
+        let (_, anisotropy)=param("coat_roughness_anisotropy");
+        assert_eq!(anisotropy.kind,OpenPbrKind::Float);
+        assert_eq!(anisotropy.default,&[0.]);
+        assert_eq!((anisotropy.min,anisotropy.max),(0.,1.));
+        let (_,tangent)=param("geometry_coat_tangent");
+        assert_eq!(tangent.kind,OpenPbrKind::Vector3);
+        assert_eq!(tangent.default_text,"unperturbed tangent");
+        for inputs in [serde_json::json!({"coat_roughness_anisotropy":0}),serde_json::json!({"coat_roughness_anisotropy":1,"geometry_coat_tangent":[0,1,0]})] {
+            let s=scene(serde_json::json!({"paint":{"inputs":inputs}}));
+            assert!(values(&s,"paint").is_ok());
         }
     }
 
@@ -3288,7 +3663,7 @@ mod tests {
                 "sRGB data image",
             ),
             (
-                serde_json::json!({"coat_roughness_anisotropy":0.5}),
+                serde_json::json!({"transmission_scatter":[0.5,0.5,0.5]}),
                 "parameter vork does not shade",
             ),
             (
@@ -3403,6 +3778,7 @@ mod tests {
             taps: Vec::new(),
             alpha_mask: false,
             double_sided: false,
+            preserve_solid_backfaces: true,
             transparent: false,
             transmissive: false,
             lobes: false,
@@ -3416,6 +3792,10 @@ mod tests {
             unique: unique.map(str::to_owned),
         };
         assert_ne!(pending(None).key(), pending(Some("paint")).key());
+        let native = pending(None);
+        let mut imported = native.clone();
+        imported.preserve_solid_backfaces = false;
+        assert_ne!(native.key(), imported.key());
     }
     #[test]
     fn material_tracks_read_the_installed_record() {
@@ -3605,8 +3985,9 @@ mod source_capacity_tests {
 mod descriptor_capacity_tests {
     use super::*;
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn material_tables_sample_beyond_1024_textures_and_64_samplers() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let images=Default::default();
         let mut installer=TextureInstaller::new(&r,&images);
         let samplers:Vec<_>=(0..65).map(|i|r.device.create_sampler(&wgpu::SamplerDescriptor {lod_min_clamp:i as f32/128.,lod_max_clamp:32.,..Default::default()})).collect();
@@ -3649,8 +4030,9 @@ mod descriptor_capacity_tests {
 
 #[cfg(test)]
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn dielectric_spills_preserve_records_and_return_every_slot() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(());};
+    let r = crate::test_renderer()?;
     let images=Default::default();
     let mut installer=TextureInstaller::new(&r,&images);
     let material_layout=r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:None,entries:&crate::pipelines::material_entries(false)});
@@ -3668,7 +4050,7 @@ fn dielectric_spills_preserve_records_and_return_every_slot() -> Result<()> {
     PathOccupancy<8> state={};uint good=1u;let count=17u+id.x;
     for(uint repeat=0u;repeat<4u;repeat++) {
         for(uint i=0u;i<count;i++) {
-            var b=path_air();b.object=id.x*64u+i;b.ior=1.+float(i)/64.;
+            var b=path_air();b.object=id.x*64u+i;b.ior=1.+float(i)/64.;b.reference_ior=b.ior;
             if(!state.cross<EqualBoundaryPriority>(b,true)) {good=0u;break;}
         }
         if(state.count==count) {

@@ -30,8 +30,8 @@ import surface_lighting;
 import vork_sampling;
 import camera_ray;
 import implicit_scene;
-#ifdef VORK_SPATIAL_ENVIRONMENT
-import spatial_environment;
+#ifdef VORK_CAMERA_ENVIRONMENT
+import camera_environment;
 #endif
 
 #if defined(VORK_CAMERA_CLASSIFY)
@@ -47,7 +47,7 @@ import rays;
 
 import decoupled_slots;
 import reflection_bsdf;
-[[vk::binding(13,4)]] RWStructuredBuffer<uint> nonfinite : register(u27);
+[[vk::binding(13,4)]] RWStructuredBuffer<uint> nonfinite : register(u28);
 import output_diagnostics;
 
 #ifdef VORK_CAMERA_SHADES
@@ -61,6 +61,8 @@ import forward;
 #endif
 
 struct CameraPolicy : IVariant {
+    // Static-only policy: avoid Slang 2026.21 synthesizing a zero initializer.
+    __init() {}
     static const bool layered = true;
     static const bool metal = true;
 #ifdef VORK_RAY_BINDINGS
@@ -83,10 +85,10 @@ struct CameraPolicy : IVariant {
     static const bool has_coat = true;
     static const bool has_fuzz = true;
     static const bool has_anisotropy = true;
+    static const bool has_coat_anisotropy = true;
     static const bool has_film = true;
     static const bool has_tint = true;
     static const bool has_mask = true;
-    static const bool has_sided = true;
     static const bool has_punctual = true;
     static const bool has_finite = true;
     static const bool has_rectangle = true;
@@ -100,6 +102,13 @@ struct CameraPolicy : IVariant {
     static const bool has_lit = true;
     static const uint light_types = 15u;
     static const bool has_implicit_geometry = true;
+    static const bool has_weighted_ior = true;
+    static const bool has_gltf_tint = true;
+    static const bool has_null_connection = true;
+    static const bool has_camera_interior = true;
+    static const bool has_subsurface = true;
+    static const bool has_hair = true;
+    static const bool installed = false;
 };
 
 #define VORK_CAMERA_SINGLE (camera_config.samples==1u)
@@ -120,9 +129,9 @@ uint visibility_samples() {return single_sample ? 1u : frame.sampling.w;}
 // geometry and retained evaluation tables, group 4 the colour, world and receiver images.
 #ifdef VORK_METAL
 // Metal binds a resource array through an argument buffer (hit_geometry.slang).
-[[vk::binding(0,3)]] ParameterBlock<RayHitBuffersTable> camera_hit_buffers : register(b18);
+[[vk::binding(0,3)]] ParameterBlock<RayHitBuffersTable> camera_hit_buffers : register(b19);
 #else
-[[vk::binding(0,3)]] StructuredBuffer<uint> camera_hit_buffers[REG_RAY_HIT_BUFFERS] : register(t18);
+[[vk::binding(0,3)]] StructuredBuffer<uint> camera_hit_buffers[REG_RAY_HIT_BUFFERS] : register(t19);
 #endif
 [[vk::binding(0,4)]] [[vk::image_format("rgba32f")]] RWTexture2D<float4> hdr : register(u8);
 [[vk::binding(1,4)]] Texture2DArray<uint4> environment_source : register(t9);
@@ -137,10 +146,10 @@ uint visibility_samples() {return single_sample ? 1u : frame.sampling.w;}
 // AO normals retain the receiver object in w for its geometry uncertainty bound.
 [[vk::binding(5,4)]] [[vk::image_format("rgba32f")]] WTexture2D<float4> ao_normals : register(u12);
 // Coverage- and transmittance-weighted FP32 RGB, allocated only for indirect replacement.
-[[vk::binding(6,4)]] RWStructuredBuffer<float> diffuse_response : register(u24);
+[[vk::binding(6,4)]] RWStructuredBuffer<float> diffuse_response : register(u25);
 // First record: sequence length. Then two uint4 words per visibility pass,
 // the second holding its unit-disk lens point.
-[[vk::binding(7,4)]] StructuredBuffer<uint4> camera_samples : register(t25);
+[[vk::binding(7,4)]] StructuredBuffer<uint4> camera_samples : register(t26);
 float2 sample_lens(uint sample) {
     return camera_sample_lens(camera_samples,sample);
 }
@@ -223,6 +232,14 @@ uint lighting_sample() {return shading_sample==0xffffffffu ? 0xffffffffu : expos
 float2 visibility_lattice(uint index) {
     return .5+asfloat(camera_samples[index*2u+3u].zw);
 }
+#ifdef VORK_CAMERA_ENVIRONMENT
+export float4 camera_environment_image(uint address,float2 uv) {
+    return environment_image_sample(environment_images,uv,
+        uint2(material_words[address],material_words[address+1u]),
+        uint3(material_words[address+2u],material_words[address+3u],material_words[address+4u]),
+        material_words[address+5u]);
+}
+#endif
 // The camera background seen through image position `position` with lens offset `lens`.
 float4 camera_background_at(float2 position, uint2 size, float2 lens) {
     var background=float4(frame.background.rgb,1.-frame.flags.z);
@@ -230,8 +247,8 @@ float4 camera_background_at(float2 position, uint2 size, float2 lens) {
     // constant World already lives in frame.background and has no texture.
     if (frame.environment.w>0. && frame.environment.x>0.) {
         float3 origin;float3 direction;camera_ray(position,size,lens,origin,direction);
-#ifdef VORK_SPATIAL_ENVIRONMENT
-        background.rgb=primary_environment(mul(float4(origin,0.),frame.environment_rotation).xyz,normalize(mul(float4(direction,0.),frame.environment_rotation).xyz),frame.scene.x)*frame.environment.x*frame.environment_color.rgb;
+#ifdef VORK_CAMERA_ENVIRONMENT
+        background.rgb=primary_environment(frame.medium.z,mul(float4(origin,0.),frame.environment_rotation).xyz,normalize(mul(float4(direction,0.),frame.environment_rotation).xyz),frame.scene.x)*frame.environment.x*frame.environment_color.rgb;
 #else
         let uv=environment_uv(direction,frame.environment_rotation);
         background.rgb=environment_radiance(environment_source,uv,uint(frame.environment_color.w))*frame.environment.x*frame.environment_color.rgb;
@@ -341,14 +358,14 @@ Response slot_radiance<V:IVariant>(uint at, out float3 world, out float3 geometr
 }
 // Clear records that have no eligible reflection in this composition.
 void clear_slot_reflection<V:IVariant>(uint at,SlotLayout layout) {
-    if (V.has_reflections && frame.projection.z==REG_REFLECTIONS_RAY) {reflection_records[5u][layout.reflection(at)]=packHalf2x16(float2(0.,0.));}
+    if (V.has_reflections && frame.projection.z==REG_REFLECTIONS_RAY) {reflection_records[5u][layout.reflection(at,direct_keys)]=packHalf2x16(float2(0.,0.));}
 }
 // Keep each reflection lobe with its coverage mask. Post tracing reads the
 // record only for indices this triangle actually covered. The lobe's weight
 // carries the slot's mean transmittance (exact where it is uniform over the slot).
 bool slot_reflection<V:IVariant>(uint at,SlotLayout layout,float3 world,float3 geometric,Response response,uint object,float transmittance) {
     if (!V.has_reflections || frame.projection.z!=REG_REFLECTIONS_RAY) {return false;}
-    let base=layout.reflection(at);
+    let base=layout.reflection(at,direct_keys);
     let payload=reflection_payload(response.reflected*transmittance,response.roughness,object);
     reflection_records[5u][base]=packHalf2x16(payload);
     if (!surface_reflection_traceable(payload)) {return false;}
@@ -358,11 +375,16 @@ bool slot_reflection<V:IVariant>(uint at,SlotLayout layout,float3 world,float3 g
     reflection_records[3u][base]=asuint(dot(geometric,world-frame.eye.xyz));
     reflection_records[4u][base]=packHalf2x16(encode_octahedron(response.normal));
     reflection_bsdf_set_environment(response.reflection,reflection_bsdf_environment(response.reflection)*transmittance);
-    for(uint i=0u;i<REG_REFLECTION_BSDF_VECTORS;i++) {
+    // The last vector shares the two otherwise unused BSDF components.
+    // Every live component still makes exactly the same half-float round trip.
+    for(uint i=0u;i<REG_REFLECTION_BSDF_VECTORS-1u;i++) {
         var value=response.reflection.data[i];if(i==8u) {value.xyz*=transmittance;}
+        if(i==9u) {value.w=response.reflection.data[11].z;}
+        if(i==10u) {value.w=response.reflection.data[11].w;}
         reflection_records[6u+i*2u][base]=packHalf2x16(value.xy);
         reflection_records[7u+i*2u][base]=packHalf2x16(value.zw);
     }
+    reflection_records[REG_VISIBILITY_REFLECTION_WORDS-1u][base]=packHalf2x16(response.reflection.data[11].xy);
     return true;
 }
 #endif
@@ -395,7 +417,7 @@ uint retained_coverage(uint at, SlotLayout layout, out float2 centroid, out floa
     return slot_coverage(at,layout,centroid,lens);
 #else
     // Classification already computed these moments for every occupied slot.
-    let record=layout.record(at)*REG_CAMERA_EVALUATION_METADATA_WORDS;
+    let record=layout.record(at,direct_keys)*REG_CAMERA_EVALUATION_METADATA_WORDS;
     centroid=asfloat(uint2(evaluation_metadata[record+3u],evaluation_metadata[record+4u]));
     lens=asfloat(uint2(evaluation_metadata[record+5u],evaluation_metadata[record+6u]));
     shading_footprint=asfloat(uint3(evaluation_metadata[record+7u],evaluation_metadata[record+8u],evaluation_metadata[record+9u]));
@@ -456,8 +478,8 @@ void retain_slot_coverage(uint metadata,uint count,float2 centroid,float2 lens) 
 uint evaluation_index(uint at,uint sample) {
     if(direct_evaluations()) {uint w,h;hdr.GetDimensions(w,h);return composition_pixel.y*w+composition_pixel.x;}
     uint w,h;hdr.GetDimensions(w,h);let layout=SlotLayout(w*h,visibility_samples(),camera_config.packet_pixels,camera_config.packet_first_pixel);
-    if(slot_evaluations()) {return evaluation_metadata[layout.record(at)*REG_CAMERA_EVALUATION_METADATA_WORDS+1u];}
-    let record=layout.record(at)*REG_CAMERA_EVALUATION_METADATA_WORDS;let base=evaluation_metadata[record];
+    if(slot_evaluations()) {return evaluation_metadata[layout.record(at,direct_keys)*REG_CAMERA_EVALUATION_METADATA_WORDS+1u];}
+    let record=layout.record(at,direct_keys)*REG_CAMERA_EVALUATION_METADATA_WORDS;let base=evaluation_metadata[record];
     if((evaluation_metadata[record+1u]&1u)==0u) {return base;}
     var rank=0u;for(uint word=0u;word<sample/32u;word++) {rank+=countbits(coverage_word(at,word));}
     return base+rank+countbits(coverage_word(at,sample/32u)&((1u<<(sample%32u))-1u));
@@ -486,14 +508,14 @@ bool per_sample(uint at) {
     return false;
 #else
     if(direct_evaluations() || slot_evaluations()) {return false;}
-    uint w,h;hdr.GetDimensions(w,h);return (evaluation_metadata[SlotLayout(w*h,visibility_samples(),camera_config.packet_pixels,camera_config.packet_first_pixel).record(at)*REG_CAMERA_EVALUATION_METADATA_WORDS+1u]&1u)!=0u;
+    uint w,h;hdr.GetDimensions(w,h);return (evaluation_metadata[SlotLayout(w*h,visibility_samples(),camera_config.packet_pixels,camera_config.packet_first_pixel).record(at,direct_keys)*REG_CAMERA_EVALUATION_METADATA_WORDS+1u]&1u)!=0u;
 #endif
 }
 // Colour and reflection records must reject the same fully suppressed slots.
 bool composited_transparent(uint at,SlotLayout layout) {
     if(!transparent_slot(at)) {return false;}
 #ifndef VORK_CAMERA_FUSED
-    if((evaluation_metadata[layout.record(at)*REG_CAMERA_EVALUATION_METADATA_WORDS+1u]&2u)!=0u) {return false;}
+    if((evaluation_metadata[layout.record(at,direct_keys)*REG_CAMERA_EVALUATION_METADATA_WORDS+1u]&2u)!=0u) {return false;}
 #endif
     return true;
 }
@@ -796,6 +818,40 @@ bool full_refraction_cover(uint object) {
 import refraction_transport;
 import dielectric_scene;
 import path_boundary;
+// Null transport can only borrow GI from the opaque camera samples it
+// actually reaches. Visibility masks can select another receiver on the same
+// ray; direction alone does not establish ownership of the diffuse correction.
+struct SlotRefractionReceiver : IRefractionReceiver {
+    static bool matches(DielectricHit hit,float3 world,float3 origin,float3 direction) {
+        if(hit.t<0.) return false;
+        let size=shading_size;
+        let layout=SlotLayout(size.x*size.y,visibility_samples(),camera_config.packet_pixels,camera_config.packet_first_pixel);
+        let index=shading_pixel.y*size.x+shading_pixel.x;
+        for(var at=layout.first(slots,index);at!=0xffffffffu;at=layout.next(slots,index,at)) {
+            if(transparent_slot(at) || slot_object(at)!=hit.object) continue;
+            if(!hit.field && slot_key(at).y!=hit.primitive) continue;
+            var covered=true;
+            if(shading_sample!=0xffffffffu) {
+                covered=(coverage_word(at,shading_sample/32u)&(1u<<(shading_sample%32u)))!=0u;
+            } else {
+                // A shared centroid shade may export only when all of the
+                // camera samples it represents have this same receiver.
+                for(var word=0u;word<layout.masks;word++)
+                    covered=covered && (coverage_word(shading_key,word)&~coverage_word(at,word))==0u;
+            }
+            if(!covered) continue;
+            if(hit.field) {
+                // Field visibility keys encode camera-root ordinals, whereas
+                // secondary queries return roots relative to their own origin.
+                let point=origin+direction*ray_plane(origin,direction,slot_plane(at));
+                let error=surface_position_error(hit.object,world)+surface_position_error(hit.object,point);
+                if(!all(abs(point-world)<=error)) continue;
+            }
+            return true;
+        }
+        return false;
+    }
+};
 // The cache is indexed by camera ray, never by a material or an optical
 // descriptor. Each exposure/view refreshes it with its current lens and pose.
 // Raster ray lines originate on the eye plane. Transport begins at the
@@ -807,10 +863,13 @@ void refraction_camera_ray(float2 position,uint2 size,float2 lens,out float3 ori
     origin+=direction*distance;
 }
 uint refraction_occupancy_at(uint2 pixel,uint width,uint sample) {
-    return camera_config.boundaries.w+(((pixel.y-camera_config.band)*width+pixel.x)*visibility_samples()+sample)*(1u+7u*VORK_REFRACTION_BOUNDARIES);
+    return camera_config.boundaries.w+(((pixel.y-camera_config.band)*width+pixel.x)*visibility_samples()+sample)*(1u+9u*VORK_REFRACTION_BOUNDARIES);
 }
 PathOccupancy<VORK_REFRACTION_BOUNDARIES> read_refraction_occupancy<V:IVariant,P:IProgram>(uint2 pixel,uint width,uint sample,float3 origin,float2 footprint) {
     PathOccupancy<VORK_REFRACTION_BOUNDARIES> state={};
+    // Transport entries retain the complete reachable material union. Thin-only
+    // scenes have no owner state, even though their transport ABI reserves a slot.
+    if(!V.has_solid_transmission) return state;
     let at=refraction_occupancy_at(pixel,width,sample);state.count=evaluation_metadata[at];
     // Capacities below the inline limit cannot spill: append() reports an
     // overflow instead. Do not compile unreachable containment recovery into
@@ -819,9 +878,13 @@ PathOccupancy<VORK_REFRACTION_BOUNDARIES> read_refraction_occupancy<V:IVariant,P
         return camera_occupancy<V,P,ReceiverGeometry,VORK_REFRACTION_BOUNDARIES>(ReceiverGeometry(ray_alpha,ray_hit_buffers),ray_scene,origin,float3(1.,0.,0.),camera_config.boundaries.xy,footprint,frame.field_geometry.x,frame.field_geometry.y);
     }
     for(var i=0u;i<state.count;i++) {
-        let k=at+1u+i*7u;PathBoundary b;
+        let k=at+1u+i*9u;PathBoundary b={};
         b.object=evaluation_metadata[k];b.medium=evaluation_metadata[k+1u];b.ior=asfloat(evaluation_metadata[k+2u]);
-        b.color=asfloat(uint3(evaluation_metadata[k+3u],evaluation_metadata[k+4u],evaluation_metadata[k+5u]));b.depth=asfloat(evaluation_metadata[k+6u]);state.set(i,b);
+        b.color=asfloat(uint3(evaluation_metadata[k+3u],evaluation_metadata[k+4u],evaluation_metadata[k+5u]));b.depth=asfloat(evaluation_metadata[k+6u]);
+#ifndef VORK_UNIT_BOUNDARY_IOR
+        b.reference_ior=asfloat(evaluation_metadata[k+7u]);b.specular_weight=asfloat(evaluation_metadata[k+8u]);
+#endif
+        state.set(i,b);
     }
     return state;
 }
@@ -865,6 +928,8 @@ void prepare_refraction_occupancy<V:IVariant,P:IProgram>(uint3 gid) {
     let layout=SlotLayout(w*h,visibility_samples(),camera_config.packet_pixels,camera_config.packet_first_pixel);
     for(var sample=0u;sample<visibility_samples();sample++) {
         let at=refraction_occupancy_at(pixel,w,sample);
+        // Preserve the installed metadata layout and its zero-count contract.
+        if(!V.has_solid_transmission) {evaluation_metadata[at]=0u;continue;}
         var coverage=RefractionCameraCoverage(sample/32u);visit_slots(layout,pixel.y*w+pixel.x,coverage);
         if((coverage.bits&(1u<<(sample%32u)))==0u) {evaluation_metadata[at]=0u;continue;}
         float3 origin,direction;
@@ -872,9 +937,14 @@ void prepare_refraction_occupancy<V:IVariant,P:IProgram>(uint3 gid) {
         var state=camera_occupancy<V,P,ReceiverGeometry,VORK_REFRACTION_BOUNDARIES>(ReceiverGeometry(ray_alpha,ray_hit_buffers),ray_scene,origin,float3(1.,0.,0.),camera_config.boundaries.xy,float2(2.)/float2(w,h),frame.field_geometry.x,frame.field_geometry.y);
         evaluation_metadata[at]=state.count;
         for(var i=0u;i<min(state.count,VORK_REFRACTION_BOUNDARIES);i++) {
-            let k=at+1u+i*7u;let b=state.at(i);
+            let k=at+1u+i*9u;let b=state.at(i);
             evaluation_metadata[k]=b.object;evaluation_metadata[k+1u]=b.medium;evaluation_metadata[k+2u]=asuint(b.ior);
             evaluation_metadata[k+3u]=asuint(b.color.x);evaluation_metadata[k+4u]=asuint(b.color.y);evaluation_metadata[k+5u]=asuint(b.color.z);evaluation_metadata[k+6u]=asuint(b.depth);
+#ifndef VORK_UNIT_BOUNDARY_IOR
+            evaluation_metadata[k+7u]=asuint(b.reference_ior);evaluation_metadata[k+8u]=asuint(b.specular_weight);
+#else
+            evaluation_metadata[k+7u]=asuint(b.ior);evaluation_metadata[k+8u]=asuint(1.);
+#endif
         }
         state.clear();
     }
@@ -882,7 +952,10 @@ void prepare_refraction_occupancy<V:IVariant,P:IProgram>(uint3 gid) {
 
 #endif
 #endif
-float3 slot_transmitted<V:IVariant,P:IProgram>(Varying v,Surface s,Coordinates k,uint2 size,bool interface_transport) {
+// Interface transport also returns, in receiver_ambient/receiver_diffuse, the
+// GI-replaceable terms of receivers reached across null interfaces
+// (refraction_transport), normalized like the colour.
+float3 slot_transmitted<V:IVariant,P:IProgram>(Varying v,Surface s,Coordinates k,uint2 size,bool interface_transport,inout float3 receiver_ambient,inout float3 receiver_diffuse) {
     // Receiver visibility and mesh boundary crossings vary across a pixel.
     // Keep material evaluation and front lighting at the shading point, but
     // trace transport from every covered camera sample with its own view.
@@ -891,7 +964,7 @@ float3 slot_transmitted<V:IVariant,P:IProgram>(Varying v,Surface s,Coordinates k
     let saved_sample=shading_sample;
     let per_sample=(interface_transport || (V.has_solid_transmission && !s.closure.geometry_thin_walled))
         && integrate && saved_sample==0xffffffffu;
-    var color=float3(0.);
+    var color=float3(0.);var null_ambient=float3(0.);var null_diffuse=float3(0.);
     for(uint word=0u;word<select(per_sample,shading_masks,1u);word++) {
         var bits=per_sample ? slots[shading_key+REG_VISIBILITY_KEY_WORDS+word] : 1u;
         while(bits!=0u) {
@@ -909,14 +982,16 @@ float3 slot_transmitted<V:IVariant,P:IProgram>(Varying v,Surface s,Coordinates k
             if(interface_transport) {
                 float3 camera_origin;float3 camera_direction;
                 refraction_camera_ray(sample_v.position.xy,size,shading_sample==0xffffffffu ? shading_mean_lens : sample_lens(shading_sample),camera_origin,camera_direction);
-                color+=refraction_transport<V,P,VORK_REFRACTION_BOUNDARIES>(sample_v,sample_s,k,camera_origin,read_refraction_occupancy<V,P>(shading_pixel,size.x,shading_sample==0xffffffffu ? 0u : shading_sample,camera_origin,float2(2.)/float2(size)),shading_face,float2(2.)/float2(size),shading_pixel,lighting_sample());
+                color+=refraction_transport<V,P,SlotRefractionReceiver,VORK_REFRACTION_BOUNDARIES>(sample_v,sample_s,k,camera_origin,read_refraction_occupancy<V,P>(shading_pixel,size.x,shading_sample==0xffffffffu ? 0u : shading_sample,camera_origin,float2(2.)/float2(size)),shading_face,float2(2.)/float2(size),shading_pixel,lighting_sample(),null_ambient,null_diffuse);
             } else
 #endif
             {color+=transmission_radiance<V,SlotTransmission,P>(sample_v,sample_s,shading_face);}
         }
     }
     shading_sample=saved_sample;
-    return color/float(select(per_sample,shading_count,1u));
+    let normalization=float(select(per_sample,shading_count,1u));
+    receiver_ambient+=null_ambient/normalization;receiver_diffuse+=null_diffuse/normalization;
+    return color/normalization;
 }
 // One transport policy for ray receivers, retained mesh exits and the opaque
 // screen capture. Only the composite can read the capture written by Opaque.
@@ -937,9 +1012,9 @@ struct SlotTransmission : ITransmission {
 #endif
 // Stored transparency already includes coverage/discard and solid-rear decisions.
 #if defined(VORK_COMPOSE_STORED)
-float4 slot_transparency<V:IVariant>(uint at,uint sample) {
+float4 slot_transparency<V:IVariant>(uint at,uint sample,out float3 receiver_ambient,out float3 receiver_diffuse) {
     let e=read_evaluation<V>(at,sample);
-    surface_aovs=e.aovs;
+    surface_aovs=e.aovs;receiver_ambient=e.response.baseline.diffuse;receiver_diffuse=e.response.diffuse;
     return e.alpha;
 }
 #endif
@@ -966,7 +1041,23 @@ float ray_plane(float3 origin,float3 direction,SlotPlane st) {
         let root=field_crossing<CameraGeometry>(CameraGeometry(draw_table,camera_hit_buffers),draw_table[draw*REG_RAY_SLOT_WORDS+1u],st.object,st.primitive,origin,direction,camera_near_distance(origin,direction),REG_FP32_MAX);
         return root.found ? root.t : REG_FP32_MAX;
     }
+#ifdef VORK_SOFTWARE_RASTER
+    // The bounded point can leave the camera ray at a quantised raster edge.
+    // Order by camera-axis depth, exactly as the raster depth attachment does.
+    let triangle=surface_triangle<CameraGeometry>(CameraGeometry(draw_table,camera_hit_buffers),object_draws[st.object]&0x7fffffffu,st.primitive,st.object);
+    let b=triangle_barycentrics(origin,direction,triangle.p0,triangle.p1,triangle.p2);
+    let point=hit_point(triangle.t,float3(1.-b.x-b.y,b));
+    let forward=-float3(frame.view[0].z,frame.view[1].z,frame.view[2].z);
+    if(camera_needs_relative_clip(frame)) {
+        let model=object_model(st.object);
+        let local=triangle.t.c[0].POSITION*(1.-b.x-b.y)+triangle.t.c[1].POSITION*b.x+triangle.t.c[2].POSITION*b.y;
+        let relative=mul(float4(local,0.),model).xyz+(model[3].xyz-frame.eye.xyz);
+        return dot(relative-(origin-frame.eye.xyz),forward)/dot(direction,forward);
+    }
+    return dot(point-origin,forward)/dot(direction,forward);
+#else
     return dot(st.point-origin,st.normal)/dot(direction,st.normal);
+#endif
 }
 bool ray_front(float3 origin,float3 direction,SlotPlane st) {
     if(!field_primitive(st.primitive)) return dot(st.normal,direction)<0.;
@@ -1003,6 +1094,7 @@ struct FrontCover : ISlotVisitor {
         // With a pinhole camera, plane ordering is linear over the pixel ray
         // cone while neither plane crosses its horizon. Prove the whole cone
         // at its four corners before walking individual covered samples.
+#ifndef VORK_SOFTWARE_RASTER
         if(frame.post.w<=0. && !field_primitive(st.primitive) && !field_primitive(rear.primitive)) {
             var all_hidden=true;var all_behind=true;var all_back=true;var rear_side=0.;var front_side=0.;var stable=true;
             for(uint corner=0u;corner<4u;corner++) {
@@ -1019,6 +1111,7 @@ struct FrontCover : ISlotVisitor {
             if(stable && all_hidden) {bits|=shared;return;}
             if(stable && (all_behind || all_back)) {return;}
         }
+#endif
         // Exit suppression requires strictly positive interior thickness;
         // coplanar boundaries do not enclose an interior, regardless of identity.
         while (shared!=0u) {
@@ -1112,7 +1205,7 @@ struct CountTableEvaluations : ISlotVisitor {
         let bin=evaluation_bin(at);
         let table=table_index(bin);
         if(table>=2u) {return;}
-        let record=layout.record(at)*REG_CAMERA_EVALUATION_METADATA_WORDS;
+        let record=layout.record(at,direct_keys)*REG_CAMERA_EVALUATION_METADATA_WORDS;
         let policy=evaluation_metadata[record+1u];
         if((policy&2u)==0u) {table_count[table]+=(policy&1u)!=0u ? evaluation_metadata[record+2u] : 1u;}
     }
@@ -1121,7 +1214,7 @@ struct ClassifyEvaluation : ISlotVisitor {
     SlotLayout layout; uint pixel; bool scatter;
     __init(SlotLayout layout,uint pixel,bool scatter) {this.layout=layout;this.pixel=pixel;this.scatter=scatter;}
     [mutating] void visit(uint at) {
-        let material=material_record(slot_object(at));let bin=evaluation_bin(at);let record=layout.record(at)*REG_CAMERA_EVALUATION_METADATA_WORDS;
+        let material=material_record(slot_object(at));let bin=evaluation_bin(at);let record=layout.record(at,direct_keys)*REG_CAMERA_EVALUATION_METADATA_WORDS;
         if(scatter) {
             if((evaluation_metadata[record+1u]&2u)!=0u) {return;}
             let per=(evaluation_metadata[record+1u]&1u)!=0u;
@@ -1232,7 +1325,7 @@ struct IndexEvaluationSlots : ISlotVisitor {
     [mutating] void visit(uint at) {
         count++;
         if(scatter) {
-            let record=layout.record(at);
+            let record=layout.record(at,direct_keys);
             if(record>=layout.pixels*REG_VISIBILITY_SLOTS) {
                 evaluation_metadata[record*REG_CAMERA_EVALUATION_METADATA_WORDS]=pixel;
             }
@@ -1291,16 +1384,18 @@ void prefix_evaluations() {
 // exits end the thread. Returning the slot to one shared store instead keeps a
 // convergence barrier live across the whole surface evaluation, and NVIDIA then
 // spills barrier registers inside the lighting loops.
-interface IEvaluationSink {[mutating] void deliver(EvaluatedSlot slot);[mutating] void accumulate(float3 transport);}
+// A transparent slot's response.baseline.diffuse and response.diffuse carry only
+// its null-interface receivers' GI-replaceable terms (slot_transmitted).
+interface IEvaluationSink {[mutating] void deliver(EvaluatedSlot slot);[mutating] void accumulate(float3 transport,float3 receiver_ambient,float3 receiver_diffuse);}
 #ifdef VORK_PROBES
 uint indirect_work_stride() {return (camera_config.flags&REG_CAMERA_PROBE_LIT)!=0u ? 24u : (VORK_CAMERA_DIFFUSION!=0u ? 16u : 8u);}
 #endif
 struct StoredEvaluation<V:IVariant> : IEvaluationSink {
     uint output;uint at;uint pixel;uint sample;float2 centroid;
     __init(uint output,uint at,uint pixel,uint sample,float2 centroid) {this.output=output;this.at=at;this.pixel=pixel;this.sample=sample;this.centroid=centroid;}
-    [mutating] void accumulate(float3 transport) {
+    [mutating] void accumulate(float3 transport,float3 receiver_ambient,float3 receiver_diffuse) {
         var e=evaluation_read<V>(output);
-        e.alpha.rgb+=transport;
+        e.alpha.rgb+=transport;e.response.baseline.diffuse+=receiver_ambient;e.response.diffuse+=receiver_diffuse;
         evaluation_write<V>(output,e);
     }
     [mutating] void deliver(EvaluatedSlot slot) {
@@ -1344,7 +1439,9 @@ struct ReturnedEvaluation : IEvaluationSink {
     EvaluatedSlot slot;
     __init() {slot=(EvaluatedSlot)0;}
     [mutating] void deliver(EvaluatedSlot slot) {this.slot=slot;}
-    [mutating] void accumulate(float3 transport) {this.slot.alpha.rgb+=transport;}
+    [mutating] void accumulate(float3 transport,float3 receiver_ambient,float3 receiver_diffuse) {
+        this.slot.alpha.rgb+=transport;this.slot.response.baseline.diffuse+=receiver_ambient;this.slot.response.diffuse+=receiver_diffuse;
+    }
 };
 void evaluate_slot<S:IEvaluationSink,V:IVariant,P:IProgram,let decode_table:bool,Q:IProgram>(uint at,uint2 pixel,uint2 size,float2 centroid,uint sample,inout S sink) {
     // Capacity feedback has already proved this view incomplete. Keep valid empty
@@ -1400,17 +1497,22 @@ void evaluate_slot<S:IEvaluationSink,V:IVariant,P:IProgram,let decode_table:bool
 #else
     let interface_transport=false;
 #endif
-    var transport=float3(0.);
+    var transport=float3(0.);var receiver_ambient=float3(0.);var receiver_diffuse=float3(0.);
     if(V.has_transmission && transparent && !replaced) {
         for(uint i=0u;i<select(V.has_lobes && P.lobes,hsurf.s.lobes,1u);i++) {
             var lobe=hsurf.s;
             if(i>0u) {lobe=surface_at<V,P,decode_table>(hsurf.v,hsurf.entering,hsurf.s.view,hsurf.k,Lobe(i,0.));}
             if(hidden && V.has_solid_transmission && lobe.closure.transmission_weight>0. && !lobe.closure.geometry_thin_walled) {if(!later) {sink.deliver(result);}return;}
-            if(lit) {transport+=slot_transmitted<V,Q>(hsurf.v,lobe,hsurf.k,size,interface_transport)*select(V.has_lobes && P.lobes,lobe.weight,1.);}
+            if(lit) {
+                let weight=select(V.has_lobes && P.lobes,lobe.weight,1.);
+                var lobe_ambient=float3(0.);var lobe_diffuse=float3(0.);
+                transport+=slot_transmitted<V,Q>(hsurf.v,lobe,hsurf.k,size,interface_transport,lobe_ambient,lobe_diffuse)*weight;
+                receiver_ambient+=lobe_ambient*weight;receiver_diffuse+=lobe_diffuse*weight;
+            }
         }
     }
     if(later) {
-        if(transparent) {sink.accumulate(transport);}
+        if(transparent) {sink.accumulate(transport,receiver_ambient,receiver_diffuse);}
         return;
     }
     // The only camera surface+lighting site. Coverage expansion is outside this kernel.
@@ -1421,6 +1523,7 @@ void evaluate_slot<S:IEvaluationSink,V:IVariant,P:IProgram,let decode_table:bool
     if(transparent) {
         let alpha=select(material_records[material_record(st.t.object)].extra.y>0.,opacity,objects[st.t.object].opacity.x);
         result.alpha=float4(result.response.color+transport,alpha);
+        result.response.baseline.diffuse=receiver_ambient;result.response.diffuse=receiver_diffuse;
     }
     result.aovs=surface_aovs;
     sink.deliver(result);
@@ -1467,7 +1570,7 @@ void evaluate_material<V:IVariant,P:IProgram,let decode_table:bool=true,Q:IProgr
     let output=indexed_slots ? gid.x : (direct ? index : evaluation_bins[entry+3u]);
     if(output>=evaluation_allocator[1]) {return;}
     shading_masks=layout.masks;shading_lens=float2(0.);
-    let metadata=(indexed_slots ? record : layout.record(at))*REG_CAMERA_EVALUATION_METADATA_WORDS;
+    let metadata=(indexed_slots ? record : layout.record(at,direct_keys))*REG_CAMERA_EVALUATION_METADATA_WORDS;
     float2 centroid;
     if(indexed_slots) {
         float2 lens;shading_count=slot_coverage(at,layout,centroid,lens);
@@ -1555,7 +1658,7 @@ void indirect_material<V:IVariant,P:IProgram>(uint3 gid) {
     else {
         bits=coverage_word(at,word);
         let layout=SlotLayout(w*h,visibility_samples(),camera_config.packet_pixels,camera_config.packet_first_pixel);
-        count=evaluation_metadata[layout.record(at)*REG_CAMERA_EVALUATION_METADATA_WORDS+2u];
+        count=evaluation_metadata[layout.record(at,direct_keys)*REG_CAMERA_EVALUATION_METADATA_WORDS+2u];
     }
     bits&=(0xffffffffu>>(32u-ray_batch))<<(ray_first%32u);
     if(bits!=0u) {uint ignored;InterlockedAdd(evaluation_allocator[3],countbits(bits),ignored);}
@@ -1572,7 +1675,7 @@ void indirect_material<V:IVariant,P:IProgram>(uint3 gid) {
         // A nonlinear hook sees the completed integral exactly once. Earlier
         // mask passes only accumulate incident light; they never run a hook.
         if(ray_first+ray_batch>=visibility_samples()) {
-            let layout=SlotLayout(w*h,visibility_samples(),camera_config.packet_pixels,camera_config.packet_first_pixel);let metadata=layout.record(at)*REG_CAMERA_EVALUATION_METADATA_WORDS;
+            let layout=SlotLayout(w*h,visibility_samples(),camera_config.packet_pixels,camera_config.packet_first_pixel);let metadata=layout.record(at,direct_keys)*REG_CAMERA_EVALUATION_METADATA_WORDS;
             shading_masks=layout.masks;shading_count=evaluation_allocator[first+22u];shading_lens=float2(0.);
             shading_mean_lens=sample==0xffffffffu ? asfloat(uint2(evaluation_metadata[metadata+5u],evaluation_metadata[metadata+6u]))/float(max(shading_count,1u)) : float2(0.);
             shading_footprint=sample==0xffffffffu ? asfloat(uint3(evaluation_metadata[metadata+7u],evaluation_metadata[metadata+8u],evaluation_metadata[metadata+9u])) : float3(0.);
@@ -1585,8 +1688,8 @@ void indirect_material<V:IVariant,P:IProgram>(uint3 gid) {
         return;
     }
     let added=response*radiance*(frame.radiance.w/float(max(count,1u)));
-    e.response.color+=added;e.response.baseline.diffuse+=added;
-    if(VORK_CAMERA_TRANSPARENT!=0 && transparent_slot(at)) {e.alpha.xyz+=added;}
+    e.response.color+=added;
+    if(VORK_CAMERA_TRANSPARENT!=0 && transparent_slot(at)) {e.alpha.xyz+=added;} else {e.response.baseline.diffuse+=added;}
     if(VORK_CAMERA_DIFFUSION!=0u) {
         let irradiance=radiance*(frame.radiance.w/float(max(count,1u)));
         let scattering=scattering_response*irradiance;
@@ -1658,7 +1761,9 @@ float transparent_incoming<V:IVariant>(SlotLayout layout,uint2 pixel,uint2 size,
     var incoming=IncomingTransmittance<V>(layout,sample,origin,direction,RayOrder(depth,slot_key(target)));
     visit_slots(layout,pixel.y*size.x+pixel.x,incoming);return incoming.transmission;
 }
-void blend_transparent<V:IVariant,P:IProgram,R:ITransmittance,let AOVS:int>(SlotLayout layout,uint index,uint2 pixel,uint2 size,inout R t,inout float4 front,bool lit) {
+// `transported_ambient`/`transported_diffuse` gain the transparent slots' null-interface receiver terms
+// with the same weights as their colour, for the pixel's GI correction.
+void blend_transparent<V:IVariant,P:IProgram,R:ITransmittance,let AOVS:int>(SlotLayout layout,uint index,uint2 pixel,uint2 size,inout R t,inout float4 front,bool lit,inout float3 transported_ambient,inout float3 transported_diffuse) {
     for(uint word=0u;word<layout.masks;word++) {
         var covered=SlotCoverage(word,true);visit_slots(layout,index,covered);
         var bits=covered.bits;
@@ -1669,10 +1774,12 @@ void blend_transparent<V:IVariant,P:IProgram,R:ITransmittance,let AOVS:int>(Slot
             var walk=NextTransparent<V>(layout,i,origin,direction);
             for(visit_slots(layout,index,walk);walk.best!=0u;walk.best=0u,visit_slots(layout,index,walk)) {
                 let at=walk.best-1u;walk.previous=walk.order;walk.started=true;
-                let c=slot_transparency<V>(at,per_sample(at) ? i : 0xffffffffu);
+                float3 receiver_ambient,receiver_diffuse;
+                let c=slot_transparency<V>(at,per_sample(at) ? i : 0xffffffffu,receiver_ambient,receiver_diffuse);
                 if(c.a<=0.) {continue;}
                 if(lit) {add_aovs<AOVS>(t.at(i)*c.a);}
-                front+=t.at(i)*float4(c.rgb*float3(1.)*c.a,c.a);t.scale(i,1.-c.a);
+                front+=t.at(i)*float4(c.rgb*float3(1.)*c.a,c.a);
+                transported_ambient+=t.at(i)*c.a*receiver_ambient;transported_diffuse+=t.at(i)*c.a*receiver_diffuse;t.scale(i,1.-c.a);
 #if !defined(VORK_NO_IMPLICIT) && !defined(VORK_CAMERA_FUSED)
                 // An exactly extinguished camera sample has no later colour
                 // or AOV contribution. Do not sort another scalar-field suffix.
@@ -1705,8 +1812,8 @@ void shade_pixel<V:IVariant,P:IProgram,R:ITransmittance,C:IDiffusionCapture,let 
     let pixel=gid.xy;composition_pixel=pixel;
     let samples=visibility_samples();
     let index=pixel.y*w+pixel.x;
-    var t=R();var front=float4(0.);
-    if (R.transparent) {blend_transparent<V,P,R,AOVS>(layout,index,pixel,size,t,front,!screen);}
+    var t=R();var front=float4(0.);var transported_ambient=float3(0.);var transported_diffuse=float3(0.);
+    if (R.transparent) {blend_transparent<V,P,R,AOVS>(layout,index,pixel,size,t,front,!screen,transported_ambient,transported_diffuse);}
     var opaque=OpaqueShade<V,P,R,C,AOVS>(layout,pixel,size,t);
     visit_slots(layout,index,opaque);
     // Uncovered samples see the camera background along the ray through their
@@ -1720,19 +1827,35 @@ void shade_pixel<V:IVariant,P:IProgram,R:ITransmittance,C:IDiffusionCapture,let 
         for (uint i=0u;i<samples;i++) {left+=t.at(i);moment+=t.at(i)*(visibility_lattice(i)-0.5);}
     }
     var background=float4(0.);
+#ifdef VORK_CAMERA_ENVIRONMENT
+    // A directional environment program is evaluated along each uncovered
+    // sample's own camera ray (film offset and lens), weighted by what it transmits.
+    var background_seen=float3(0.);
+    if(frame.environment.w<=0.) {
+        if(left>0.) background=camera_background(pixel,size,moment/left);
+        if(uncovered>0u) background_seen=frame.background.rgb;
+    } else if(uncovered>0u) {
+        for(uint word=0u;word<layout.masks;word++) {
+            var coverage=SlotCoverage(word,false);visit_slots(layout,index,coverage);
+            var bits=~coverage.bits;
+            while(bits!=0u) {
+                let i=word*32u+firstbitlow(bits);bits&=bits-1u;
+                if(i>=samples) break;
+                shading_lens=frame.post.w>0. ? sample_lens(i) : float2(0.);
+                let value=camera_background(pixel,size,visibility_lattice(i)-.5);
+                background_seen+=value.rgb/float(uncovered);
+                if(left>0.) background+=value*(t.at(i)/left);
+            }
+        }
+    }
+#else
     if (left>0.) {
         shading_lens=-opaque.transmitted_lens;
         if (frame.post.w>0.) {for (uint i=0u;i<camera_samples[0].x;i++) {shading_lens+=t.at(i)*sample_lens(i);}}
         shading_lens/=left;
-#ifdef VORK_SPATIAL_ENVIRONMENT
-        for(uint i=0u;i<samples;i++) {
-            shading_lens=sample_lens(i);
-            background+=camera_background(pixel,size,visibility_lattice(i)-.5)*t.at(i)/left;
-        }
-#else
         background=camera_background(pixel,size,moment/left);
-#endif
     }
+#endif
     // The resolve subtracts the same exposure-weighted ambient that colour
     // contains, so seen through transparency, as much as it transmits. AO's
     // receiver is the opaque majority, background included: a sliver of a thin
@@ -1751,12 +1874,12 @@ void shade_pixel<V:IVariant,P:IProgram,R:ITransmittance,C:IDiffusionCapture,let 
         let clip=mul(float4(receiver.world,1.),frame.vp);
         position=float4(receiver.world,clip.z/clip.w+select(receiver.samples>uncovered,0.,1.));normal=receiver.normal;
     }
-    ambient.Store(pixel,float4(opaque.ambient/float(samples),metadata));
+    ambient.Store(pixel,float4((opaque.ambient+transported_ambient)/float(samples),metadata));
     if (write_receivers) {receivers.Store(pixel,position);ao_normals.Store(pixel,float4(normal,asfloat(receiver.key.x)));}
     if (V.has_indirect_controls && frame.flags.w!=0.) {
         // The signed indirect correction must use the shade's actual response.
         // Quantizing this multiplier changes energy even for a constant World.
-        let response=opaque.diffuse/float(samples);
+        let response=(opaque.diffuse+transported_diffuse)/float(samples);
         diffuse_response[index*3u]=response.x;diffuse_response[index*3u+1u]=response.y;diffuse_response[index*3u+2u]=response.z;
     }
     if (reflections) {opaque.write_reflection_guides(index);}
@@ -1770,7 +1893,11 @@ void shade_pixel<V:IVariant,P:IProgram,R:ITransmittance,C:IDiffusionCapture,let 
     if (screen) {
         // Without transparency in the pixel the uncovered samples' background is the one already looked up.
         // Alpha is the opaque coverage, so glass that does not receive the world can remove the background.
+#ifdef VORK_CAMERA_ENVIRONMENT
+        let seen=background_seen;
+#else
         let seen=uncovered==0u ? float3(0.) : t.active() ? camera_background(pixel,size,-opaque.offsets/float(uncovered)).rgb : background.rgb;
+#endif
         refraction_output.Store(pixel,float4(opaque.unweighted+seen*float(uncovered),float(opaque.covered))/float(samples));
         // transmission.slang unprojects the receiver's depth at the pixel centre and
         // intersects its plane: store the triangle plane's normal and depth there.
@@ -1798,8 +1925,10 @@ void composite_pixel<V:IVariant,P:IProgram,R:ITransmittance,let AOVS:int>(uint3 
     if (VORK_AOV_CHANNELS!=0u) for (uint a=0u;a<VORK_CAMERA_AOVS;a++) {pixel_aovs[a]=float4(0.);}
     if (direct_keys) {pixel_key=visibility_keys.Load(int4(gid.xy,0,0));}
     let pixel=gid.xy;composition_pixel=pixel;let index=pixel.y*size.x+pixel.x;let samples=float(visibility_samples());
-    var t=R();var front=float4(0.);
-    blend_transparent<V,P,R,AOVS>(layout,index,pixel,size,t,front,true);
+    // Screen refraction stores the pixel's GI terms in the opaque pass; this
+    // composite has no interface-transport receivers to add.
+    var t=R();var front=float4(0.);var transported_ambient=float3(0.);var transported_diffuse=float3(0.);
+    blend_transparent<V,P,R,AOVS>(layout,index,pixel,size,t,front,true,transported_ambient,transported_diffuse);
     if (!t.active()) {return;}
     if (VORK_AOV_CHANNELS!=0u) for (uint a=0u;a<VORK_CAMERA_AOVS;a++) {aov_values[index*VORK_CAMERA_AOVS+a]+=pixel_aovs[a]/samples;}
     // Screen refraction evaluates glass after the opaque source is captured.

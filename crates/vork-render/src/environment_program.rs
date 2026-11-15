@@ -17,12 +17,16 @@ pub(crate) struct Source {
 }
 #[derive(Clone)]
 pub(crate) struct Primary {
+    pub spatial: bool,
     pub uses_time: bool,
     pub modules: Vec<(String,String)>,
     pub include: Vec<PathBuf>,
     pub words: Vec<u32>,
     pub layout: vork_slang::InputLayout,
     pub material: String,
+    pub image_data: Option<wgpu::Buffer>,
+    /// One exact camera value when the compiler proves a static constant.
+    pub constant_camera: Option<wgpu::Buffer>,
 }
 pub(crate) struct Program {
     key: blake3::Hash,
@@ -40,7 +44,28 @@ struct Resources {
     time: wgpu::Buffer,
     input: wgpu::Buffer,
     output: wgpu::Texture,
-    images: Vec<wgpu::Texture>,
+    image_sizes: Vec<[u32;2]>,
+    image_data: wgpu::Buffer,
+}
+
+impl Primary {
+    /// The program as a native module that compose and path kernels link for camera rays.
+    fn new(abi: &vork_slang::Abi, program: &EnvironmentProgram, material: &str, words: Vec<u32>, spatial: bool) -> Result<Self> {
+        let decode = program.inputs.slang_decode();
+        let mut modules = abi.native_modules();
+        let mut text = program.slang.clone();
+        for dependency in &program.dependencies {
+            use std::fmt::Write;
+            writeln!(text,"// dependency {}",blake3::hash(&std::fs::read(dependency)?))?;
+        }
+        let origin = if spatial { "origin" } else { "float3(0.)" };
+        // The input word base is a frame value: kernels stay shared across scenes.
+        // Check the authored source before node tint or spectral/RGB conversion.
+        // Every direct camera consumer (including bent escapes) links this wrapper.
+        text.push_str(&format!("\nimport material_bindings;\nimport vork_constants;\npublic float3 primary_environment(uint base,float3 origin,float3 direction,float time) {{{decode}let source=environment(EnvironmentContext({origin},direction,time,true),inputs);if(!all(isfinite(source)) || any(source<float3(0.))) {{InterlockedMax(shader_errors[0],REG_ENVIRONMENT_INVALID);return float3(0.);}}return source;}}"));
+        modules.push(("camera_environment".into(),text));
+        Ok(Self {spatial,uses_time:program.animated,modules,include:program.include.clone(),words,layout:program.inputs.clone(),material:material.into(),image_data:None,constant_camera:None})
+    }
 }
 
 pub(crate) fn install_source(
@@ -48,6 +73,16 @@ pub(crate) fn install_source(
     scene: &v2::Scene,
     name: &str,
     base: &Path,
+) -> Result<(Source, Option<Program>)> {
+    install_source_in(r, scene, name, base, &Default::default())
+}
+/// [`install_source`] within a document open, reading media through the sources that open read.
+pub(crate) fn install_source_in(
+    r: &Renderer,
+    scene: &v2::Scene,
+    name: &str,
+    base: &Path,
+    opened: &crate::footage::Opened,
 ) -> Result<(Source, Option<Program>)> {
     let material = &scene.materials[name];
     let (source, origin) = if let Some(source) = vork_slang::module_source(&material.program) {
@@ -70,14 +105,14 @@ pub(crate) fn install_source(
         .iter()
         .map(|(k, v)| Ok((k.clone(), serde_json::to_value(v)?)))
         .collect::<Result<std::collections::BTreeMap<_, _>>>()?;
-    let installed = bake_animated(r, &source, &origin, &values, Some((scene, base, name)))?;
+    let installed = bake_animated(r, &source, &origin, &values, Some((scene, base, name)), opened)?;
     Ok(installed)
 }
 
 /// The Slang compile cache key of an environment program.
 pub(crate) fn program_key(abi: &vork_slang::Abi, source: &str, origin: &Path) -> Result<blake3::Hash> {
     let mut hash = blake3::Hasher::new();
-    hash.update(b"environment-images-v5");
+    hash.update(b"environment-images-v7");
     hash.update(abi.cache_identity()?.as_bytes());
     hash.update(source.as_bytes());
     hash.update(origin.to_string_lossy().as_bytes());
@@ -100,6 +135,7 @@ fn bake_animated(
     origin: &Path,
     values: &std::collections::BTreeMap<String, serde_json::Value>,
     animation_source: Option<(&v2::Scene, &Path, &str)>,
+    opened: &crate::footage::Opened,
 ) -> Result<(Source, Option<Program>)> {
     let abi = programs::abi();
     let key = program_key(&abi, source, origin)?;
@@ -108,13 +144,13 @@ fn bake_animated(
         eprintln!("{}", program.warnings.trim());
     }
     let (images, mut words) = if let Some((scene,base,_))=animation_source {
-        let (images,words)=images::Images::new(r,scene,base,&program.inputs,values)?;
+        let (images,words)=images::Images::new(r,scene,base,&program.inputs,values,opened)?;
         (Some(images),words)
     } else {
         (None,program.inputs.pack(values, |name,_|bail!("environment input {name} requires a scene"))?)
     };
     let animation = animation_source.map(|(scene, base, name)|
-        programs::InputAnimation::new(scene, base, name, &program.inputs, &mut words)).transpose()?.flatten();
+        programs::InputAnimation::new_in(scene, base, name, &program.inputs, &mut words, opened)).transpose()?.flatten();
     let spatial_fallback=program.spatial && animation_source.is_some_and(|(scene,_,_)|scene.delivery);
     if spatial_fallback { crate::warnings::dropped("spatial_environment", serde_json::json!({"program":origin,"inputs":values}), format!("warning: environment {}: ignored spatial origin dependence; evaluating the directional environment at the origin", origin.display())); }
     if program.spatial && !spatial_fallback {
@@ -146,21 +182,22 @@ fn bake_animated(
             }
             ensure!(layer.clip.as_ref().is_none_or(|clip|!chain.contains(&clip.target)),"spatial environment frame cannot have animation clips");
         }
-        let base=std::mem::size_of::<materials::MaterialRecord>()/4;
-        let decode=program.inputs.slang_decode();
-        let mut modules=abi.native_modules();
-        let mut text=program.slang.clone();
-        for dependency in &program.dependencies {
-            use std::fmt::Write;
-            writeln!(text,"// dependency {}",blake3::hash(&std::fs::read(dependency)?))?;
-        }
-        text.push_str(&format!("\npublic float3 primary_environment(float3 origin,float3 direction,float time) {{uint base={base}u;{decode}return environment(EnvironmentContext(origin,direction,time,true),inputs);}}"));
-        modules.push(("spatial_environment".into(),text));
-        return Ok((Source {texture:source_texture(r,[1,1]),identity:key,primary:Some(Primary {uses_time:program.animated,modules,include:program.include.clone(),words,layout:program.inputs.clone(),material:material.into()})},None));
+        return Ok((Source {texture:source_texture(r,[1,1]),identity:key,primary:Some(Primary::new(&abi,&program,material,words,true)?)},None));
     }
-    if let Some(animation) = &animation { animation.words(0., &mut words); }
     let image_words=images.as_ref().map(|i|i.words(&vork_time::Request::Numeric(0.))).transpose()?.unwrap_or_else(||vec![0]);
-    let size=images.as_ref().and_then(|i|i.size(&image_words)).unwrap_or(constants::ENVIRONMENT_PROGRAM_SIZE);
+    let image_capacity=images.as_ref().map_or(image_words.len(),|images|images.capacity(&image_words));
+    crate::gpu_memory::storage_binding(&r.device.limits(),"environment image inputs",(image_capacity*4) as u64,"reduce environment image dimensions or count")?;
+    // Camera bindings must retain authored blend baselines, before the lighting
+    // bake evaluates its independent animation plan at time zero.
+    let mut primary = animation_source.map(|(_,_,material)| {
+        let words = images.as_ref().map_or_else(|| words.clone(), |images| images.primary_words(&program.inputs, &words, &image_words));
+        Primary::new(&abi,&program,material,words,false)
+    }).transpose()?;
+    if let Some(animation) = &animation { animation.words(0., &mut words); }
+    // Preserve lighting quadrature independently of the camera's exact program
+    // evaluation. Installation releases bakes no longer read by transport.
+    let size=images.as_ref().and_then(|i|i.size(&image_words)).map_or(constants::ENVIRONMENT_PROGRAM_SIZE,
+        |[w,h]|[w.max(constants::ENVIRONMENT_PROGRAM_SIZE[0]),h.max(constants::ENVIRONMENT_PROGRAM_SIZE[1])]);
     let [w,h]=size;
     let mut shader = program.wgsl.clone();
     shader.push_str(&format!("\n@group(0) @binding(0) var<storage,read> words:array<u32>;\n@group(0) @binding(1) var pixels:texture_storage_2d_array<rgba32uint,write>;\n@group(0) @binding(2) var<uniform> environment_time:vec4<f32>;\nfn {}(i:u32)->u32 {{return words[i];}}\n@compute @workgroup_size(8,8) fn main(@builtin(global_invocation_id) gid:vec3<u32>) {{if gid.x>={w}u || gid.y>=u32(environment_time.z) {{return;}}let theta=3.141592653589793*(f32(gid.y)+environment_time.y+.5)/{h}.;let phi=6.283185307179586*((f32(gid.x)+.5)/{w}.-.5);let direction=vec3(sin(theta)*cos(phi),cos(theta),sin(theta)*sin(phi));var result:array<vec4<f32>,2>;{}(vec3<f32>(0.),direction,environment_time.x,0u,&result);textureStore(pixels,vec2<i32>(gid.xy),0,bitcast<vec4<u32>>(result[1]));textureStore(pixels,vec2<i32>(gid.xy),1,bitcast<vec4<u32>>(result[0]));}}\n",vork_slang::MATERIAL_WORD,program.entry));
@@ -203,7 +240,7 @@ fn bake_animated(
                 wgpu::BufferBindingType::Uniform,
             ),
         ];
-    if let Some(images)=&installed.images {for k in 0..images.count() {entries.push(wgpu::BindGroupLayoutEntry {visibility:wgpu::ShaderStages::COMPUTE,..pipelines::texture_entry(k as u32+3,wgpu::TextureSampleType::Uint,false)});}}
+    entries.push(pipelines::buffer_entry(3,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:true}));
     let bindings=d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:Some("environment program bake"),entries:&entries});
     let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("environment program bake"),
@@ -231,11 +268,13 @@ fn bake_animated(
         &[0; 16],
         wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
     );
-    let images=installed.images.as_ref().map(|i|i.install(r,&image_words)).transpose()?.unwrap_or_default();
-    let views=images.iter().map(|i|i.create_view(&Default::default())).collect::<Vec<_>>();
-    let output_view=output.create_view(&Default::default());
-    let mut entries=vec![entry(0,input.as_entire_binding()),entry(1,wgpu::BindingResource::TextureView(&output_view)),entry(2,time.as_entire_binding())];
-    entries.extend(views.iter().enumerate().map(|(k,view)|entry(k as u32+3,wgpu::BindingResource::TextureView(view))));
+    let image_data=crate::gpu_memory::buffer(d,&wgpu::BufferDescriptor {label:Some("environment image float bits"),size:(image_capacity*4) as u64,usage:wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_DST,mapped_at_creation:true});
+    image_data.get_mapped_range_mut(..).slice(..image_words.len()*4).copy_from_slice(bytemuck::cast_slice(&image_words));
+    image_data.unmap();
+    let image_sizes=installed.images.as_ref().map(|i|i.sizes(&image_words)).unwrap_or_default();
+    if let Some(primary)=&mut primary {primary.image_data=Some(image_data.clone());}
+    let output_view=output.create_view(&wgpu::TextureViewDescriptor {array_layer_count:Some(2),..Default::default()});
+    let entries=[entry(0,input.as_entire_binding()),entry(1,wgpu::BindingResource::TextureView(&output_view)),entry(2,time.as_entire_binding()),entry(3,image_data.as_entire_binding())];
     let bind=d.create_bind_group(&wgpu::BindGroupDescriptor {label:Some("environment program inputs"),layout:&pipeline.get_bind_group_layout(0),entries:&entries});
     installed.resources = Some(Resources {
         pipeline,
@@ -243,16 +282,34 @@ fn bake_animated(
         time,
         input,
         output,
-        images,
+        image_sizes,
+        image_data,
     });
-    let source=installed.evaluate_source(r,0.)?;
+    let mut source=installed.evaluate_source(r,0.,0.)?;
+    if primary.is_some() && !installed.animated && program.constant_camera(installed.images.as_ref().is_none_or(images::Images::uniform))? {
+        if let Some(primary)=&mut primary {
+            let camera=crate::gpu_memory::buffer(d,&wgpu::BufferDescriptor {
+                label:Some("constant camera environment"),size:16,
+                usage:wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_DST,mapped_at_creation:false,
+            });
+            let mut encoder=d.create_command_encoder(&Default::default());
+            encoder.copy_texture_to_buffer(source.texture.as_image_copy(),wgpu::TexelCopyBufferInfo {
+                buffer:&camera,layout:wgpu::TexelCopyBufferLayout {offset:0,bytes_per_row:None,rows_per_image:None},
+            },wgpu::Extent3d {width:1,height:1,depth_or_array_layers:1});
+            crate::command_finish::Segments::submit(&r.queue,encoder);
+            primary.constant_camera=Some(camera);
+        }
+    }
+    source.primary=primary;
     Ok((source,installed.animated.then_some(installed)))
 }
 
-pub(crate) fn source_texture(r:&Renderer,[width,height]:[u32;2])->wgpu::Texture {
+pub(crate) fn source_texture(r:&Renderer,size:[u32;2])->wgpu::Texture {source_texture_layers(r,size,2)}
+pub(crate) fn lighting_texture(r:&Renderer,size:[u32;2])->wgpu::Texture {source_texture_layers(r,size,1)}
+fn source_texture_layers(r:&Renderer,[width,height]:[u32;2],layers:u32)->wgpu::Texture {
     crate::gpu_memory::texture(&r.device,&wgpu::TextureDescriptor {
         label:Some("evaluated environment camera and lighting float bits"),
-        size:wgpu::Extent3d {width,height,depth_or_array_layers:2},mip_level_count:1,sample_count:1,
+        size:wgpu::Extent3d {width,height,depth_or_array_layers:layers},mip_level_count:1,sample_count:1,
         dimension:wgpu::TextureDimension::D2,format:wgpu::TextureFormat::Rgba32Uint,
         usage:wgpu::TextureUsages::TEXTURE_BINDING|wgpu::TextureUsages::STORAGE_BINDING|wgpu::TextureUsages::COPY_SRC|wgpu::TextureUsages::COPY_DST,view_formats:&[],
     })
@@ -260,23 +317,24 @@ pub(crate) fn source_texture(r:&Renderer,[width,height]:[u32;2])->wgpu::Texture 
 
 impl Program {
     pub(super) fn has_media(&self)->bool {self.images.as_ref().is_some_and(|images|images.animated())}
+    pub(super) fn uses_time(&self)->bool {self.uses_time}
     /// Identity of evaluated inputs, rather than the animation's clock. STEP
     /// holds and clamped tracks share the same bake and upload history.
-    pub(crate) fn sample_key(&self, request: impl Into<vork_time::Request>) -> Result<Vec<u8>> {
-        let request=request.into();
+    pub(crate) fn sample_key(&self, request: impl Into<vork_time::Request>, media: impl Into<vork_time::Request>) -> Result<Vec<u8>> {
+        let (request,media)=(request.into(),media.into());
         let time=request.numeric()?;
         let mut words = self.inputs.clone();
         if let Some(animation) = &self.animation { animation.words_request(&request,time, &mut words)?; }
         let mut key = bytemuck::cast_slice(&words).to_vec();
         if self.uses_time { key.extend_from_slice(&time.to_bits().to_le_bytes()); }
-        if let Some(images)=&self.images {key.extend(images.sample_key(&request)?);}
+        if let Some(images)=&self.images {key.extend(images.sample_key(&media)?);}
         Ok(key)
     }
-    pub(crate) fn evaluate_source(&self,r:&Renderer,request:impl Into<vork_time::Request>)->Result<Source> {
-        let request=request.into();
+    pub(crate) fn evaluate_source(&self,r:&Renderer,request:impl Into<vork_time::Request>,media:impl Into<vork_time::Request>)->Result<Source> {
+        let (request,media)=(request.into(),media.into());
         let time=request.numeric()?;
         let resources=self.resources.as_ref().context("environment evaluation resources")?;
-        if let Some(images)=&self.images {if images.animated() {images.upload(r,&resources.images,&images.words(&request)?)?;}}
+        if let Some(images)=&self.images {if images.animated() {images.upload(r,&resources.image_data,&resources.image_sizes,&images.words(&media)?)?;}}
         if let Some(animation)=&self.animation {
             let mut words=self.inputs.clone();animation.words_request(&request,time,&mut words)?;
             r.queue.write_buffer(&resources.input,0,bytemuck::cast_slice(&words));
@@ -285,7 +343,7 @@ impl Program {
         let mut encoder=r.device.create_command_encoder(&Default::default());
         {let mut pass=encoder.begin_compute_pass(&Default::default());pass.set_pipeline(&resources.pipeline);pass.set_bind_group(0,&resources.bind,&[]);pass.dispatch_workgroups(self.size[0].div_ceil(8),self.size[1].div_ceil(8),1);}
         crate::command_finish::Segments::submit(&r.queue,encoder);
-        let mut hash=blake3::Hasher::new();hash.update(self.key.as_bytes());hash.update(&self.sample_key(&request)?);
+        let mut hash=blake3::Hasher::new();hash.update(self.key.as_bytes());hash.update(&self.sample_key(&request,&media)?);
         Ok(Source {texture:resources.output.clone(),identity:hash.finalize(),primary:None})
     }
 }
@@ -298,7 +356,7 @@ impl Source {
         let size=stride as u64*h as u64*2;
         let read=crate::gpu_memory::buffer(&r.device,&wgpu::BufferDescriptor {label:Some("environment test readback"),size,usage:wgpu::BufferUsages::MAP_READ|wgpu::BufferUsages::COPY_DST,mapped_at_creation:false});
         let mut encoder=r.device.create_command_encoder(&Default::default());
-        encoder.copy_texture_to_buffer(self.texture.as_image_copy(),wgpu::TexelCopyBufferInfo {buffer:&read,layout:wgpu::TexelCopyBufferLayout {offset:0,bytes_per_row:Some(stride),rows_per_image:Some(h)}},self.texture.size());
+        encoder.copy_texture_to_buffer(self.texture.as_image_copy(),wgpu::TexelCopyBufferInfo {buffer:&read,layout:wgpu::TexelCopyBufferLayout {offset:0,bytes_per_row:Some(stride),rows_per_image:Some(h)}},wgpu::Extent3d {depth_or_array_layers:2,..self.texture.size()});
         r.queue.submit([encoder.finish()]);
         let(tx,rx)=std::sync::mpsc::channel();read.map_async(wgpu::MapMode::Read,..,move |v|{let _=tx.send(v);});r.wait(None)?;rx.recv()??;
         let mapped=read.get_mapped_range(..);
@@ -315,7 +373,7 @@ pub(crate) fn install(r:&Renderer,scene:&v2::Scene,name:&str,base:&Path)->Result
 }
 #[cfg(test)]
 impl Program {
-    pub(crate) fn evaluate(&self,r:&Renderer,time:f32)->Result<Baked> {self.evaluate_source(r,time)?.read(r)}
+    pub(crate) fn evaluate(&self,r:&Renderer,time:f32)->Result<Baked> {self.evaluate_source(r,time,time)?.read(r)}
 }
 
 #[cfg(test)]
@@ -366,12 +424,13 @@ mod tests {
         };
         let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
         for index in [10usize,0,3,7,times.len()-1,2,10,0] {
-            let residual=vork_std::environment::split(&frames[index],0.25).0;
-            let file=root.join(format!("reference-{index}.exr"));residual.save(&file)?;
+            // The same program over this index's static source and weight frames:
+            // both sequence clocks must select them.
             let mut reference=value.clone();reference["animation"]=serde_json::json!([]);
-            reference["images"]["environment_image"]["file"]=serde_json::json!(file);
-            reference["images"]["environment_lighting_weight"]["file"]=serde_json::json!(root.join("one.exr"));
-            image::Rgb32FImage::from_pixel(64,32,image::Rgb([1.;3])).save(root.join("one.exr"))?;
+            for image in ["environment_image","environment_lighting_weight"] {
+                let file=reference["images"][image]["file"].as_str().context("sequence file")?.replace("%06d",&format!("{index:06}"));
+                reference["images"][image]["file"]=serde_json::json!(file);
+            }
             let reference=r.install(v2::from_test_value(reference)?,&root)?;
             let expected=render(&reference,0.)?;
             slot.submit_outputs(&installed,&r,&times[index],ReadbackOutputs {float:FloatOutputs {color:true,..Default::default()},..Default::default()})?;
@@ -393,14 +452,62 @@ mod tests {
             "animation":[{"tracks":[{"path":["materials","world","inputs","gain"],"interpolation":"STEP","keys":[[0,1],[1,1.000001]]}]}]}))?;
         let (first,program)=install(&r,&scene,"world",Path::new("."))?;
         let program=program.context("tracked environment")?;
-        assert_eq!(program.sample_key(0.)?,program.sample_key(0.9)?);
-        assert_ne!(program.sample_key(0.9)?,program.sample_key(1.)?);
+        assert_eq!(program.sample_key(0.,0.)?,program.sample_key(0.9,0.9)?);
+        assert_ne!(program.sample_key(0.9,0.9)?,program.sample_key(1.,1.)?);
         assert_eq!(program.evaluate(&r,0.9)?.image,first.image);
         assert_ne!(program.evaluate(&r,1.)?.image,first.image);
         // A clock-dependent program must still distinguish these sample times.
         let mut timed=program;
         timed.uses_time=true;
-        assert_ne!(timed.sample_key(0.)?,timed.sample_key(0.9)?);
+        assert_ne!(timed.sample_key(0.,0.)?,timed.sample_key(0.9,0.9)?);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires real GPU and pinned Slang"]
+    fn environment_images_do_not_pad_the_source_storage() -> Result<()> {
+        let r=Renderer::new()?;
+        let root=std::env::temp_dir().join(format!("vork-environment-extents-{}",std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        image::Rgb32FImage::from_pixel(32,16,image::Rgb([2.,4.,8.])).save(root.join("full.exr"))?;
+        image::Rgb32FImage::from_pixel(4,2,image::Rgb([0.25;3])).save(root.join("weight.exr"))?;
+        let scene:v2::Scene=serde_json::from_value(serde_json::json!({"version":2,
+            "images":{"full":{"file":"full.exr","color_space":"Linear Rec.709"},"weight":{"file":"weight.exr","color_space":"Non-Color"}},
+            "materials":{"world":{"program":"std/environment_image","inputs":{"image":{"image":"full"},"lighting_weight":{"image":"weight"}}}},
+            "nodes":[]}))?;
+        let (source,_)=install_source(&r,&scene,"world",&root)?;
+        assert_eq!(source.texture.depth_or_array_layers(),2);
+        assert_eq!(source.primary.as_ref().unwrap().image_data.as_ref().unwrap().size(),(2+2*10)*4);
+        assert_eq!(source.primary.as_ref().unwrap().constant_camera.as_ref().unwrap().size(),16);
+        let baked=source.read(&r)?;
+        for (camera,lighting) in baked.camera.pixels().zip(baked.image.pixels()) {
+            assert_eq!(camera.0,[2.,4.,8.]);
+            assert_eq!(lighting.0,[0.5,1.,2.]);
+        }
+        // These scenes need the camera inputs, not a retained camera bake.
+        for path in [false,true] {
+            let mut scene=scene.clone();
+            if path {scene.render.settings.integrator=vork_scene::Integrator::Path(Default::default());}
+            scene.nodes=serde_json::from_value(serde_json::json!([{"type":"camera"},{"type":"light","shape":"environment","material":"world"}]))?;
+            let settings=environment_node::Settings::from_scene(&scene)?;
+            let installed=environment::Environment::new(&r,settings,&scene,&root)?;
+            assert_eq!([installed.source.texture().width(),installed.source.texture().height()],[1,1]);
+            assert_eq!(installed.source.texture().depth_or_array_layers(),1);
+            assert!(!installed.lighting_is_black);
+        }
+        // A visible camera source can have exactly black lighting. Tiny positive
+        // lighting must not be discarded by a moments/energy threshold.
+        for weight in [0.,1e-30] {
+            image::Rgb32FImage::from_pixel(4,2,image::Rgb([weight;3])).save(root.join("weight.exr"))?;
+            let mut scene=scene.clone();
+            scene.render.settings.integrator=vork_scene::Integrator::Path(Default::default());
+            scene.nodes=serde_json::from_value(serde_json::json!([{"type":"camera"},{"type":"light","shape":"environment","material":"world"}]))?;
+            let settings=environment_node::Settings::from_scene(&scene)?;
+            let installed=environment::Environment::new(&r,settings,&scene,&root)?;
+            assert_eq!(installed.lighting_is_black,weight==0.);
+            assert!(installed.primary.as_ref().unwrap().constant_camera.is_some());
+        }
+        std::fs::remove_dir_all(root)?;
         Ok(())
     }
 
@@ -419,12 +526,18 @@ mod tests {
             "nodes":[]}))?;
         for _ in 0..2 {
             let (baked,_)=install(&r,&scene,"world",&root)?;
-            assert_eq!(baked.camera.dimensions(),full.dimensions());
-            for ((camera,lighting),expected) in baked.camera.pixels().zip(baked.image.pixels()).zip(full.pixels()) {
-                for k in 0..3 {
-                    assert!((camera[k]-expected[k]).abs()<0.01,"camera: {camera:?} expected {expected:?}");
-                    assert!((lighting[k]-expected[k]*0.25).abs()<0.01,"lighting: {lighting:?}");
-                }
+            // A small image cannot lower the lighting grid below the program floor.
+            assert_eq!(<[u32;2]>::from(baked.camera.dimensions()),constants::ENVIRONMENT_PROGRAM_SIZE);
+            let step=[baked.camera.width()/full.width(),baked.camera.height()/full.height()];
+            for (camera,lighting) in baked.camera.pixels().zip(baked.image.pixels()) {
+                for k in 0..3 {assert!((lighting[k]-camera[k]*0.25).abs()<=camera[k].abs()*1e-6,"lighting: {lighting:?} camera {camera:?}");}
+            }
+            // Grid texels beside each image texel centre reconstruct that texel; the
+            // last column looks inward rather than across the longitude seam.
+            for (x,y,expected) in full.enumerate_pixels() {
+                let gx=x*step[0]+step[0]/2-u32::from(x+1==full.width());
+                let camera=baked.camera.get_pixel(gx,y*step[1]+step[1]/2);
+                for k in 0..3 {assert!((camera[k]-expected[k]).abs()<0.01,"camera: {camera:?} expected {expected:?}");}
             }
         }
         let mut moving=serde_json::to_value(&scene)?;
@@ -511,12 +624,40 @@ float3 environment(EnvironmentContext ctx,Inputs inputs) {
         Ok(())
     }
     fn spatial_scene() -> serde_json::Value {
-        serde_json::json!({"version":2,"render":{"resolution":[8,4],"background":"environment","settings":{"samples":1,"denoiser":null},"display":{"program":"std/standard"}},
+        serde_json::json!({"version":2,"composition":{"space":"3d","view":{"program":"std/standard"}},"render":{"resolution":[8,4],"background":"environment","settings":{"samples":1,"denoiser":null}},
             "programs":{"world":{"source":"struct Inputs {float gain=1.;}; float3 environment(EnvironmentContext ctx,Inputs i){return float3((ctx.origin.x+3.)*.1,ctx.time*.2,.1)*i.gain;}"}},
             "materials":{"world":{"program":"world"}},
             "nodes":[{"type":"light","name":"world","shape":"environment","material":"world"},
                 {"type":"camera","name":"camera","translation":[0,0,10],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":4}}}]})
     }
+    /// A narrow camera-only cap lies between every midpoint in the lighting bake.
+    /// Actual camera evaluations must validate the source before any RGB transform.
+    #[test]
+    #[ignore = "requires pinned Slang and a real GPU"]
+    fn camera_source_validation_covers_directions_between_bake_samples() -> Result<()> {
+        let r=Renderer::new()?;
+        for integrator in ["raster","path"] {
+            for mode in 0..4 {
+                let value=["negative","NaN","infinity","valid"][mode as usize];
+                let mut input=spatial_scene();
+                input["render"]["settings"]=serde_json::json!({"integrator":integrator,"samples":1,"denoiser":null});
+                input["programs"]["world"]["source"]=serde_json::json!("struct Inputs {uint mode=0;};float3 environment(EnvironmentContext c,Inputs i) {let v=i.mode==0u ? -1. : (i.mode==1u ? asfloat(0x7fc00000u) : (i.mode==2u ? asfloat(0x7f800000u) : 2.));return float3(c.camera && c.direction.z < -0.999999 ? v : 1.);}");
+                input["materials"]["world"]["inputs"]["mode"]=mode.into();
+                let installed=r.install(vork_scene::v2::from_test_value(input)?,Path::new("."))?;
+                let mut frame=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
+                frame.submit(&installed,&r,0.)?;
+                let result=frame.collect(&r);
+                if mode==3 {
+                    assert!(result?.linear_rgba.unwrap().iter().all(|p|p[..3].iter().all(|v|v.is_finite() && *v>0.)),"valid source must render");
+                } else {
+                    let error=result.err().context("invalid camera source must refuse the exposure")?;
+                    assert!(error.to_string().contains("environment radiance must be finite and nonnegative"),"{integrator} {value}: {error:#}");
+                }
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires pinned Slang and Vulkan"]
     fn delivery_spatial_environment_warns_and_renders_approximation() -> Result<()> {
@@ -525,7 +666,7 @@ float3 environment(EnvironmentContext ctx,Inputs inputs) {
         let collector=crate::warnings::Collector::default();
         let _scope=collector.enter();
         let installed=r.install_with_options(scene,Path::new("."),crate::InstallOptions {test_participating_media:false,..Default::default()})?;
-        assert!(installed.environment.primary.is_none());
+        assert!(!installed.environment.primary.as_ref().unwrap().spatial);
         assert!(collector.snapshot().iter().any(|w|w.code=="spatial_environment"));
         let mut frame=installed.create_frame_slot(&r,Default::default())?;
         frame.submit(&installed,&r,0.)?;

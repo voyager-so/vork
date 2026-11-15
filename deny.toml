@@ -10,6 +10,11 @@ ignore = [
     # that maintenance for an unmaintained-only advisory with no reported flaw.
     # Revisit when pulp removes paste or an EXR upgrade removes this dependency.
     { id = "RUSTSEC-2024-0436", reason = "Compile-time paste through pulp/exr; no upstream upgrade removes it without a local fork" },
+    # Unmaintained-only, no patched release: Moda's text core shapes with rustybuzz 0.20 and resvg 0.47, and
+    # ttf-parser arrives through them and cosmic-text 0.19 (newest) via fontdb. Leaving them means rewriting
+    # Moda's shaping on harfrust/skrifa. Revisit when Moda or cosmic-text/usvg move off them.
+    { id = "RUSTSEC-2026-0206", reason = "rustybuzz unmaintained; Moda's text core shapes with it and no upstream release replaces it" },
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser unmaintained; reached through rustybuzz, usvg and cosmic-text's fontdb with no newer release dropping it" },
 
 ]
 
@@ -22,3 +27,28 @@ allow = ["MIT", "MIT-0", "Apache-2.0", "BSD-2-Clause", "BSD-3-Clause", "ISC", "Z
 [[licenses.exceptions]]
 name = "webpki-roots"
 allow = ["CDLA-Permissive-2.0"]
+
+# MPL-2.0 (file-level copyleft, used unmodified): the CSS selector parser under moda-text's HTML parser (scraper).
+[[licenses.exceptions]]
+name = "cssparser"
+allow = ["MPL-2.0"]
+
+# MPL-2.0 (file-level copyleft, used unmodified): the CSS selector parser under moda-text's HTML parser (scraper).
+[[licenses.exceptions]]
+name = "cssparser-macros"
+allow = ["MPL-2.0"]
+
+# MPL-2.0 (file-level copyleft, used unmodified): the CSS selector parser under moda-text's HTML parser (scraper).
+[[licenses.exceptions]]
+name = "dtoa-short"
+allow = ["MPL-2.0"]
+
+# MPL-2.0 (file-level copyleft, used unmodified): the CSS selector parser under moda-text's HTML parser (scraper).
+[[licenses.exceptions]]
+name = "selectors"
+allow = ["MPL-2.0"]
+
+# MPL-2.0 (file-level copyleft, used unmodified): CSS Color 4 parsing for text paints.
+[[licenses.exceptions]]
+name = "cssparser-color"
+allow = ["MPL-2.0"]

@@ -22,3 +22,32 @@ impl SurfaceKernel {
         format!("import vork_constants;import frame;import surface;import {module};\n[shader(\"compute\")][numthreads({threads})] void surface_main({parameters}) {{{call}}}\n")
     }
 }
+
+/// The prebuilt path engine: path transport over the material table with every
+/// capability (`Unspecialized`) and no scene code, compiled once at build for
+/// both backends. A family is what a capability cannot express, because it
+/// changes the kernel's resources or stored state: adaptive sampling and the
+/// inline dielectric boundary capacity. Each family is one driver pipeline for
+/// every scene it draws, so setup can create it before any scene exists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PathEngine { pub adaptive: bool, pub boundaries: u32 }
+#[allow(dead_code)] // Entry generation is shared with build_slang.rs.
+impl PathEngine {
+    /// Boundary capacities with a prebuilt family: no solid, or one at a time.
+    pub const BOUNDARIES: u32 = 1;
+    pub const ALL: [Self;4] = [
+        Self {adaptive:false,boundaries:0}, Self {adaptive:false,boundaries:1},
+        Self {adaptive:true,boundaries:0}, Self {adaptive:true,boundaries:1},
+    ];
+    pub const ENTRY: &'static str = "path_engine";
+    /// The engine keeps every scene proof general: table containment, connection
+    /// transmission, weighted IOR and glTF tint all stay, so no proof selects a
+    /// family. What it leaves out is what no table-material triangle scene has:
+    /// implicit fields, points, AOVs (and Gaussians, which no shipped entry has).
+    pub const DEFINES: [&'static str;6] = ["VORK_NO_IMPLICIT","VORK_AOV_COUNT=0","VORK_PATH_SLANG_OUTLINE","VORK_NO_POINTS","VORK_LIGHT_PATHS","VORK_PROGRAM_COVERAGE"];
+    pub fn name(self) -> String { format!("path_engine_{}_{}",u8::from(self.adaptive),self.boundaries) }
+    pub fn source(self) -> String {
+        format!("import vork_constants;import frame;import variant;import surface;import path;\n[shader(\"compute\")][numthreads(REG_COMPUTE_TILE,REG_COMPUTE_TILE,1)] void {}(uint3 gid:SV_DispatchThreadID) {{path_pixel<{},false,Unspecialized,NoPrograms,{},false>(gid);}}\n",
+            Self::ENTRY,self.adaptive,self.boundaries)
+    }
+}

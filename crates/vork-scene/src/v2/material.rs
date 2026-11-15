@@ -12,9 +12,17 @@ pub struct Image {
     #[serde(default)]
     #[schemars(extend("x-source" = "vork (nested scene-linear render)", "x-help-path" = "image.render", "x-help" = "ImageRender; renders a camera view into the texture; inherits integrator, fps, AOVs; sampling budget follows quality/cost level; closed shutter; scene-linear premultiplied RGBA", "x-help-extra" = "image.render restrictions: shared parent pose; aperture sampling is renderer-selected; geometry_opacity/alpha_cutoff/geometry_normal/environment image inputs unsupported"))]
     pub render: Option<ImageRender>,
-    /// Blender `Image.colorspace_settings.name`. Omitted follows Blender's file default.
+    /// A rendered image's composition: its image graph, run on the capture before it is published.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-source" = "vork", "x-help-path" = "image.composition", "x-help" = "{compositor}|null; a rendered image's image graph; requires render"))]
+    pub composition: Option<ImageComposition>,
+    /// The canvas node this image is a picture of, once the document around the canvas is split from it
+    /// (`Scene::without_compositions`): the 2D engine draws it. Never authored.
+    #[serde(skip)]
+    pub picture_of: Option<String>,
+    /// Explicit input encoding; omitted uses embedded colour metadata, then the format fallback.
     #[serde(default)]
-    #[schemars(extend("x-source" = "Blender 5.2.1 Image.colorspace_settings.name", "x-help-path" = "image.color_space", "x-help" = "sRGB|Linear Rec.709|Non-Color|null; null: hdr/exr/ies linear, others sRGB"))]
+    #[schemars(extend("x-source" = "Blender 5.2.1 Image.colorspace_settings.name", "x-help-path" = "image.color_space", "x-help" = "sRGB|Display P3|Linear Rec.709|Linear Rec.2020|ACEScg|Non-Color|null; omitted/null: embedded colour description, else hdr/exr/ies linear Rec.709 and other files sRGB"))]
     pub color_space: Option<ColorSpace>,
     #[serde(default)]
     #[schemars(extend("x-source" = "glTF 2.0 sampler.wrapS", "x-help-path" = "image.wrap_s", "x-help" = "repeat|clamp_to_edge|mirrored_repeat"))]
@@ -30,23 +38,49 @@ pub struct Image {
     pub min_filter: MinFilter,
 }
 impl Image {
-    /// Blender's file default when `color_space` is omitted: float formats
-    /// (.hdr, .exr) and .ies are linear, every other file is sRGB.
+    /// This rendered image's graph: its composition's ordered entries.
+    pub fn compositor(&self) -> &[CompositeEntry] {
+        self.composition.as_ref().map_or(&[][..], |composition| composition.compositor.as_slice())
+    }
+    /// The render this image runs: its own fields and image graph over the settings it inherits from
+    /// `parent`. None for an image that is not rendered.
+    pub fn resolved_render(&self, parent: &Render) -> Option<Render> {
+        let render = self.render.as_ref()?;
+        let integrator = parent.settings.integrator.clone();
+        Some(Render {
+            camera: render.camera.clone(),
+            root: render.root.clone(),
+            resolution: render.resolution,
+            background: render.background.clone(),
+            compositor: self.compositor().to_vec(),
+            settings: Settings {
+                promotion_denoise: parent.settings.promotion_denoise,
+                bounded_secondary_compilation: parent.settings.bounded_secondary_compilation,
+                approximate_field_boundaries: parent.settings.approximate_field_boundaries,
+                previs: parent.settings.previs,
+                reconstruct: parent.settings.reconstruct,
+                seed: parent.settings.seed,
+                samples: parent.settings.samples,
+                ..Settings::with_integrator(integrator)
+            },
+            fps: parent.fps,
+            aovs: parent.aovs.clone(),
+            ..Render::default()
+        })
+    }
+    /// Upload encoding after input colour conversion. Metadata is resolved by the decoder.
     pub fn is_srgb(&self) -> bool {
-        if self.render.is_some() {
+        if self.render.is_some() || self.picture_of.is_some() {
             return false;
         }
         match self.color_space {
-            Some(ColorSpace::Srgb) => true,
-            Some(ColorSpace::LinearRec709 | ColorSpace::NonColor) => false,
-            None => !matches!(
-                std::path::Path::new(self.file.as_deref().unwrap_or(""))
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .map(str::to_ascii_lowercase)
-                    .as_deref(),
-                Some("hdr" | "exr" | "ies")
-            ),
+            Some(ColorSpace::LinearRec709 | ColorSpace::LinearRec2020 | ColorSpace::ACEScg | ColorSpace::NonColor) => false,
+            // Float files upload scene-linear whatever they declare: EXR pixels are associated, and a transfer
+            // curve applied to associated colour is wrong. The decoder converts a declared encoded space itself.
+            Some(ColorSpace::Srgb | ColorSpace::DisplayP3) | None => !std::path::Path::new(self.file.as_deref().unwrap_or(""))
+                .extension()
+                .and_then(|e| e.to_str())
+                .is_some_and(|e| ["hdr", "exr", "ies"].iter().any(|float| e.eq_ignore_ascii_case(float))),
         }
     }
     pub fn sampler(&self) -> Sampler {
@@ -102,7 +136,13 @@ pub struct ImageRender {
     pub resolution: [u32; 2],
     #[schemars(extend("x-source" = "vork (Blender RenderSettings.film_transparent plus a constant RGB)", "x-help-path" = "image.render.background", "x-help" = "environment|transparent|RGB"))]
     pub background: Background,
-    #[schemars(extend("x-source" = "vork", "x-help-path" = "image.render.compositor", "x-help" = "same image graph as render.compositor; names local to this capture"))]
+}
+/// `images.<name>.composition`: the image graph of a rendered image.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ImageComposition {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[schemars(extend("x-source" = "vork", "x-help-path" = "image.composition.compositor", "x-help" = "same ordered image graph as composition.compositor; names local to this capture"))]
     pub compositor: Vec<CompositeEntry>,
 }
 impl Default for ImageRender {
@@ -113,33 +153,6 @@ impl Default for ImageRender {
             root: r.root,
             resolution: r.resolution,
             background: r.background,
-            compositor: r.compositor,
-        }
-    }
-}
-impl ImageRender {
-    /// Lower inherited settings once for the normal validation/install path.
-    pub fn resolve(&self, parent: &Render) -> Render {
-        let integrator = parent.settings.integrator.clone();
-        Render {
-            camera: self.camera.clone(),
-            root: self.root.clone(),
-            resolution: self.resolution,
-            background: self.background.clone(),
-            compositor: self.compositor.clone(),
-            settings: Settings {
-                promotion_denoise: parent.settings.promotion_denoise,
-                bounded_secondary_compilation: parent.settings.bounded_secondary_compilation,
-                approximate_field_boundaries: parent.settings.approximate_field_boundaries,
-                previs: parent.settings.previs,
-                reconstruct: parent.settings.reconstruct,
-                seed: parent.settings.seed,
-                samples: parent.settings.samples,
-                ..Settings::with_integrator(integrator)
-            },
-            fps: parent.fps,
-            aovs: parent.aovs.clone(),
-            ..Render::default()
         }
     }
 }
@@ -150,6 +163,11 @@ pub enum ColorSpace {
     Srgb,
     #[serde(rename = "Linear Rec.709")]
     LinearRec709,
+    #[serde(rename = "Linear Rec.2020")]
+    LinearRec2020,
+    ACEScg,
+    #[serde(rename = "Display P3")]
+    DisplayP3,
     #[serde(rename = "Non-Color")]
     NonColor,
 }
@@ -264,7 +282,7 @@ pub struct Material {
     #[schemars(with = "NameOr<Program>")]
     pub program: String,
     #[serde(default)]
-    #[schemars(extend("x-source" = "OpenPBR Surface 1.1.1 defaults (spec table)", "x-help-path" = "material.inputs", "x-help" = "{name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{node}|{channel}|{geometry}}", "x-help-extra" = "material.inputs (transmission): transmission_depth 0 = sqrt(tint) per solid interface; thin sheets = full tint; positive-depth solids = Beer absorption\nmaterial.inputs (animation): numeric scalar/vector/colour inputs on surface/environment/compute/compositor/display programs use ordinary tracks; geometry_thin_walled is structural; an omitted animated program input has a zero blend baseline (author inputs for another baseline)\nmaterial.inputs.subsurface: thick: radius × radius_scale; thin: diffuse reflection/transmission split by scatter_anisotropy"))]
+    #[schemars(extend("x-source" = "OpenPBR Surface 1.1.1 defaults (spec table)", "x-help-path" = "material.inputs", "x-help" = "{name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{step}|{channel}|{geometry}}", "x-help-extra" = "material.inputs (transmission): transmission_depth 0 = sqrt(tint) per solid interface; thin sheets = full tint; positive-depth solids = Beer absorption\nmaterial.inputs (animation): numeric scalar/vector/colour inputs on surface/environment/compute/compositor/display programs use ordinary tracks; geometry_thin_walled is structural; an omitted animated program input has a zero blend baseline (author inputs for another baseline)\nmaterial.inputs.subsurface: thick: radius × radius_scale; thin: diffuse reflection/transmission split by scatter_anisotropy"))]
     pub inputs: Table<Input>,
     #[serde(default = "material_double_sided")]
     #[schemars(extend("x-source" = "Blender renders both sides; imported glTF retains doubleSided", "x-help-path" = "material.double_sided", "x-help" = "bool; false culls back faces"))]
@@ -296,7 +314,7 @@ pub enum Input {
     Grid(GridBinding),
     Aov(AovBinding),
     Channel(ChannelBinding),
-    Node(NodeBinding),
+    Step(StepBinding),
     /// An enum token of the program's reflected input type.
     Token(String),
 }
@@ -310,9 +328,9 @@ pub struct GeometryBinding {
 /// An earlier named compositor entry, local to this graph.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
-pub struct NodeBinding {
-    #[schemars(extend("x-source" = "vork", "x-help-path" = "material.node.node", "x-help" = "earlier compositor entry name; clamped bilinear image sampling"))]
-    pub node: String,
+pub struct StepBinding {
+    #[schemars(extend("x-source" = "vork", "x-help-path" = "material.step.step", "x-help" = "earlier compositor entry name; clamped bilinear image sampling"))]
+    pub step: String,
 }
 /// A volume grid buffer for a FloatGrid or VectorGrid program input.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
@@ -463,7 +481,10 @@ mod image_tokens {
         assert!(!image(serde_json::json!({"file":"a.exr"})).is_srgb());
         assert!(!image(serde_json::json!({"file":"a.png","color_space":"Non-Color"})).is_srgb());
         assert!(!image(serde_json::json!({"file":"a.png","color_space":"Linear Rec.709"})).is_srgb());
-        assert!(image(serde_json::json!({"file":"a.exr","color_space":"sRGB"})).is_srgb());
+        // A float file uploads linear whatever it declares; the decoder converts a declared encoding itself.
+        assert!(!image(serde_json::json!({"file":"a.exr","color_space":"sRGB"})).is_srgb());
+        assert!(!image(serde_json::json!({"file":"a.exr","color_space":"Display P3"})).is_srgb());
+        assert!(image(serde_json::json!({"file":"a.png","color_space":"Display P3"})).is_srgb());
         let s = image(serde_json::json!({"file":"a.png","wrap_s":"clamp_to_edge","wrap_t":"mirrored_repeat",
             "mag_filter":"nearest","min_filter":"nearest_mipmap_linear"})).sampler();
         assert_eq!(s.gltf_codes(), (33071, 33648, 9986, 9728));

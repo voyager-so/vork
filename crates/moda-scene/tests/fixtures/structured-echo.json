@@ -1,0 +1,75 @@
+{
+  "nodes": [
+    {
+      "id": "fx-echo-text",
+      "type": "richtext",
+      "x": 140,
+      "y": 180,
+      "rotation": 0,
+      "scale": 1,
+      "width": 1000,
+      "height": 220,
+      "htmlContent": "<p style=\"font-family: Inter; font-size: 84px; font-weight: 700; color: #f4f7fb\">ECHO</p>",
+      "effects": [
+        {
+          "type": "echo",
+          "id": "effect-echo-fixture-1",
+          "count": 5,
+          "offsetX": 9,
+          "offsetY": 7,
+          "scaleStep": 0.96,
+          "colorStart": "#3a86ff",
+          "colorEnd": "#8338ec",
+          "opacityStep": 0.82
+        }
+      ]
+    },
+    {
+      "id": "fx-echo-text-mono",
+      "type": "richtext",
+      "x": 140,
+      "y": 460,
+      "rotation": 0,
+      "scale": 1,
+      "width": 1000,
+      "height": 180,
+      "htmlContent": "<p style=\"font-family: Inter; font-size: 56px; color: #ffd166\">repeat repeat</p>",
+      "effects": [
+        {
+          "type": "echo",
+          "id": "effect-echo-fixture-2",
+          "count": 3,
+          "offsetX": -6,
+          "offsetY": 6,
+          "scaleStep": 1,
+          "colorStart": "#073b4c",
+          "opacityStep": 0.7
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "effects-structured-echo",
+      "width": 1280,
+      "height": 800,
+      "nodeIds": ["fx-echo-text", "fx-echo-text-mono"],
+      "fills": [
+        {
+          "id": "fill-0",
+          "paint": {
+            "type": "solid",
+            "color": "#171b24"
+          }
+        }
+      ]
+    }
+  ],
+  "config": {
+    "renderPageClipping": true
+  },
+  "variables": [],
+  "canvasRootNodeIds": [],
+  "layoutMode": "vertical"
+}

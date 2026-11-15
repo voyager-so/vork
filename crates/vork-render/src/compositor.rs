@@ -2,6 +2,8 @@
 use super::*;
 use vork_slang::{Compiler, CompositeProgram};
 mod images;
+mod canvas;
+pub(crate) use canvas::CanvasGraph;
 #[derive(Clone, Copy)]
 pub(crate) enum Normalization {
     None,
@@ -70,7 +72,7 @@ pub(crate) fn dependencies(programs:&std::collections::HashMap<String,Program>, 
                 "motion"=>result.motion=true,
                 "shadow_catcher"=>result.catcher=true,
                 c if c.starts_with("aov:")=>result.aovs=true,
-                c if c.starts_with("node:")=>{nodes.insert(c[5..].to_owned());},
+                c if c.starts_with("step:")=>{nodes.insert(c[5..].to_owned());},
                 c if c.starts_with("image:")=>result.images=true,
                 _=>(),
             }
@@ -100,13 +102,13 @@ pub(crate) fn image_plan(scene:&Scene,programs:&std::collections::HashMap<String
         }
         reads
     }
-    let mut needed=reads(scene,programs,&scene.render.compositor,scene.render.root.as_deref(),main);
+    let mut needed=reads(scene,programs,scene.compositor(),scene.render.root.as_deref(),main);
     let mut visited=std::collections::BTreeSet::new();
     while let Some(name)=needed.iter().find(|name|!visited.contains(*name)).cloned() {
         visited.insert(name.clone());
-        let Some(render)=scene.images.get(&name).and_then(|i|i.render.as_ref()) else {continue;};
-        let (mut d,_)=dependencies(programs,&render.compositor);
-        let input_reads=reads(scene,programs,&render.compositor,render.root.as_deref(),d);
+        let Some((image,render))=scene.images.get(&name).and_then(|i|i.render.as_ref().map(|render|(i,render))) else {continue;};
+        let (mut d,_)=dependencies(programs,image.compositor());
+        let input_reads=reads(scene,programs,image.compositor(),render.root.as_deref(),d);
         d.images=input_reads.iter().any(|name|scene.images.get(name).is_some_and(|i|i.render.is_some()));
         needed.extend(input_reads);
         main.color |= d.color;main.beauty |= d.beauty;main.depth |= d.depth;main.ids |= d.ids;
@@ -123,9 +125,9 @@ pub(crate) struct FrameInputs {
     buffers: std::collections::HashMap<String, wgpu::Buffer>,
 }
 impl FrameInputs {
-    pub(crate) fn new(s: &InstalledScene, r: &Renderer, names: &[vork_scene::v2::CompositeEntry]) -> Self {
+    pub(crate) fn new(programs: &std::collections::HashMap<String, Program>, r: &Renderer, names: &[vork_scene::v2::CompositeEntry]) -> Self {
         let buffers = names.iter().filter_map(|name| {
-            let program = &s.compositor[name.material()];
+            let program = &programs[name.material()];
             program.animation.as_ref()?;
             Some((name.material().clone(), init(&r.device, "animated compositor inputs",
                 bytemuck::cast_slice(&program.input_words),
@@ -133,13 +135,21 @@ impl FrameInputs {
         }).collect();
         Self { buffers }
     }
-    pub(crate) fn upload(&self, s: &InstalledScene, time: f32, changes: &mut crate::values::ChangeTracker) {
+    /// A world's inputs at a sample's time.
+    pub(crate) fn upload(&self, s: &InstalledScene, time: f32, changes: &mut crate::values::ChangeTracker) -> Result<()> {
+        self.publish(&s.compositor, changes, |animation, words| { animation.words(time, words); Ok(()) })
+    }
+    /// Each animated program's words as `sample` evaluates them, published through the change tracker: a
+    /// world's at a sample's time, a canvas's at its frame's exact instant.
+    fn publish(&self, programs: &std::collections::HashMap<String, Program>, changes: &mut crate::values::ChangeTracker,
+        mut sample: impl FnMut(&programs::InputAnimation, &mut [u32]) -> Result<()>) -> Result<()> {
         for (name, buffer) in &self.buffers {
-            let program = &s.compositor[name];
+            let program = &programs[name];
             let mut words = program.input_words.clone();
-            program.animation.as_ref().unwrap().words(time, &mut words);
+            sample(program.animation.as_ref().expect("an animated program"), &mut words)?;
             changes.upload(buffer, 0, bytemuck::cast_slice(&words));
         }
+        Ok(())
     }
 }
 /// Enable producers independently of the user's file/readback channels.
@@ -160,26 +170,49 @@ pub(crate) fn channel_flags(s: &InstalledScene, names: &[vork_scene::v2::Composi
                 }
         })
 }
+/// A graph's entries as (authored path, material) instances.
+fn instances<'a>(instances: &mut Vec<(String, &'a String)>, path: String, chain: &'a [vork_scene::v2::CompositeEntry]) {
+    for (index, name) in chain.iter().enumerate() {
+        instances.push((format!("{path}[{index}]"), name.material()));
+    }
+}
+/// The programs of a world's graphs: its own and each rendered image's.
 pub(crate) fn install(
     r: &Renderer,
     scene: &Scene,
     base: &Path,
+    opened: &crate::footage::Opened,
 ) -> Result<std::collections::HashMap<String, Program>> {
-    let mut result = std::collections::HashMap::new();
-    let mut instances = Vec::new();
-    fn add<'a>(instances: &mut Vec<(String, &'a String)>, path: String, chain: &'a [vork_scene::v2::CompositeEntry]) {
-        for (index, name) in chain.iter().enumerate() {
-            instances.push((format!("{path}[{index}]"), name.material()));
-        }
-    }
+    let mut all = Vec::new();
     // Authored paths precede resolved chains so automatic lens/motion entries
     // cannot shift the index reported for an authored per-step instance.
-    add(&mut instances, "render.compositor".into(), &scene.render.compositor);
+    instances(&mut all, "composition.compositor".into(), scene.compositor());
     for (name, image) in &scene.images {
-        if let Some(render) = &image.render {
-            add(&mut instances, format!("images.{name}.render.compositor"), &render.compositor);
+        if image.render.is_some() {
+            instances(&mut all, format!("images.{name}.composition.compositor"), image.compositor());
         }
     }
+    install_instances(r, scene, base, opened, all)
+}
+/// The programs of a composition's own graph alone: a canvas's, which renders no images.
+fn install_own(
+    r: &Renderer,
+    scene: &Scene,
+    base: &Path,
+    opened: &crate::footage::Opened,
+) -> Result<std::collections::HashMap<String, Program>> {
+    let mut own = Vec::new();
+    instances(&mut own, "composition.compositor".into(), scene.compositor());
+    install_instances(r, scene, base, opened, own)
+}
+fn install_instances(
+    r: &Renderer,
+    scene: &Scene,
+    base: &Path,
+    opened: &crate::footage::Opened,
+    instances: Vec<(String, &String)>,
+) -> Result<std::collections::HashMap<String, Program>> {
+    let mut result = std::collections::HashMap::new();
     for (path, name) in instances {
         if result.contains_key(name) {
             continue;
@@ -223,7 +256,7 @@ pub(crate) fn install(
             use vork_scene::v2::Input;
             let identity = match serde_json::from_value::<Input>(value.clone())? {
                 Input::Texture(v) => format!("image:{}", v.image),
-                Input::Node(v) => format!("node:{}", v.node),
+                Input::Step(v) => format!("step:{}", v.step),
                 Input::Aov(v) => format!("aov:{}", v.aov),
                 Input::Channel(v) => v.channel.token().to_owned(),
                 _ => anyhow::bail!("{path}: input {name} must bind an image"),
@@ -256,13 +289,13 @@ pub(crate) fn install(
         let mut channels = Vec::new();
         let mut slots = std::collections::BTreeMap::new();
         let mut words = compiled.inputs.pack(&inputs, |name, value| {
-            // Internal image keys: a kernel channel token, "image:<name>" or "aov:<name>"; graph images use "node:<name>".
+            // Internal image keys: a kernel channel token, "image:<name>" or "aov:<name>"; graph images use "step:<name>".
             let channel = match serde_json::from_value::<vork_scene::v2::Input>(value.clone()) {
                 Ok(vork_scene::v2::Input::Texture(t)) if scene.images.contains_key(&t.image) => format!("image:{}", t.image),
-                Ok(vork_scene::v2::Input::Node(n)) => format!("node:{}", n.node),
+                Ok(vork_scene::v2::Input::Step(n)) => format!("step:{}", n.step),
                 Ok(vork_scene::v2::Input::Channel(c)) => c.channel.token().to_owned(),
                 Ok(vork_scene::v2::Input::Aov(a)) if scene.render.aovs.iter().any(|d| d.name == a.aov) => format!("aov:{}", a.aov),
-                _ => anyhow::bail!("compositor input {name}: expected {{\"node\": earlier name}}, {{\"image\": images name}}, {{\"channel\": ...}}, {{\"aov\": render.aovs name}}; got {value}"),
+                _ => anyhow::bail!("compositor input {name}: expected {{\"step\": earlier name}}, {{\"image\": images name}}, {{\"channel\": ...}}, {{\"aov\": render.aovs name}}; got {value}"),
             };
             let channel = channel.as_str();
             let slot = if let Some(index) = channels.iter().position(|c| c == channel) {
@@ -274,7 +307,7 @@ pub(crate) fn install(
             slots.insert(name.to_owned(), slot);
             Ok(slot)
         }).with_context(|| format!("{path}: material {name}, program {} (materials.{name}.inputs)", material.program))?;
-        let animation = programs::InputAnimation::new(scene, base, name, &compiled.inputs, &mut words)?;
+        let animation = programs::InputAnimation::new_in(scene, base, name, &compiled.inputs, &mut words, opened)?;
         let input_words = words.clone();
         let words = init(
             &r.device,
@@ -318,43 +351,70 @@ pub(crate) fn record(
         let (finished,dispatch)=crate::catcher::finish(s,r,uniform,targets,&source,size,accumulated)?;
         source=finished;dispatches.push(dispatch);accumulated=Normalization::None;
     }
+    let (finished, images) = record_images(images::Sources::World(s, targets), &s.compositor, r, uniform, &source, names,
+        &inputs.buffers, size, accumulated, stage, |label, bytes, usage| s.transients.buffer(&r.device, label, bytes, usage))?;
+    source = finished;
+    dispatches.extend(images);
+    if !dispatches.is_empty() {
+        recorder.compositor(stage, dispatches, Vec::new(), None);
+    }
+    Ok(source)
+}
+
+/// Record a graph's entries over `source` (associated RGBA, row-major, `size`): one dispatch per live entry,
+/// and a last one that resamples to `size` when the last entry works at another resolution. A world's and a
+/// canvas's graph are recorded here; `sources` is where the entries' world channels and image inputs come
+/// from, and `allocate` makes each entry's image.
+#[allow(clippy::too_many_arguments)]
+fn record_images(
+    sources: images::Sources<'_>,
+    programs: &std::collections::HashMap<String, Program>,
+    r: &Renderer,
+    uniform: &wgpu::Buffer,
+    source: &wgpu::Buffer,
+    names: &[vork_scene::v2::CompositeEntry],
+    inputs: &std::collections::HashMap<String, wgpu::Buffer>,
+    size: [u32; 2],
+    accumulated: Normalization,
+    stage: graph::Pass,
+    mut allocate: impl FnMut(&str, u64, wgpu::BufferUsages) -> wgpu::Buffer,
+) -> Result<(wgpu::Buffer, Vec<graph::Dispatch>)> {
+    let mut source = source.clone();
+    let mut dispatches = Vec::new();
     let original = source.clone();
     let original_normalization = accumulated;
     let mut previous_size = size;
     let mut nodes = std::collections::BTreeMap::new();
-    let (_, live) = dependencies(&s.compositor, names);
+    let (_, live) = dependencies(programs, names);
     for (index, entry) in names.iter().enumerate() {
         if !live[index] {continue;}
         let name = entry.material();
-        let program = &s.compositor[name];
-        let words = inputs.buffers.get(name).unwrap_or(&program.words);
+        let program = &programs[name];
+        let words = inputs.get(name).unwrap_or(&program.words);
         let extent = entry.extent(size)?;
         let bytes = u64::from(extent[0]).checked_mul(u64::from(extent[1]))
             .and_then(|pixels| pixels.checked_mul(constants::ACCUMULATION_PIXEL_BYTES))
             .context("compositor image size overflows")?;
         let limits = r.device.limits();
         ensure!(bytes <= u64::from(limits.max_storage_buffer_binding_size) && bytes <= limits.max_buffer_size,
-            "{}", crate::gpu_memory::limit_message(format_args!("compositor entry {index}"), format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",limits.max_storage_buffer_binding_size,limits.max_buffer_size), "reduce compositor image resolution"));
-        let output = s.transients.buffer(&r.device, &format!("{stage:?} image {index}"),
+            crate::gpu_memory::device_limit(format_args!("compositor entry {index}"), format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",limits.max_storage_buffer_binding_size,limits.max_buffer_size), "reduce compositor image resolution"));
+        let output = allocate(&format!("{stage:?} image {index}"),
             bytes,
             wgpu::BufferUsages::STORAGE);
         // Size queries use authored metadata even when the previous producer is dead.
         previous_size=if index==0 {size} else {names[index-1].extent(size)?};
-        dispatches.push(images::pass(s, r, uniform, targets, program, words, &source,
+        dispatches.push(images::pass(sources, r, uniform, program, words, &source,
             size, extent, previous_size, accumulated.first(index == 0), &program.compiled.entry, &output, &nodes, &original, original_normalization)?);
         source = output;
         previous_size = extent;
         if let Some(name) = entry.name() { nodes.insert(name.to_owned(), (source.clone(), extent)); }
     }
     if previous_size != size {
-        let program = &s.compositor[names.last().unwrap().material()];
-        let output = s.transients.buffer(&r.device, "compositor output", u64::from(size[0]) * u64::from(size[1]) * constants::ACCUMULATION_PIXEL_BYTES, wgpu::BufferUsages::STORAGE);
-        dispatches.push(images::pass(s, r, uniform, targets, program, &program.words, &source,
+        let program = &programs[names.last().unwrap().material()];
+        let output = allocate("compositor output", u64::from(size[0]) * u64::from(size[1]) * constants::ACCUMULATION_PIXEL_BYTES, wgpu::BufferUsages::STORAGE);
+        dispatches.push(images::pass(sources, r, uniform, program, &program.words, &source,
             size, size, previous_size, Normalization::None, "vork_copy", &output, &nodes, &original, original_normalization)?);
         source = output;
     }
-    if !dispatches.is_empty() {
-        recorder.compositor(stage, dispatches, Vec::new(), None);
-    }
-    Ok(source)
+    Ok((source, dispatches))
 }

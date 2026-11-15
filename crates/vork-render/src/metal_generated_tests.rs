@@ -8,7 +8,7 @@ fn installed_scene_modules() -> Result<()> {
     let destination = std::env::var_os("VORK_INSTALLED_METAL_DIR")
         .expect("scripts/check-metal-generated supplies an output directory");
     std::fs::create_dir_all(&destination)?;
-    let mut renderer = pollster::block_on(Renderer::create(|_| Ok(true), true))?;
+    let mut renderer = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
     renderer.adapter_info.backend = wgpu::Backend::Metal;
     let mut field = Vec::new();
     for z in 0..8 { for y in 0..8 { for x in 0..8 {

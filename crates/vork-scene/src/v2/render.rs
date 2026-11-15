@@ -1,5 +1,5 @@
 use super::*;
-/// An ordered image-graph node. Resource names remain shorthand for an unnamed node.
+/// An ordered image-graph step. Resource names remain shorthand for an unnamed step.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(untagged)]
 pub enum CompositeEntry {
@@ -44,6 +44,32 @@ impl CompositeEntry {
 impl From<String> for CompositeEntry { fn from(s: String) -> Self { Self::Material(s) } }
 impl From<&str> for CompositeEntry { fn from(s: &str) -> Self { Self::Material(s.into()) } }
 
+/// Check normalized graph material slots before the untagged input decoder loses
+/// the obsolete key. Inline materials and nested captures have already been hoisted.
+pub(super) fn refuse_node_bindings(scene: &serde_json::Value) -> Result<()> {
+    use serde_json::Value;
+    fn node_compositions<'a>(nodes: Option<&'a Value>, out: &mut Vec<&'a Value>) {
+        for node in nodes.and_then(Value::as_array).into_iter().flatten() {
+            out.extend(node.get("composition"));
+            node_compositions(node.get("children"), out);
+        }
+    }
+    let mut compositions: Vec<&Value> = scene.get("composition").into_iter().chain(
+        scene.get("images").and_then(Value::as_object).into_iter().flatten()
+            .filter_map(|(_, image)| image.get("composition"))).collect();
+    node_compositions(scene.get("nodes"), &mut compositions);
+    for composition in compositions {
+        for entry in composition.get("compositor").and_then(Value::as_array).into_iter().flatten() {
+            let Some(name) = entry.get("material").unwrap_or(entry).as_str() else { continue };
+            let inputs = scene.get("materials").and_then(|m| m.get(name))
+                .and_then(|m| m.get("inputs")).and_then(Value::as_object);
+            ensure!(!inputs.into_iter().flatten().any(|(_, input)| input.get("node").is_some()),
+                "compositor {{node:NAME}} was renamed to {{step:NAME}}; see vork help upgrade");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(default, deny_unknown_fields)]
 pub struct Render {
@@ -62,11 +88,12 @@ pub struct Render {
     pub duration: vork_time::Clock,
     #[schemars(extend("x-source" = "Blender 5.2.1 render motion blur", "x-help-path" = "render.motion_blur", "x-help" = "MotionBlur|null; non-null enables; shutter in frames"))]
     pub motion_blur: Option<MotionBlur>,
-    #[schemars(extend("x-source" = "vork (Blender RenderSettings.film_transparent plus a constant RGB)", "x-help-path" = "render.background", "x-help" = "environment|transparent|RGB; RGB and transparent apply to camera escapes and opacity passthrough; path glass transmission sees the World"))]
+    #[schemars(extend("x-source" = "vork (Blender RenderSettings.film_transparent plus a constant RGB)", "x-help-path" = "render.background", "x-help" = "environment|transparent|RGB|CSS colour; RGB and transparent apply to camera escapes and opacity passthrough; path glass transmission sees the World; a 2D canvas takes transparent or a CSS colour"))]
     pub background: Background,
-    #[schemars(with = "NameOr<Material>", extend("x-source" = "Blender 5.2.1 AgX; display program: vork", "x-help-path" = "render.display", "x-help" = "material-name|inline material; display program; EXR stays scene-linear"))]
-    pub display: NameOr<Material>,
-    #[schemars(extend("x-source" = "vork", "x-help-path" = "render.compositor", "x-help" = "(material-name|{material,name?,resolution?})[]; ordered image graph, last output; material may be inline"))]
+    /// The image graph this render runs, resolved from its composition (`Scene::main_render`,
+    /// `Image::resolved_render`). Authored as `composition.compositor`; empty in a decoded scene.
+    #[serde(skip)]
+    #[schemars(skip)]
     pub compositor: Vec<CompositeEntry>,
     /// How the shot is rendered, resolved from the profile and render-call values
     /// (`Profile::resolve`). Not scene content: scene files cannot carry it
@@ -76,7 +103,14 @@ pub struct Render {
     #[cfg_attr(not(any(test, feature="test-support")), serde(skip_deserializing))]
     #[schemars(skip)]
     pub settings: Settings,
+    /// Final output quantization dither. Output encoding owns dither, so this is not scene content
+    /// (`Scene::from_json` rejects it); Rust tests turn it off to assert exact codes.
+    #[serde(skip_serializing_if = "is_true")]
+    #[cfg_attr(not(any(test, feature="test-support")), serde(skip_deserializing))]
+    #[schemars(skip)]
+    pub dither: bool,
 }
+fn is_true(value: &bool) -> bool { *value }
 impl Default for Render {
     fn default() -> Self {
         Self {
@@ -88,9 +122,9 @@ impl Default for Render {
             duration: constants::DURATION_SECONDS.parse().expect("default duration"),
             motion_blur: None,
             background: Background::Mode(BackgroundMode::Environment),
-            display: NameOr::Inline(Material { program: "std/agx".into(), inputs: Table::new(), double_sided: true, priority: 0, opacity: None }),
             compositor: Vec::new(),
             settings: Settings::default(),
+            dither: true,
         }
     }
 }
@@ -110,7 +144,7 @@ pub struct Settings {
     pub approximate_field_boundaries: bool,
     /// Internal blocking-look policy, retained when an effect needs ray camera visibility.
     pub previs: bool,
-    /// Internal scene-linear spatial reconstruction; independent of optional OIDN.
+    /// Internal scene-linear film normalization; independent of optional OIDN.
     pub reconstruct: bool,
     /// Camera integration budget shared with render-image captures.
 
@@ -152,7 +186,7 @@ impl Settings {
         }
         settings
     }
-    /// Stop denoising: raster reconstructs spatially, path samples stay raw.
+    /// Stop denoising: retain film-filtered camera samples.
     pub fn disable_denoiser(&mut self) {
         self.promotion_denoise = Some(false);
         match &mut self.integrator {
@@ -207,6 +241,8 @@ impl<'de> Deserialize<'de> for Settings {
 pub enum Background {
     Color(#[serde(deserialize_with="super::numeric")] [f32; 3]),
     Mode(BackgroundMode),
+    /// A 2D canvas's background: a CSS colour behind every node.
+    Css(String),
 }
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
@@ -497,11 +533,11 @@ mod color_tests {
 
     #[test]
     fn display_is_a_program_instance() {
-        assert!(matches!(Render::default().display, NameOr::Inline(_)));
-        let scene = Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera"}],"render":{"display":{"program":"std/standard","inputs":{"gamma":1.74}}}}"#).unwrap();
+        assert!(matches!(Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera"}]}"#).unwrap().view(), NameOr::Inline(_)));
+        let scene = Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera"}],"composition":{"space":"3d","view":{"program":"std/standard","inputs":{"gamma":1.74}}}}"#).unwrap();
         scene.validate().unwrap();
-        let NameOr::Name(name) = &scene.render.display else { panic!("inline lowering") };
-        assert_eq!(scene.materials[name].program, "std/standard");
+        let NameOr::Name(name) = scene.view() else { panic!("inline lowering") };
+        assert_eq!(scene.materials[&name].program, "std/standard");
         for field in ["view_transform", "exposure", "gamma", "dither_intensity", "look"] {
             assert!(serde_json::from_value::<Render>(serde_json::json!({field: 1})).is_err());
         }
@@ -549,16 +585,71 @@ pub struct Denoiser {}
 mod compositor_tests {
     use super::*;
     #[test]
+    fn old_graph_binding_is_refused_with_one_upgrade_line() {
+        use serde_json::json;
+        for input in [json!({"node":"saved"}), json!({"node":"saved","step":"saved"})] {
+            let material = json!({"program":"copy_program","inputs":{"source":input}});
+            for entry in [json!("read"), json!({"material":"read"}),
+                material.clone(), json!({"material":material})] {
+                let graph = json!([{"name":"saved","material":"copy"}, entry]);
+                for location in ["main", "capture", "inline-capture"] {
+                    let mut scene = json!({"version":2,"nodes":[{"type":"camera"}],
+                        "programs":{"copy_program":{"source":crate::v2::COPY_COMPOSITOR}},
+                        "materials":{"copy":{"program":"copy_program"},"read":material}});
+                    match location {
+                        "main" => scene["composition"] = json!({"space":"3d","compositor":graph}),
+                        "capture" => scene["images"] = json!({"capture":{"composition":{"compositor":graph},"render":{}}}),
+                        _ => scene["composition"] = json!({"space":"3d","compositor":[{"program":"copy_program",
+                            "inputs":{"source":{"image":{"composition":{"compositor":graph},"render":{}}}}}]}),
+                    }
+                    let error = Scene::from_json(&serde_json::to_vec(&scene).unwrap()).unwrap_err();
+                    assert_eq!(format!("{error:#}"),
+                        "compositor {node:NAME} was renamed to {step:NAME}; see vork help upgrade", "{location}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn step_binding_has_one_serialized_spelling() {
+        use serde_json::json;
+        let input: Input = serde_json::from_value(json!({"step":"saved"})).unwrap();
+        assert!(matches!(&input, Input::Step(binding) if binding.step == "saved"));
+        assert_eq!(serde_json::to_value(input).unwrap(), json!({"step":"saved"}));
+        for value in [json!({"node":"saved"}), json!({"step":"saved","node":"saved"}),
+            json!({"step":"saved","image":"saved"}), json!({"step":1})] {
+            assert!(serde_json::from_value::<Input>(value).is_err());
+        }
+    }
+
+    #[test]
+    fn step_names_resolve_within_each_capture_graph() {
+        use serde_json::json;
+        let graph = json!([{"name":"saved","material":"copy"}, "read"]);
+        let mut document = json!({"version":2,"nodes":[{"type":"camera","name":"saved"}],
+            "programs":{"copy_program":{"source":crate::v2::COPY_COMPOSITOR}},
+            "materials":{"copy":{"program":"copy_program"},
+                "read":{"program":"copy_program","inputs":{"source":{"step":"saved"}}}},
+            "composition":{"space":"3d","compositor":graph},"render":{}, "images":{"capture":{"composition":{"compositor":graph},"render":{}}}});
+        let scene = Scene::from_json(&serde_json::to_vec(&document).unwrap()).unwrap();
+        assert!(matches!(&scene.materials["read"].inputs["source"], Input::Step(b) if b.step == "saved"));
+        // Neither a main-graph name nor a scene-node name makes a capture edge valid.
+        document["images"]["capture"]["composition"]["compositor"] = json!(["read"]);
+        let error = Scene::from_json(&serde_json::to_vec(&document).unwrap()).unwrap_err();
+        assert!(format!("{error:#}").contains("step saved must name an earlier entry"), "{error:#}");
+    }
+
+    #[test]
     fn graph_names_are_backward_and_local_and_extents_are_checked() {
         use serde_json::json;
         let scene = |entries: serde_json::Value| Scene::from_json(&serde_json::to_vec(&json!({
             "version":2,"programs":{"copy_program":{"source":crate::v2::COPY_COMPOSITOR}},"nodes":[{"type":"camera"}],
-            "render":{"resolution":[65,33],"compositor":entries},
+            "composition":{"space":"3d","compositor":entries},"render":{"resolution":[65,33]},
             "materials":{"copy":{"program":"copy_program"},
-                "read":{"program":"copy_program","inputs":{"source":{"node":"saved"}}}}
+                "read":{"program":"copy_program","inputs":{"source":{"step":"saved"}}}}
         })).unwrap());
         let valid=scene(json!([{"material":"copy","name":"saved","resolution":0.5},"read"])).unwrap();
-        assert_eq!(valid.render.compositor[0].extent([65,33]).unwrap(),[32,16]);
+        assert_eq!(valid.compositor()[0].extent([65,33]).unwrap(),[32,16]);
         for entries in [
             json!(["read",{"material":"copy","name":"saved"}]),
             json!([{"material":"read","name":"saved"}]),
@@ -578,12 +669,12 @@ mod compositor_tests {
         let mut scene: Scene = serde_json::from_value(serde_json::json!({
             "version":2,"programs":{"copy_program":{"source":crate::v2::COPY_COMPOSITOR}},"nodes":[{"type":"camera"}],
             "materials":{"bloom":{"program":"copy_program","inputs":{"original":{"channel":"color"},"source":{"channel":"color"}}},"grade":{"program":"copy_program"}},
-            "render":{"compositor":["bloom","grade"]}
+            "composition":{"space":"3d","compositor":["bloom","grade"]},"render":{}
         })).unwrap();
         scene.validate().unwrap();
-        scene.render.compositor = vec!["grade".into(), "bloom".into()];
+        *scene.compositor_mut() = vec!["grade".into(), "bloom".into()];
         scene.validate().unwrap();
-        scene.render.compositor = vec!["bloom".into(), "bloom".into()];
+        *scene.compositor_mut() = vec!["bloom".into(), "bloom".into()];
         scene.validate().unwrap();
     }    #[test]
     fn aov_names_are_plain_channel_tokens() {

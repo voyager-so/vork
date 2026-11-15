@@ -55,22 +55,15 @@ void resolve_denoise(uint3 gid : SV_DispatchThreadID) {
     if(uint(guide_frame.temporal.w)==REG_DENOISE_GUIDES_PATH) {return;}
     int2 p = int2(gid.xy);
     float4 guide_albedo = float4(0.); float4 guide_normal = float4(0.);
-    var identity=CONTROL_LOAD(albedo,p,0).a;
     for (int sample = 0; sample < CONTROL_SAMPLES; sample++) {
         var a=CONTROL_LOAD(albedo,p,sample);
-        if(a.a<0. || a.a!=identity) {identity=-1.;}
-        a.a=a.a!=0. ? 1. : 0.;
         guide_albedo += a / float(CONTROL_SAMPLES);
         guide_normal += float4(CONTROL_LOAD(normals, p, sample).xyz, 0.) / float(CONTROL_SAMPLES);
     }
     uint index = (gid.y * width + gid.x) * 2u;
     if (guide_frame.temporal.x > 0.) {
         guide_albedo += denoising_guides[index];
-        let previous=denoising_guides[index+1u];guide_normal.rgb+=previous.rgb;
-        if(previous.w!=identity) {identity=-1.;}
+        guide_normal+=denoising_guides[index+1u];
     }
-    // Mixed camera coverage and transported radiance cannot use a single
-    // primary-surface guide. This word is ignored by OIDN.
-    guide_normal.w=identity;
     denoising_guides[index] = guide_albedo; denoising_guides[index + 1u] = guide_normal;
 }

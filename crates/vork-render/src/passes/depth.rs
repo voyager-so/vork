@@ -28,8 +28,9 @@ pub(crate) fn encode(encoder: &mut wgpu::CommandEncoder, f: &crate::view::ViewSt
 
 #[cfg(test)]
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn diagnostics_preserve_glass_only_and_empty_depth_renders() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else { return Ok(()); };
+    let r = crate::test_renderer()?;
     let base: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/closed-glass-slab.json"))?;
     for (kind, refraction) in [("glass", "environment"), ("glass", "screen"), ("opaque", "environment"), ("culled", "environment"), ("empty", "environment")] {
         for samples in [1, 4] {

@@ -3,9 +3,12 @@ Geometry builders: box, sphere, grid, cylinder, cone, torus, capsule, revolve,
 rounded_box, text, extrude and sweep. Options: vork help std --all.
 Programs: std/hair (curves), std/sky
 (environment). Depth of field: std/camera use_dof; motion blur: render.motion_blur.
-std/agx (default) and std/standard: Blender 5.2.1 display programs.
-Inputs: exposure (stops), gamma, dither_intensity; AgX also look and lut.
-Named display instances animate with material-input tracks; looks use STEP.
+std/agx (default) and std/standard: Blender 5.2.1 view programs; bind at composition.view.
+Inputs: exposure (stops), gamma; AgX also look, lut and destination_lut.
+Display P3 and Rec.2100 outputs take AgX's own rendering for that display: look none
+and the library lut only (the other looks are sRGB renderings and refuse them);
+Rec.2100 at peak_luminance 1000 with reference_white 203 or 100.
+Named view instances animate with material-input tracks; looks use STEP.
 <!-- all -->
 SHAPE REFERENCE
 For vork std NAME JSON, name defaults to NAME and prefixes geometry and buffers.
@@ -17,6 +20,8 @@ profile clearance. Box faces span 0..1 UV. Round shapes use Y as axis; cylinder
 has both caps, cone has a bottom cap, capsule height includes caps, and torus
 radius measures to the tube centre. Round UVs run from +X toward -Z around Y
 and top to bottom. Grid lies in XZ with +Y normals; size is its full XZ extent.
+Sweep scale must be positive; closed paths require matching endpoint scales and whole turns of twist.
+SVG extrusion uses XY metres without flipping Y.
 <!-- generated-shapes:start -->
 Scene geometry: {std: NAME, ...options}; omit name: the table key or inline position owns identity.
 box: {name?:string="box",size?:vec3=[2,2,2]} → GeometryFragment
@@ -28,18 +33,16 @@ capsule: {name?:string="capsule",radius?:number=0.5,height?:number=2,segments?:n
 rounded_box: {name?:string="rounded_box",size?:vec3=[1,1,1],radius?:number=0.1,segments?:number=8} → GeometryFragment
 grid: {name?:string="grid",size?:vec2=[2,2],segments?:vec2=[1,1]} → GeometryFragment; XZ plane facing +Y; size,segments:[x,z]; u along +X, v along +Z
 revolve: {name?:string="revolve",profile:vec2[],segments?:number=32} → GeometryFragment; profile:[radius,height][] around +Y; consecutive duplicates ignored; radius-0 ends close; other ends open; last=first closes loop; corners >30° sharp; u from +X toward -Z, v along profile
-text: {name?:string="text",body:string,font:string,size?:number,extrude?:number,bevel_depth?:number,bevel_resolution?:number,align_x?:"left"|"center"|"right"|"justify"|"flush",align_y?:"center"|"top_baseline"|"top"|"bottom_baseline"|"bottom"} → GeometryFragment; font:TrueType/OpenType file; extrude:half-depth; bevel_depth:metres
+text: {name?:string="text",body:string,font:string,size?:number,extrude?:number,bevel_depth?:number,bevel_resolution?:number,align_x?:"left"|"center"|"right",align_y?:"center"|"top_baseline"|"top"|"bottom_baseline"|"bottom"} → GeometryFragment; font:TrueType/OpenType file; extrude:half-depth; bevel_depth:metres
 extrude: {name?:string="extrude",outline?:vec2[],d?:string,holes?:vec2[][],depth?:number=1,bevel_depth?:number=0,bevel_resolution?:number=4} → GeometryFragment; d:SVG path in XY metres XOR outline/holes; first subpath outer, rest holes; curves flatten at 1e-4 of extent; XY outline/holes: either winding; depth:full Z thickness, centred; +Z front; bevel_depth:inward rim radius; bevel_resolution:1..32; wall corners >30° sharp; cap uv spans outline bounds (v down); wall u along contour, v front→back
 sweep: {name?:string="sweep",profile:vec2[],path:vec3[],scale?:number|number[]=1,twist?:number=0,caps?:boolean=true} → GeometryFragment; profile:[x,y][] in the plane normal to the path, x to the right, y up at the path start; path:polyline in metres; consecutive duplicates ignored; profile last=first closes the section (caps allowed), otherwise an open strip; path last=first closes the loop (no caps); frames are rotation-minimising along the path; scale: one value or one per path point, applied to the profile; twist: total rotation of the profile from path start to end in radians, linear in arc length; corners >30° sharp; u along profile, v along path
 <!-- generated-shapes:end -->
 
 SHADER REFERENCE
 std/hair: Principled Hair (Chiang); curves only. Physical hair selects path transport
-with Chiang fibre scattering. Typed inputs/defaults/ranges: vork help field std/hair (also below).
+with Chiang fibre scattering. Inputs below.
 std/environment_image: Image image; optional Image lighting_weight; lat-long +Y up, longitude atan2(z,x)/2pi+0.5; lighting_weight.r weights lighting only (unbound = 1).
 std/sky: Nishita scattering atmosphere.
-Typed sky inputs/defaults/ranges: vork help field std/sky (also below).
-Text defaults and units: vork help field std/text (also below).
 vork std sky: atmosphere plus declared solar light; sun_size is full angle, sun_intensity scales solar emission.
 vork std environment: {file,output,name?,threshold?,color_space?,fps?}; weight EXR plus environment program and declared sun; threshold defaults to 10.
 Modules (import std.<m>):

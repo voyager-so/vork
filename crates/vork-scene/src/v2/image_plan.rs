@@ -18,17 +18,19 @@ fn medium_materials(nodes: &[Node]) -> BTreeSet<&str> {
 impl Scene {
     pub(super) fn validate_image_sources(&self, nodes: &BTreeMap<&str, &Node>) -> Result<()> {
         for (name, image) in &self.images {
+            if image.picture_of.is_some() { continue; }
             ensure!(
                 image.file.is_some() != image.render.is_some(),
                 "image {name}: requires exactly one of file or render"
             );
             if let Some(render) = &image.render {
                 ensure!(
-                    !matches!(image.color_space, Some(ColorSpace::Srgb)),
-                    "image {name}: render sources are scene-linear"
+                    matches!(image.color_space, None | Some(ColorSpace::LinearRec709 | ColorSpace::NonColor)),
+                    "image {name}: render sources carry their scene-linear source colour space"
                 );
-                self.validate_render(&render.resolve(&self.render), nodes)?;
+                self.validate_render(&image.resolved_render(&self.render).expect("a rendered image"), nodes)?;
             }
+            ensure!(image.composition.is_none() || image.render.is_some(), "image {name}: composition is a rendered image's image graph; give the image a render");
         }
         fn environment(scene: &Scene, nodes: &[Node]) -> Result<()> {
             for node in nodes {
@@ -49,8 +51,7 @@ impl Scene {
         }
         let medium_materials = medium_materials(&self.nodes);
         for (name, material) in &self.materials {
-            let medium = material.program == "std/fog"
-                || medium_materials.contains(name.as_str());
+            let medium = medium_materials.contains(name.as_str());
             for (field, input) in &material.inputs {
                 let image = match input {
                     Input::Texture(binding) => Some(&binding.image),
@@ -125,16 +126,20 @@ impl Scene {
             states: &mut HashMap<String, u8>,
             out: &mut Vec<String>,
         ) -> Result<()> {
-            let Some(render) = scene.images.get(name).and_then(|i| i.render.as_ref()) else {
+            let Some((image, render)) = scene.images.get(name).and_then(|i| i.render.as_ref().map(|render| (i, render))) else {
                 return Ok(());
             };
+            // A canvas's picture is drawn by the 2D engine, not captured by a camera.
+            if render.root.as_deref().is_some_and(|root| scene.is_canvas_node(root)) {
+                return Ok(());
+            }
             match states.get(name) {
                 Some(1) => anyhow::bail!("render image dependency cycle at {name}"),
                 Some(2) => return Ok(()),
                 _ => {}
             }
             states.insert(name.into(), 1);
-            for dependency in scene.image_reads(render.root.as_deref()).into_iter().chain(scene.compositor_image_reads(&render.compositor)) {
+            for dependency in scene.image_reads(render.root.as_deref()).into_iter().chain(scene.compositor_image_reads(image.compositor())) {
                 visit(scene, &dependency, states, out)?;
             }
             states.insert(name.into(), 2);
@@ -148,7 +153,7 @@ impl Scene {
         }
         states.clear();
         let mut used = Vec::new();
-        for name in self.image_reads(root).into_iter().chain(self.compositor_image_reads(&self.render.compositor)) {
+        for name in self.image_reads(root).into_iter().chain(self.compositor_image_reads(self.compositor())) {
             visit(self, &name, &mut states, &mut used)?;
         }
         Ok(used)
@@ -179,8 +184,8 @@ mod tests {
     fn image_inherits_parent_settings_without_authored_copies() {
         let mut parent: Render=crate::v2::from_test_value(json!({"fps":48,"aovs":[{"name":"mask","type":"value"}]})).unwrap();
         parent.settings=crate::v2::from_test_value(json!({"integrator":"path","samples":8})).unwrap();
-        let image: ImageRender=crate::v2::from_test_value(json!({"camera":"other","resolution":[32,16]})).unwrap();
-        let resolved=image.resolve(&parent);
+        let image: Image=crate::v2::from_test_value(json!({"render":{"camera":"other","resolution":[32,16]}})).unwrap();
+        let resolved=image.resolved_render(&parent).unwrap();
         assert_eq!(resolved.fps,crate::Time::integer(48));
         assert_eq!(resolved.settings.integrator,parent.settings.integrator);
         assert_eq!(resolved.aovs,parent.aovs);
@@ -193,21 +198,21 @@ mod tests {
             let error=crate::v2::from_test_value::<ImageRender>(authored).unwrap_err().to_string();
             assert!(error.contains("unknown field") && error.contains(key),"{error}");
         }
-        let omitted: ImageRender=crate::v2::from_test_value(json!({})).unwrap();
+        let omitted: Image=crate::v2::from_test_value(json!({"render":{}})).unwrap();
 
-        assert_eq!(omitted.resolve(&parent).settings.samples,8);
-        assert_eq!(omitted.resolve(&Render::default()).settings.samples,64);
+        assert_eq!(omitted.resolved_render(&parent).unwrap().settings.samples,8);
+        assert_eq!(omitted.resolved_render(&Render::default()).unwrap().settings.samples,64);
     }
     #[test]
     fn image_sample_budget_follows_resolved_profile_and_overrides() {
-        let capture = ImageRender::default();
+        let capture: Image = crate::v2::from_test_value(json!({"render":{}})).unwrap();
         for profile in ["std/draft", "std/final", "std/path"] {
             let profile = Profile::load(profile).unwrap();
             let mut parent = Render::default();
             parent.settings = profile.resolve(&serde_json::Map::new()).unwrap();
-            assert_eq!(capture.resolve(&parent).settings.samples, parent.settings.samples);
+            assert_eq!(capture.resolved_render(&parent).unwrap().settings.samples, parent.settings.samples);
             parent.settings = test_settings(&parent.settings, &[("samples".into(), json!(17))].into_iter().collect()).unwrap();
-            assert_eq!(capture.resolve(&parent).settings.samples, 17);
+            assert_eq!(capture.resolved_render(&parent).unwrap().settings.samples, 17);
 
         }
     }
@@ -264,7 +269,8 @@ mod tests {
         v["materials"]["screen"]=json!({"program":"custom","inputs":{"alpha_cutoff":{"image":"feed"}}});
         crate::v2::from_test_value::<Scene>(v).unwrap().validate().unwrap();
         let mut v = valid();
-        v["materials"]["screen"] = json!({"program":"std/fog","inputs":{"scattering":{"image":"feed"}}});
+        v["materials"]["screen"] = json!({"program":{"source":include_str!("../../tests/fixtures/medium.slang")},"inputs":{"scattering":{"image":"feed"}}});
+        v["nodes"].as_array_mut().unwrap().push(json!({"type":"light","shape":"environment","medium":"screen"}));
         assert!(
             crate::v2::from_test_value::<Scene>(v)
                 .unwrap()

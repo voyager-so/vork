@@ -107,7 +107,7 @@ try:
         print('npm ci portability check needs all three native tarballs; host install only.', flush=True)
     run([sys.executable, '-m', 'venv', project / '.venv'])
     python = project / '.venv' / ('Scripts/python.exe' if os.name == 'nt' else 'bin/python')
-    run([python, '-m', 'pip', 'install', '--index-url', f'http://127.0.0.1:{http.server_address[1]}/simple/', '--no-cache-dir', 'vork'], project)
+    run([python, '-m', 'pip', 'install', '--index-url', f'http://127.0.0.1:{http.server_address[1]}/simple/', '--no-cache-dir', 'vork', 'vork-native-' + target], project)
     run([python, ROOT / 'scripts/test-registry-install', *(['--gpu'] if a.gpu else [])], project)
     if a.init:
         run([python, 'scene.py'], a.work / 'python starter project')

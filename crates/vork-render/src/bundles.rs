@@ -85,7 +85,7 @@ impl Recorder<'_> {
         if s.pipelines.program_trace && matches!(kind,Kind::Depth|Kind::Controls|Kind::TransparentControls) {
             b.set_bind_group(2,self.shadow_bind,&[]);
         }
-        if matches!(kind, Kind::TransparentFragments(_) | Kind::Visibility(_)) || (s.pipelines.field_controls && matches!(kind,Kind::Controls|Kind::TransparentControls)) {
+        if matches!(kind, Kind::TransparentFragments(_) | Kind::Visibility(_)) || ((s.pipelines.field_controls || s.pipelines.software_raster) && matches!(kind,Kind::Controls|Kind::TransparentControls)) || (s.pipelines.software_raster && kind==Kind::Depth) {
             b.set_bind_group(2, self.fragments.expect("transparent fragment list"), &[]);
             b.set_bind_group(3, self.fragments_geometry.expect("transparent opacity geometry"), &[]);
             if s.pipelines.program_trace {b.set_bind_group(4,self.shadow_bind,&[]); }
@@ -126,6 +126,7 @@ impl Recorder<'_> {
                 continue;
             }
             let draw = &s.draws[i];
+            if !draw.rasterized() {continue;}
             if kind==Kind::Depth && s.pipelines.field_controls && draw.implicit.is_some() {continue;}
             let flags = &s.plan.draws[i];
             let moving = flags.moving;

@@ -133,6 +133,23 @@ impl Entry {
             copies,
         }
     }
+    /// An entry whose producer records its own copy into the staging: the 2D canvas, which has one plane.
+    /// The credit, the encoder surfaces and the delivered frame are the ones a 3D slot's entry holds.
+    pub(crate) fn staging(device: &wgpu::Device, bytes: u64) -> Self {
+        Self {
+            credit: Arc::default(),
+            readback: crate::gpu_memory::buffer(device, &wgpu::BufferDescriptor {
+                label: Some("ring sink staging"),
+                size: bytes.max(4),
+                usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+            encoder_surfaces: Vec::new(),
+            frame: None,
+            output: None,
+            copies: Vec::new(),
+        }
+    }
     /// Preserve sink leases and staging while replacing the frame's producers.
     pub(crate) fn rebind_pixels(&mut self, pixels: &wgpu::Buffer) {
         for copy in &mut self.copies { copy.source = pixels.clone(); }
@@ -166,11 +183,12 @@ mod tests {
     use crate::*;
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn grown_slots_read_current_pixels_through_every_preserved_ring() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let scene: Scene = vork_scene::v2::from_test_value(serde_json::json!({
             "version":2,
-            "render":{"resolution":[8,8],"settings":{"integrator":"raster","samples":1},"display":{"program":"std/agx","inputs":{"dither_intensity":0}}},
+            "composition":{"space":"3d","view":{"program":"std/agx","inputs":{}}},"render":{"dither":false,"resolution":[8,8],"settings":{"integrator":"raster","samples":1}},
             "buffers":{"p":{"type":"vec3","data":[[-2,-2,0],[2,-2,0],[2,2,0],[-2,2,0]]},"i":{"type":"u32","data":[0,1,2,0,2,3]}},
             "geometry":{"quad":{"attributes":{"POSITION":"p"},"indices":"i"}},
             "programs":{"color":{"source":"import vork; struct Inputs {}; Closure surface(ShadingContext ctx, Inputs i) { return unlit(ctx.time < .5 ? float3(1,0,0) : float3(0,1,0)); }"}},

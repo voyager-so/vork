@@ -5,6 +5,8 @@ pub(crate) fn module(native: bool) -> String {
     let transforms = [
         ("object_to_generated", "uint object_index, float3 position", "let bounds=objects[object_index].reserved; let minimum=float3(asfloat(material_words[bounds]),asfloat(material_words[bounds+1u]),asfloat(material_words[bounds+2u])); let extent=float3(asfloat(material_words[bounds+3u]),asfloat(material_words[bounds+4u]),asfloat(material_words[bounds+5u])); return (position-minimum)/select(extent!=float3(0.),extent,float3(1.));"),
         ("world_to_object", "uint object_index, float3 position", "return mul(float4(position,1.),transpose(object_normal(object_index))).xyz;"),
+        ("object_direction_to_world", "uint object_index, float3 direction", "return normalize(mul(float4(direction,0.),object_model(object_index)).xyz);"),
+        ("object_normal_to_world", "uint object_index, float3 normal", "return normalize(mul(float4(normal,0.),object_normal(object_index)).xyz);"),
         ("world_normal_to_object", "uint object_index, float3 normal", "return normalize(mul(float4(normal,0.),transpose(object_model(object_index))).xyz);"),
         ("world_to_camera", "float3 position", "return mul(float4(position,1.),frame.view).xyz;"),
         ("world_to_window", "float3 position", "let clip=mul(float4(position,1.),frame.vp); return float3(clip.xy/clip.w*.5+.5,0.);"),
@@ -33,6 +35,8 @@ pub(crate) fn validation_stubs() -> String {
     stubs.push_str(
     "fn vork_object_to_generated(i:u32,p:vec3<f32>)->vec3<f32>{return p+vec3(f32(i));}\n\
      fn vork_world_to_object(i:u32,p:vec3<f32>)->vec3<f32>{return p+vec3(f32(i));}\n\
+     fn vork_object_direction_to_world(i:u32,p:vec3<f32>)->vec3<f32>{return p+vec3(f32(i));}\n\
+     fn vork_object_normal_to_world(i:u32,p:vec3<f32>)->vec3<f32>{return p+vec3(f32(i));}\n\
      fn vork_world_normal_to_object(i:u32,p:vec3<f32>)->vec3<f32>{return p+vec3(f32(i));}\n\
      fn vork_world_to_camera(p:vec3<f32>)->vec3<f32>{return p;}\n\
      fn vork_world_to_window(p:vec3<f32>)->vec3<f32>{return p;}\n");

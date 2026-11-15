@@ -99,7 +99,7 @@ fail:
 /* Consumes preparation and fd on every return. Match the actual Vulkan UUID. */
 NvSession *vork_nv_open(NvSession *s, int fd, uint64_t allocation_size, const unsigned char *uuid,
                          unsigned width, unsigned height, unsigned pitch, unsigned fps_num, unsigned fps_den, unsigned bitrate, unsigned gop_frames,
-                         unsigned capacity, int *error) {
+                         unsigned primaries, unsigned capacity, int *error) {
     *error = -1;
     if (!s) { close(fd); return NULL; }
     s->capacity = capacity;
@@ -182,13 +182,14 @@ NvSession *vork_nv_open(NvSession *s, int fd, uint64_t allocation_size, const un
     config.rcParams.zeroReorderDelay = 1;
     config.encodeCodecConfig.h264Config.repeatSPSPPS = 1;
     /* NVENC's RGB input conversion produces limited-range BT.709 YUV. Without
-     * VUI tags decoders can assume BT.601 and change the rendered colours. */
+     * VUI tags decoders can assume BT.601 and change the rendered colours.
+     * The primaries are the frames' display's, as an H.273 code. */
     NV_ENC_CONFIG_H264_VUI_PARAMETERS *vui = &config.encodeCodecConfig.h264Config.h264VUIParameters;
     vui->videoSignalTypePresentFlag = 1;
     vui->videoFormat = 5;
     vui->videoFullRangeFlag = 0;
     vui->colourDescriptionPresentFlag = 1;
-    vui->colourPrimaries = NV_ENC_VUI_COLOR_PRIMARIES_BT709;
+    vui->colourPrimaries = (NV_ENC_VUI_COLOR_PRIMARIES)primaries;
     vui->transferCharacteristics = NV_ENC_VUI_TRANSFER_CHARACTERISTIC_BT709;
     vui->colourMatrix = NV_ENC_VUI_MATRIX_COEFFS_BT709;
     NV_ENC_INITIALIZE_PARAMS initialize = {0};

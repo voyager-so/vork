@@ -7,7 +7,7 @@ import stream;
 #ifndef VORK_POINT_WORDS_REGISTER
 #define VORK_POINT_WORDS_REGISTER t29
 #endif
-[[vk::binding(10,0)]] StructuredBuffer<uint> point_words : register(VORK_POINT_WORDS_REGISTER);
+[[vk::binding(11,0)]] StructuredBuffer<uint> point_words : register(VORK_POINT_WORDS_REGISTER);
 uint point_header(uint object) {if(point_words[0]==0u) return 0u;return point_words[object+1u];}
 float3 point_vec3(uint at) {return asfloat(uint3(point_words[at],point_words[at+1u],point_words[at+2u]));}
 float4 point_vec4(uint at) {return float4(point_vec3(at),asfloat(point_words[at+3u]));}
@@ -56,7 +56,11 @@ VertexIn point_vertex(VertexIn v,uint object) {
     v.attr7=point_vec4(a+39u);
 #endif
 #if VORK_ATTRIBUTES > 8
+#ifdef VORK_STAGE_SCALARS
+    [unroll] for(uint i=0u;i<VORK_ATTRIBUTES-8u;i++) set_attribute_extra(v,i,point_vec4(a+43u+i*4u));
+#else
     [unroll] for(uint i=0u;i<VORK_ATTRIBUTES-8u;i++) v.attr_extra[i]=point_vec4(a+43u+i*4u);
+#endif
 #endif
     return v;
 }

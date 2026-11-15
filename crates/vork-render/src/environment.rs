@@ -37,6 +37,7 @@ pub(super) struct Environment {
     pub settings: environment_node::Settings,
     pub primary: Option<environment_program::Primary>,
     pub mean: [f32; 3],
+    pub lighting_is_black: bool,
     animated: Option<Animated>,
     initial_filter_scale:f32,
     pub node: Option<usize>,
@@ -70,22 +71,34 @@ impl Integral {
 }
 impl Environment {
     pub(crate) fn has_media(&self)->bool {self.animated.as_ref().is_some_and(|a|a.program.has_media())}
+    /// Whether the environment program reads `time`.
+    pub(crate) fn uses_time(&self) -> bool {
+        self.primary.as_ref().is_some_and(|p| p.uses_time) || self.animated.as_ref().is_some_and(|a| a.program.uses_time())
+    }
     pub(crate) fn animated(&self) -> bool {
         self.animated.is_some()
     }
-    pub(crate) fn sample_key(&self,time:impl Into<vork_time::Request>)->Result<Vec<u8>> {
-        self.animated.as_ref().map_or_else(||Ok(Vec::new()), |a|a.program.sample_key(time))
+    /// `time` is the scene instant (scene-owned tracks and the program's `time` read it);
+    /// `media` the instant its movies show: the light's node clock (rule 7), see `media_request`.
+    pub(crate) fn sample_key(&self,time:impl Into<vork_time::Request>,media:impl Into<vork_time::Request>)->Result<Vec<u8>> {
+        self.animated.as_ref().map_or_else(||Ok(Vec::new()), |a|a.program.sample_key(time,media))
+    }
+    /// The instant the environment's movies show at scene `request`: its node's local time,
+    /// or `None` while the node is absent (rule 1).
+    pub(crate) fn media_request(&self,animation:&crate::animation::Plan,request:&vork_time::Request)->Result<Option<vork_time::Request>> {
+        let Some(node)=self.node else {return Ok(Some(request.clone()))};
+        Ok(animation.node_instant(request,node)?.map(vork_time::Request::Exact))
     }
     /// Only values change: source radiance, proposal, moments and the retained
     /// filter passes. Every consumer keeps the same installed texture views.
-    pub(crate) fn update(&self, r: &Renderer, time: impl Into<vork_time::Request>, changes: &mut values::LightingTracker) -> Result<()> {
+    pub(crate) fn update(&self, r: &Renderer, time: impl Into<vork_time::Request>, media: impl Into<vork_time::Request>, changes: &mut values::LightingTracker) -> Result<()> {
         let Some(animated) = &self.animated else {
             return Ok(());
         };
-        let time=time.into();
-        let key=animated.program.sample_key(&time)?;
+        let (time,media)=(time.into(),media.into());
+        let key=animated.program.sample_key(&time,&media)?;
         if !changes.changed(values::LightingKey::EnvironmentRadiance,&key) {return Ok(());}
-        animated.program.evaluate_source(r,time)?;
+        animated.program.evaluate_source(r,time,media)?;
         let mut encoder = r.device.create_command_encoder(&Default::default());
         animated.evaluation.encode(r,&mut encoder);
         for integral in &animated.integrals {
@@ -137,7 +150,7 @@ impl Environment {
         let source=environment_program::source_texture(r,[1,1]).create_view(&Default::default());
         let sampler=d.create_sampler(&Default::default());
         Self {settings:environment_node::Settings {source:None,material:None,medium:None},
-            primary:None,mean:[0.;3],animated:None,initial_filter_scale:1.,node:None,
+            primary:None,mean:[0.;3],lighting_is_black:false,animated:None,initial_filter_scale:1.,node:None,
             source,distribution:None,distribution_size:[1,1],specular:image.clone(),diffuse:image.clone(),
             brdf:image.clone(),ltc:image,sampler:sampler.clone(),image_sampler:sampler}
     }
@@ -147,6 +160,16 @@ impl Environment {
         scene: &vork_scene::v2::Scene,
         base: &Path,
     ) -> Result<Self> {
+        Self::new_in(r, config, scene, base, &Default::default())
+    }
+    /// [`Self::new`] within a document open, reading media through the sources that open read.
+    pub(crate) fn new_in(
+        r: &Renderer,
+        config: environment_node::Settings,
+        scene: &vork_scene::v2::Scene,
+        base: &Path,
+        opened: &crate::footage::Opened,
+    ) -> Result<Self> {
         let settings = config.has_radiance().then_some(&config);
         let d = &r.device;
         let mut program=None;
@@ -155,9 +178,9 @@ impl Environment {
         let mut filtered_path=None;
         let source=if let Some(e)=settings {
             let material=e.material.as_ref().context("environment radiance material")?;
-            let (baked,installed)=environment_program::install_source(r,scene,material,base)?;
+            let (baked,installed)=environment_program::install_source_in(r,scene,material,base,opened)?;
             primary=baked.primary;program=installed;
-            if primary.is_none() {
+            if !primary.as_ref().is_some_and(|p|p.spatial) {
                 let path=cache::path(r,baked.identity);filtered=cache::Filtered::read(&path);filtered_path=Some(path);
             }
             baked.texture
@@ -165,9 +188,9 @@ impl Environment {
             let texture=environment_program::source_texture(r,[1,1]);
             r.queue.write_texture(texture.as_image_copy(),bytemuck::cast_slice(&[0f32;8]),wgpu::TexelCopyBufferLayout {offset:0,bytes_per_row:Some(16),rows_per_image:Some(1)},texture.size());texture
         };
-        let source_transport=primary.is_none() && scene.render.settings.integrator.is_path();
+        let source_transport=!primary.as_ref().is_some_and(|p|p.spatial) && scene.render.settings.integrator.is_path();
         let proposal_needed=filtered.is_none() || program.is_some() || source_transport;
-        let evaluation=(settings.is_some() && primary.is_none()).then(||if proposal_needed {evaluated::Evaluation::new(r,&source)} else {evaluated::Evaluation::validation(r,&source)});
+        let evaluation=(settings.is_some() && !primary.as_ref().is_some_and(|p|p.spatial)).then(||if proposal_needed {evaluated::Evaluation::new(r,&source)} else {evaluated::Evaluation::validation(r,&source)});
         // Release preparation only constructs shaders/resources. The no-op
         // device cannot evaluate radiance or produce readback metadata.
         let (mut sh,filter_scale)=if r.release_preparation {([glam::DVec3::ZERO;4],1.)} else {
@@ -180,7 +203,8 @@ impl Environment {
         // The shared filter layout needs a proposal even for first-device LUT
         // initialization. A warm raster install dispatches neither, so creates none.
         let proposal=||distribution.get_or_init(||init(d,"uniform environment proposal",bytemuck::cast_slice(&[[1f32,1./(4.*std::f32::consts::PI)]]),wgpu::BufferUsages::STORAGE));
-        let source=source.create_view(&Default::default());
+        let baked_source=source;
+        let source=baked_source.create_view(&Default::default());
         let texture = |label, width, height, mips, format, usage| {
             crate::gpu_memory::texture(
                 &d,
@@ -213,12 +237,12 @@ impl Environment {
             | wgpu::TextureUsages::STORAGE_BINDING
             | wgpu::TextureUsages::COPY_SRC
             | wgpu::TextureUsages::COPY_DST;
-        let size = if settings.is_some() && primary.is_none() {
+        let size = if settings.is_some() && !primary.as_ref().is_some_and(|p|p.spatial) {
             crate::constants::ENVIRONMENT_WIDTH
         } else {
             1
         };
-        let levels = if settings.is_some() && primary.is_none() {
+        let levels = if settings.is_some() && !primary.as_ref().is_some_and(|p|p.spatial) {
             crate::constants::ENVIRONMENT_LEVELS
         } else {
             1
@@ -306,7 +330,7 @@ impl Environment {
         });
         let mut encoder = d.create_command_encoder(&Default::default());
         let mut integrals = Vec::new();
-        if settings.is_some() && primary.is_none() && (filtered.is_none() || program.is_some()) {
+        if settings.is_some() && !primary.as_ref().is_some_and(|p|p.spatial) && (filtered.is_none() || program.is_some()) {
             for (target, mode, mip) in (0..levels)
                 .map(|m| (&specular, 0u32, m))
                 .chain([(&diffuse, 1, 0)])
@@ -367,7 +391,35 @@ impl Environment {
                 texture.create_view(&Default::default())
             }
         });
+        // Camera rays read the program's compact inputs directly. Static raster
+        // lighting is already in its convolution; path transport retains only
+        // the lighting layer. Animated evaluations keep their shared bake.
+        let retained_source=if settings.is_none() || primary.as_ref().is_some_and(|p|p.spatial) {
+            source.clone()
+        } else if program.is_some() {
+            baked_source.create_view(&wgpu::TextureViewDescriptor {dimension:Some(wgpu::TextureViewDimension::D2Array),base_array_layer:1,array_layer_count:Some(1),..Default::default()})
+        } else if source_transport {
+            let uniform=evaluation.as_ref().and_then(evaluated::Evaluation::uniform);
+            let lighting=environment_program::lighting_texture(r,if uniform.is_some() {[1,1]} else {[baked_source.width(),baked_source.height()]});
+            if let Some(rgb)=uniform {
+                r.queue.write_texture(lighting.as_image_copy(),bytemuck::cast_slice(&[rgb[0],rgb[1],rgb[2],1f32.to_bits()]),wgpu::TexelCopyBufferLayout {offset:0,bytes_per_row:Some(16),rows_per_image:Some(1)},lighting.size());
+            } else {
+                let mut encoder=d.create_command_encoder(&Default::default());
+                encoder.copy_texture_to_texture(wgpu::TexelCopyTextureInfo {origin:wgpu::Origin3d {x:0,y:0,z:1},..baked_source.as_image_copy()},lighting.as_image_copy(),lighting.size());
+                crate::command_finish::Segments::submit(&r.queue,encoder);
+            }
+            lighting.create_view(&wgpu::TextureViewDescriptor {dimension:Some(wgpu::TextureViewDimension::D2Array),..Default::default()})
+        } else {
+            environment_program::lighting_texture(r,[1,1]).create_view(&wgpu::TextureViewDescriptor {dimension:Some(wgpu::TextureViewDimension::D2Array),..Default::default()})
+        };
+        // Exact retained lighting bits, not a mean/threshold: underflow in the
+        // moments must never classify a dim source as absent. Animated and
+        // spatial programs retain their ordinary sampling path.
+        let lighting_is_black=program.is_none() && evaluation.as_ref()
+            .and_then(evaluated::Evaluation::uniform)
+            .is_some_and(|rgb|rgb.into_iter().all(|bits|f32::from_bits(bits)==0.));
         Ok(Self {
+            lighting_is_black,
             primary,
             animated: program.map(|program| Animated {
                 program,
@@ -378,7 +430,7 @@ impl Environment {
             settings: config,
             mean: sh[0].as_vec3().to_array(),
             node: None,
-            source,
+            source:retained_source,
             distribution: source_transport.then(||proposal().clone()),
             distribution_size: [dw,dh],
             specular: specular.create_view(&Default::default()),
@@ -589,6 +641,9 @@ mod tests {
             let source=environment_program::source_texture(&r,[width,height]);
             r.queue.write_texture(source.as_image_copy(),bytemuck::cast_slice(&data),wgpu::TexelCopyBufferLayout {offset:0,bytes_per_row:Some(width*16),rows_per_image:Some(height)},source.size());
             let evaluated=evaluated::Evaluation::new(&r,&source);let (actual,scale)=evaluated.update(&r)?;
+            let first=image.pixels().next().unwrap().0.map(f32::to_bits);
+            let uniform=image.pixels().all(|pixel|pixel.0.map(f32::to_bits)==first);
+            assert_eq!(evaluated.uniform(),uniform.then_some(first));
             assert!((scale-radiance_scale(&image)).abs()<1e-5+1e-6*radiance_scale(&image));
             let reference=analyze(&image);
             // Signed moments can cancel to zero. Float32 reduction/trigonometric
@@ -674,15 +729,15 @@ mod tests {
             "animation":[{"tracks":[{"path":["materials","world","inputs","gain"],"interpolation":"STEP","keys":[[0,1],[1,2]]}]}]}))?;
         let environment=Environment::new(&r,environment_node::Settings::from_scene(&scene)?,&scene,Path::new("."))?;
         let mut changes=values::LightingTracker::default();
-        environment.update(&r,0.,&mut changes)?;
+        environment.update(&r,0.,0.,&mut changes)?;
         let program=&environment.animated.as_ref().context("animated environment")?.program;
         // Perturb the GPU source without touching the production change tracker.
         // A held update must leave it alone, proving evaluation itself was skipped.
-        let source=program.evaluate_source(&r,1.)?;
-        environment.update(&r,0.9,&mut changes)?;
+        let source=program.evaluate_source(&r,1.,1.)?;
+        environment.update(&r,0.9,0.9,&mut changes)?;
         assert!(source.read(&r)?.image.pixels().all(|p|p.0==[2.;3]));
-        program.evaluate_source(&r,0.)?;
-        environment.update(&r,1.,&mut changes)?;
+        program.evaluate_source(&r,0.,0.)?;
+        environment.update(&r,1.,1.,&mut changes)?;
         assert!(source.read(&r)?.image.pixels().all(|p|p.0==[2.;3]));
         r.errors.check()?;Ok(())
     }
@@ -713,7 +768,7 @@ mod tests {
                 input["images"]=serde_json::json!({"capture":{"render":{"camera":"camera","resolution":[8,8],"background":"environment"}}});
                 input["programs"]["copy"]=serde_json::json!({"source":"struct Inputs {Image source;}; float4 composite(CompositeContext c,Inputs i){return compositor_load(i.source,int2(c.uv*c.size));}"});
                 input["materials"]["copy"]=serde_json::json!({"program":"copy","inputs":{"source":{"image":"capture"}}});
-                input["render"]["compositor"]=serde_json::json!(["copy"]);
+                input["composition"]["space"] = "3d".into(); input["composition"]["compositor"] = serde_json::json!(["copy"]);
             }
             // Cross the filter scale threshold within the existing sample
             // output format. Medium mean consumption has its own oracle below.
@@ -749,7 +804,7 @@ mod tests {
                 "render":{"resolution":[8,8],"fps":1,"background":"environment","motion_blur":{"shutter":1},"settings":{"samples":8,"denoiser":null,"fast_gi":null,"reflections":"environment"}},
                 "programs":{"world":{"source":source}},"materials":{"world":{"program":"world"}},
                 "nodes":[{"type":"camera"},{"type":"light","shape":"environment","material":"world"}]});
-            let installed=r.install(vork_scene::v2::from_test_value(input)?,Path::new("."))?;
+            let installed=r.install(vork_scene::v2::from_test_value(input.clone())?,Path::new("."))?;
             assert_eq!(installed.plan.exposure_samples,8);
             let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
             let outputs=ReadbackOutputs {float:FloatOutputs {color:true,..Default::default()},..Default::default()};
@@ -757,6 +812,10 @@ mod tests {
             let error=slot.collect(&r).err().context("invalid earlier shutter sample was accepted")?;
             assert!(error.to_string().contains("radiance must be finite and nonnegative"),"{error:#}");
             assert!(installed.environment.sampled_mean(&r)?.iter().all(|v|v.is_finite() && *v>0.),"last sample must be valid so diagnostics prove accumulation");
+            // A failed publication invalidates the installation, including its
+            // other slots. Reinstall before checking a later valid exposure.
+            let installed=r.install(vork_scene::v2::from_test_value(input)?,Path::new("."))?;
+            let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
             slot.submit_outputs(&installed,&r,3.,outputs)?;
             assert!(slot.collect(&r)?.linear_rgba.unwrap().iter().flatten().all(|v|v.is_finite()));
         }

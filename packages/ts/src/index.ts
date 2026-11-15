@@ -121,6 +121,8 @@ export { text, type TextOptions } from './lib/text.js';
 export { extrude, type ExtrudeOptions } from './lib/extrude.js';
 export { sweep, type SweepOptions } from './lib/sweep.js';
 export { render, type RenderOptions, type RenderResult, type RenderWarning, type ExposureSummary } from './lib/render.js';
+export { ask, type AskQuestion, type AskTime } from './lib/ask.js';
+export { Session, type SessionOptions, type SessionOpenOptions, type SessionRenderOptions, type SessionOpenResult, type SessionRenderResult, type SessionReuse, type ChangedPath } from './lib/session.js';
 export { environmentImage, sky, type EnvironmentImageOptions, type EnvironmentFragment } from './lib/environment.js';
 
 export {exportAsset} from './lib/export.js';

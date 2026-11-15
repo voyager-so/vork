@@ -18,7 +18,7 @@ import tempfile
 import tomllib
 import zipfile
 
-from runtime_platform import check_runtime_platform
+from runtime_platform import check_runtime_platform, redundant_library_names, verify_macos_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 # npm provenance (trusted publishing) requires the package's repository metadata
@@ -86,15 +86,15 @@ def main():
     if json.loads((tree / 'sdk/package.json').read_text())['version'] != version:
         p.error('release SDK version does not match Cargo version')
     # The native executable owns immutable build identity; a version alone can
-    # describe many different SDK revisions. Resolve abbreviated build SHAs in
-    # this checkout and require the exact commit before combining their bytes.
+    # describe many different SDK revisions. Require the full source commit
+    # before combining their bytes.
     commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
     try:
         reported = subprocess.check_output([str(tree / binary), '--version'], text=True)
-        match = re.fullmatch(r'vork ([^ ]+) \(commit ([0-9a-f]{12,40}); API v2\)\s*', reported)
+        match = re.fullmatch(r'vork ([^ ]+) \(commit ([0-9a-f]{40}); API v2\)\s*', reported)
         if not match or match[1] != version:
             p.error('native runtime lacks current version and source identity')
-        native_commit = subprocess.check_output(['git', 'rev-parse', '--verify', match[2] + '^{commit}'], cwd=ROOT, text=True).strip()
+        native_commit = match[2]
     except (OSError, subprocess.CalledProcessError) as error:
         p.error(f'cannot verify native runtime source identity: {error}')
     if native_commit != commit:
@@ -113,12 +113,15 @@ def main():
     a.output.mkdir(parents=True, exist_ok=True)
     # npm drops symlinks. Materialize internal links with identical target bytes;
     # wheels do the same. Never follow a link outside the signed runtime tree.
+    # A shared library the tree names several ways through links is packaged
+    # once, under its SONAME: that is the name the engine and every other
+    # library ask the loader for. The archive keeps its links.
     runtime = {}
     for f in sorted(tree.rglob('*')):
         rel = f.relative_to(tree)
         if rel.parts[0] in ('sdk', 'python', 'examples', 'skills', 'README.md'):
             continue
-        if rel.parts[0] not in (binary, companion, 'slang', 'oidn', 'shaders', 'LICENSE', 'NOTICE', 'licenses', 'libraries'):
+        if rel.parts[0] not in (binary, companion, 'slang', 'oidn', 'shaders', 'LICENSE', 'NOTICE', 'licenses', 'libraries', 'macos-runtime.json'):
             p.error(f'unexpected release content: {rel}')
         if not f.resolve().is_relative_to(tree):
             p.error(f'runtime symlink escapes tree: {rel}')
@@ -126,10 +129,17 @@ def main():
             p.error(f'runtime link must target a regular file: {rel}')
         if f.is_file():
             runtime[rel.as_posix()] = f
+    try:
+        for name in redundant_library_names(runtime):
+            del runtime[name]
+    except ValueError as error:
+        p.error(str(error))
     os_name, cpu, tag, _ = TARGETS[a.platform]
     try:
         minimum = check_runtime_platform(runtime.values(), a.platform)
-    except ValueError as error:
+        if a.platform == 'darwin-arm64':
+            verify_macos_manifest(tree)
+    except (ValueError, OSError) as error:
         p.error(str(error))
     if a.platform == 'darwin-arm64':
         tag = f'macosx_{minimum[0]}_{minimum[1]}_arm64'

@@ -35,10 +35,10 @@ impl Compiler {
                     use vork_scene::v2::Input;
                     let channel=match serde_json::from_value::<Input>(value.clone()) {
                         Ok(Input::Texture(t))=>format!("image:{}",t.image),
-                        Ok(Input::Node(n))=>format!("node:{}",n.node),
+                        Ok(Input::Step(n))=>format!("step:{}",n.step),
                         Ok(Input::Channel(c))=>c.channel.token().to_owned(),
                         Ok(Input::Aov(a))=>format!("aov:{}",a.aov),
-                        _=>anyhow::bail!("compositor input {name}: expected {{\"node\": earlier name}}, {{\"channel\": ...}}, {{\"aov\": ...}} or {{\"image\": ...}}; got {value}"),
+                        _=>anyhow::bail!("compositor input {name}: expected {{\"step\": earlier name}}, {{\"channel\": ...}}, {{\"aov\": ...}} or {{\"image\": ...}}; got {value}"),
                     };
                     let channel=channel.as_str();
                     let slot=if let Some(index)=channels.iter().position(|c|c==channel) {index as u32+1} else {channels.push(channel.to_owned());channels.len() as u32};

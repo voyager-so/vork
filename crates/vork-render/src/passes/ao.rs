@@ -181,7 +181,7 @@ impl Resources {
             };
             let source_records=u64::from(bands)*(u64::from(batches)+1);
             anyhow::ensure!(source_records<=d.limits().max_buffer_size/256,
-                "{}", crate::gpu_memory::limit_message("GI dispatch uniforms", format_args!("{} bytes",source_records*256), format_args!("max_buffer_size={} bytes",d.limits().max_buffer_size), "reduce resolution or samples with --set samples=N"));
+                crate::gpu_memory::device_limit("GI dispatch uniforms", format_args!("{} bytes",source_records*256), format_args!("max_buffer_size={} bytes",d.limits().max_buffer_size), "reduce resolution or samples with --set samples=N"));
             let mut source_words=vec![0u32;source_records as usize*64];
             let topology=s.rays.as_ref().unwrap();
             for band in 0..bands {
@@ -213,20 +213,20 @@ impl Resources {
                     s.gi.as_ref().map(|pipeline|pipeline.current(false)),
                     "ray GI plan",
                     // rt::gi_entries: the scene globals, then GI's images and rays.
-                    { let mut entries=pipelines::ray_globals(s,uniform,objects,lights,cluster_config,cluster_lights);
+                    { let mut entries=pipelines::ray_globals(s,uniform,objects,lights,cluster_config,cluster_lights,light_tree.context("analytic light tree")?);
                       entries.extend([
-                        entry(10, wgpu::BindingResource::TextureView(receivers)),
-                        entry(11, wgpu::BindingResource::TextureView(post_normals)),
-                        entry(12, wgpu::BindingResource::TextureView(&raw_ao)),
-                        entry(13, wgpu::BindingResource::TextureView(&incident)),
-                        entry(14, tlas.as_binding()),
-                        entry(15, table.as_entire_binding()),
-                        entry(16, wgpu::BindingResource::TextureView(&cell_receivers)),
-                        entry(17,sources.as_entire_binding()),
-                        entry(18,frame_rays.emitter_weights.as_ref().map_or(table,|weights|&weights.buffer).as_entire_binding()),
-                        entry(19,wgpu::BindingResource::TextureView(ambient)),
-                        entry(20,diffuse_response.as_entire_binding()),
-                        entry(21,wgpu::BindingResource::TextureView(&demand[demand_ping])),
+                        entry(11, wgpu::BindingResource::TextureView(receivers)),
+                        entry(12, wgpu::BindingResource::TextureView(post_normals)),
+                        entry(13, wgpu::BindingResource::TextureView(&raw_ao)),
+                        entry(14, wgpu::BindingResource::TextureView(&incident)),
+                        entry(15, tlas.as_binding()),
+                        entry(16, table.as_entire_binding()),
+                        entry(17, wgpu::BindingResource::TextureView(&cell_receivers)),
+                        entry(18,sources.as_entire_binding()),
+                        entry(19,frame_rays.emitter_weights.as_ref().map_or(table,|weights|&weights.buffer).as_entire_binding()),
+                        entry(20,wgpu::BindingResource::TextureView(ambient)),
+                        entry(21,diffuse_response.as_entire_binding()),
+                        entry(22,wgpu::BindingResource::TextureView(&demand[demand_ping])),
                     ]);
                     entries },
                     Some(material),
@@ -268,12 +268,12 @@ impl Resources {
               for batch in 0..if material.is_some() && !pilot {batches} else {1} {
                 let mut entries=entries.clone();
                 if material.is_some() {
-                    entries.iter_mut().find(|e|e.binding==17).unwrap().resource=wgpu::BindingResource::Buffer(wgpu::BufferBinding {buffer:&sources,offset:u64::from(if pilot {bands*batches+band} else {band*batches+batch})*256,size:std::num::NonZeroU64::new(32)});
+                    entries.iter_mut().find(|e|e.binding==18).unwrap().resource=wgpu::BindingResource::Buffer(wgpu::BufferBinding {buffer:&sources,offset:u64::from(if pilot {bands*batches+band} else {band*batches+batch})*256,size:std::num::NonZeroU64::new(32)});
                 }
                 let pipeline = pipeline.context("incomplete installed AO plan")?;
                 let (binding, prefix, tile_extent) = if material.is_some() {
                     let at = (if pilot {bands*batches+band} else {band*batches+batch}) as usize*64;
-                    (17, &source_words[at..at+8], [aw,(ah-band*band_rows).min(band_rows)])
+                    (18, &source_words[at..at+8], [aw,(ah-band*band_rows).min(band_rows)])
                 } else {
                     let offset = match entries.iter().find(|e|e.binding==7).unwrap().resource {
                         wgpu::BindingResource::Buffer(ref b) => b.offset as usize / 4,
@@ -432,10 +432,10 @@ mod accumulation_tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn gi_bands_preserve_float_output_with_independent_storage_limit() -> Result<()> {
-        // Adapter-free runners skip with test_renderer's diagnostic; renderer
-        // failures and every pixel/allocation assertion still fail on a GPU.
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        // Explicit GPU runs require renderer creation and all assertions to succeed.
+        let r = crate::test_renderer()?;
         let mut scene=crate::test_scene(serde_json::json!({"version":2,
             "render":{"resolution":[66,50]},
             "nodes":[
@@ -480,8 +480,9 @@ mod accumulation_tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn gi_demand_matches_full_pixel_support_without_false_negatives() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let d=&r.device;
         let layout=demand_layout(d);
         let module=crate::native::shader_module(d,&crate::native::GI_DEMAND_BUILD);
@@ -569,8 +570,9 @@ mod accumulation_tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn gi_proposal_keeps_sampled_cap_density_at_float_boundaries() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let source=r#"
 import gi_proposal;
 import vork_sampling;
@@ -612,8 +614,9 @@ export float3 ray_eye() {return float3(0.);}
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn gi_reconstruction_preserves_incident_and_visibility_sums() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let d=&r.device;let (w,h)=(17u32,9u32);let count=(w*h) as usize;
         let texture=|label,format| d.create_texture(&wgpu::TextureDescriptor {
             label:Some(label),size:extent(w,h),mip_level_count:1,sample_count:1,

@@ -1,6 +1,7 @@
-# Run on your own NVIDIA GPU
+# Run on your own Linux GPU
 
-Rendering requires Apple Silicon or an NVIDIA GPU with Vulkan ray queries.
+Rendering requires Apple Silicon or an NVIDIA or AMD GPU with Vulkan ray queries
+(AMD: Linux/Mesa RADV).
 Authoring scenes and `vork help` do not need a GPU. Docker requires a suitable
 GPU on its host; it does not provide one.
 
@@ -52,10 +53,19 @@ NVIDIA graphics, compute, utility and video capabilities are
 requested; native NVENC handles MP4 encoding. FFmpeg is built with GPL/nonfree
 features disabled and shared LGPL libraries, with matching source and notices
 retained in `/opt/ffmpeg/notices`. There is no libx264 fallback in this image;
-a working NVIDIA video encoder is required for H.264 video. This version's
-`vork setup` can warn that libx264 is missing alongside its muxing message;
-libx264 is not needed for native NVENC muxing. Setup exits successfully without libx264. Slang, OIDN, portable
+a working NVIDIA video encoder is required for H.264 video. `vork setup` reports libx264 as absent: native NVENC needs FFmpeg to mux, not
+libx264. Setup exits successfully without libx264. Slang, OIDN, portable
 shaders, the Preview License and all release notices accompany the executable.
 The GPL Blender bridge is excluded. Ubuntu OS utilities retain their own
 licenses, including GPL; the FFmpeg license check applies to its configured
 binaries.
+
+## AMD on Linux
+
+Bare-metal rendering also supports AMD GPUs with ray queries and storage buffer
+arrays on Mesa RADV. GPU denoising additionally needs the ROCm runtime
+(`libamdhip64.so.7` for the bundled OIDN). Without it, draft and final use their
+undenoised sample budgets; `--set denoise=true` explicitly selects CPU denoising.
+The contributor tested an RX 7900 XTX with Mesa RADV 26.0.8 and ROCm 7.
+AMD containers have not been qualified; the NVIDIA image and commands above
+do not provide an AMD runtime.

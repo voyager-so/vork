@@ -81,8 +81,11 @@ impl Slot {
 @group(0) @binding(1) var<storage,read_write> words:array<u32>;
 fn v(at:u32)->vec3<f32> {{return bitcast<vec3<f32>>(vec3<u32>(words[at],words[at+1u],words[at+2u]));}}
 @compute @workgroup_size(64) fn refit(@builtin(global_invocation_id) tid:vec3<u32>) {{
-    let index=tid.x+tid.y*{width}u;
-    if(index>={count}u) {{return;}}
+    // No scene size in the text: the root node's skip word is the end of the nodes, and the
+    // dispatch row width follows from the count and the device's workgroup limit.
+    let count=words[3u]/{stride}u;
+    let index=tid.x+tid.y*min((count+63u)/64u,{row_groups}u)*64u;
+    if(index>=count) {{return;}}
     let node=index*{stride}u;
     let huge=bitcast<f32>(0x7f800000u);
     var low=vec3<f32>(huge);var high=vec3<f32>(-huge);
@@ -112,7 +115,7 @@ fn v(at:u32)->vec3<f32> {{return bitcast<vec3<f32>>(vec3<u32>(words[at],words[at
     }}
     for(var axis=0u;axis<3u;axis++) {{words[node+axis]=bitcast<u32>(low[axis]);words[node+4u+axis]=bitcast<u32>(high[axis]);}}
 }}
-"#,object=crate::object_abi::wgsl("Object"),finite=crate::compute::FINITE_WGSL,width=width*64,count=plan.count,stride=constants::SHADOW_BOUND_NODE_WORDS,solid_stride=constants::PATH_SOLID_WORDS,shadow=constants::RAY_SHADOW,gamma=vork_slang::registry::FP32_GAMMA7);
+"#,object=crate::object_abi::wgsl("Object"),finite=crate::compute::FINITE_WGSL,row_groups=d.limits().max_compute_workgroups_per_dimension,stride=constants::SHADOW_BOUND_NODE_WORDS,solid_stride=constants::PATH_SOLID_WORDS,shadow=constants::RAY_SHADOW,gamma=vork_slang::registry::FP32_GAMMA7);
             crate::compute::pipeline_layout(r,&source,"shadow containment refit",&[Some(true),Some(false)],"refit")
         }).clone();
         let buffer=crate::gpu_memory::buffer(d,&wgpu::BufferDescriptor {label:Some("frame shadow containment bounds"),size:plan.template.size(),usage:wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_DST|wgpu::BufferUsages::COPY_SRC,mapped_at_creation:false});
@@ -145,7 +148,7 @@ mod tests {
     #[test]
     fn empty_and_unbounded_domains_allocate_no_index() {
         assert!(topology(&[],&Default::default(),&[]).is_empty());
-        let solids=[passes::path::PathSolid {lo:Vec3::splat(f32::NEG_INFINITY),hi:Vec3::splat(f32::INFINITY),row:0,contact_bounds:(Vec3::splat(f32::NEG_INFINITY),Vec3::splat(f32::INFINITY)),shadow_bounds:None}];
+        let solids=[passes::path::PathSolid {lo:Vec3::splat(f32::NEG_INFINITY),hi:Vec3::splat(f32::INFINITY),row:0,contact_bounds:(Vec3::splat(f32::NEG_INFINITY),Vec3::splat(f32::INFINITY)),shadow_bounds:None,rest_bounds:None}];
         assert!(topology(&solids,&[0].into(),&[Object::new(Mat4::IDENTITY)]).is_empty());
     }
     #[test]
@@ -153,7 +156,7 @@ mod tests {
     fn bounds_refit_prunes_off_ray_solids_and_tracks_moving_placements() -> Result<()> {
         let r=Renderer::new()?;
         for far in [0u32,64,1024] {
-            let solids:Vec<_>=(0..=far).map(|row|passes::path::PathSolid {lo:Vec3::splat(-1.),hi:Vec3::splat(1.),row,contact_bounds:(Vec3::splat(f32::NEG_INFINITY),Vec3::splat(f32::INFINITY)),shadow_bounds:Some((Vec3::splat(-1.),Vec3::splat(1.)))}).collect();
+            let solids:Vec<_>=(0..=far).map(|row|passes::path::PathSolid {lo:Vec3::splat(-1.),hi:Vec3::splat(1.),row,contact_bounds:(Vec3::splat(f32::NEG_INFINITY),Vec3::splat(f32::INFINITY)),shadow_bounds:Some((Vec3::splat(-1.),Vec3::splat(1.))),rest_bounds:None}).collect();
             let mut objects:Vec<_>=(0..=far).map(|i|Object::new(Mat4::from_translation(if i==0 {Vec3::ZERO} else {Vec3::new(10.+i as f32*4.,0.,0.)}))).collect();
             let plan=Plan::new(&r,&solids,&(0..=far).collect(),&objects,&[],&[])?.unwrap();
             let object_buffer=init(&r.device,"bounds test objects",bytemuck::cast_slice(&gpu_objects(&objects)),wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_DST);

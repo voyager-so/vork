@@ -14,6 +14,8 @@ import re
 from typing import Any, Optional, Sequence, Union, TypedDict
 from .types import Scene
 from ._validate import helper_options as _helper_options
+from .session import Session, SessionError
+from .ask import ask
 
 # SDK authoring choice shared with @voyager-so/vork: externalize buffers of at least 4 KiB.
 BINARY_BUFFER_MIN_BYTES = 4096
@@ -231,7 +233,7 @@ def std(function: str, argument: Any = None, **options: Any) -> Any:
 
 
 @_helper_options
-def _render_arguments(scene: str, out: Union[str, Sequence[str]], *, at: Optional[float] = None,
+def _render_arguments(scene: str, out: Union[str, dict, Sequence[Union[str, dict]]], *, at: Optional[float] = None,
                      frame_start: Optional[int] = None, frame_end: Optional[int] = None,
                      profile: Optional[str] = None,
                      set: Optional[dict] = None,
@@ -241,8 +243,8 @@ def _render_arguments(scene: str, out: Union[str, Sequence[str]], *, at: Optiona
     set accepts resolution, fps, seed, samples and denoise only.
     """
     args = ['render', str(scene)]
-    for path in [out] if isinstance(out, str) else out:
-        args += ['--out', str(path)]
+    for path in [out] if isinstance(out, (str, dict)) else out:
+        args += ['--out', json.dumps(path, allow_nan=False, separators=(',', ':')) if isinstance(path, dict) else str(path)]
     if at is not None:
         args += ['--at', str(at)]
     if frame_start is not None:
@@ -286,7 +288,7 @@ class RenderResult(TypedDict):
     exposure: list[ExposureOutput]
 
 
-def render(scene: str, out: Union[str, Sequence[str]], **options: Any) -> RenderResult:
+def render(scene: str, out: Union[str, dict, Sequence[Union[str, dict]]], **options: Any) -> RenderResult:
     """Render, print the CLI exposure report, and return full-precision statistics per output.
 
     Options are render-time choices (at, frame_start, frame_end, profile,
@@ -297,7 +299,8 @@ def render(scene: str, out: Union[str, Sequence[str]], **options: Any) -> Render
                    check=True)
     exposure = []
     warnings = []
-    for output in [out] if isinstance(out, str) else out:
+    for output in [out] if isinstance(out, (str, dict)) else out:
+        output = output["file"] if isinstance(output, dict) else output
         directory = output.endswith(os.sep) or output.endswith('/')
         file = not directory and os.path.splitext(output)[1].lower() in ('.png', '.mp4', '.mov', '.exr')
         name = os.path.basename(output)

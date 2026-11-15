@@ -2,6 +2,7 @@
 // the integrator or the light proposal that consumes it.
 import vork_constants;
 import openpbr_core;
+import dielectric_interface;
 import closure;
 import bsdf_microfacet;
 import bsdf_film;
@@ -27,12 +28,12 @@ float3 surface_directional_albedo(Closure c, float3 view, bool sheet=false, bool
         if (light.z>0.) {
             let world_light=mul(light,transpose(frame_));
             let cosine=max(dot(v,h),0.);
-            let f=float3(c.specular_weight)*c.specular_color*(unit_fresnel ? 1. : fresnel(cosine,c.specular_ior));
+            let f=c.specular_color*(unit_fresnel ? 1. : fresnel(cosine,dielectric_ior(c)));
             var reflected=unit_fresnel ? f : surface_reflection(dielectric,cosine);
             if (sheet) {
-                var interface_f=float3(fresnel(cosine,c.specular_ior));
-                if (c.thin_film_weight>0. && c.thin_film_thickness>0.) {interface_f=lerp(interface_f,film_dielectric(cosine,c.specular_ior,c.thin_film_ior,c.thin_film_thickness),c.thin_film_weight);}
-                reflected=c.specular_weight*c.specular_color*(2.*interface_f/(1.+interface_f));
+                var interface_f=float3(fresnel(cosine,dielectric_ior(c)));
+                if (c.thin_film_weight>0. && c.thin_film_thickness>0.) {interface_f=lerp(interface_f,film_dielectric(cosine,dielectric_ior(c),c.thin_film_ior,c.thin_film_thickness),c.thin_film_weight);}
+                reflected=c.specular_color*(2.*interface_f/(1.+interface_f));
             }
             result+=reflected*(4.*no*light.z*microfacet_visibility(c,view,world_light))/g1;
         }

@@ -24,9 +24,12 @@ import probes;
 #ifdef VORK_IMPLICIT_CONTROLS
 import implicit_controls;
 #endif
+#ifdef VORK_SOFTWARE_RASTER
+import software_surface;
+#endif
 // Control targets, attachment order.
 struct Output {
-#ifdef VORK_IMPLICIT_CONTROLS
+#if defined(VORK_IMPLICIT_CONTROLS) || defined(VORK_SOFTWARE_RASTER)
     float depth : SV_Depth;
 #endif
     uint4 id : SV_Target0; float4 normal : SV_Target1; float4 ambient : SV_Target2; float4 motion : SV_Target3;
@@ -90,7 +93,7 @@ float2 reflection_payload(float3 reflected,float roughness,uint object) {
 Output pack_response(Varying v, Response r) {
     let payload=reflection_payload(r.reflected,r.roughness,v.object);
     Output o={};
-#ifdef VORK_IMPLICIT_CONTROLS
+#if defined(VORK_IMPLICIT_CONTROLS) || defined(VORK_SOFTWARE_RASTER)
     o.depth=v.position.z;
 #endif
     // A device-depth slope over one pixel distinguishes continuous creases
@@ -114,23 +117,13 @@ Output pack_response(Varying v, Response r) {
 // lobe that reflects most, as for coat and base. Every lobe runs at every pixel,
 // keeping derivatives in uniform control flow.
 // Evaluate every lobe at one call site, retaining the strongest reflective controls.
-bool reconstruction_protected(Surface s, Response r) {
-    // First-surface guides do not describe a reflected/refracted receiver.
-    // Keep that radiance intact instead of interpreting its detail as noise.
-    let diffuse=max(r.diffuse.x,max(r.diffuse.y,r.diffuse.z));
-    return s.closure.geometry_opacity<1.
-        || s.closure.transmission_weight*(1.-s.closure.base_metalness)>0.
-        || reflects(r)>diffuse*RECONSTRUCT_SPECULAR_RATIO;
-}
-Response surface_lobes<V:IVariant, P:IProgram>(Varying v, bool front, Surface first, out bool protect) {
-    protect=false;
+Response surface_lobes<V:IVariant, P:IProgram>(Varying v, bool front, Surface first) {
     Response sum={};var best=0.;
     // The first evaluated surface also supplies controls for an empty Blend.
     for (uint i=0u;i<max(first.lobes,1u);i++) {
         var s=first;
         if (i>0u) {s=surface<V,P>(v,front,i);}
         let r=weighted(surface_terms<V>(v,s),s.weight);
-        protect=protect || (s.weight>0. && reconstruction_protected(s,r));
         if (i==0u) {sum=r;best=reflects(r);}
         else {
             sum.color+=r.color;sum.direct+=r.direct;
@@ -144,15 +137,14 @@ Response surface_lobes<V:IVariant, P:IProgram>(Varying v, bool front, Surface fi
     return sum;
 }
 Output surface_controls<V:IVariant, P:IProgram>(Varying v, bool front, Surface s) {
-    Response r;bool protect;
-    if (V.has_lobes && P.lobes) {r=surface_lobes<V,P>(v,front,s,protect);}
-    else {r=surface_terms<V>(v,s);protect=reconstruction_protected(s,r);}
+    Response r;
+    if (V.has_lobes && P.lobes) {r=surface_lobes<V,P>(v,front,s);}
+    else {r=surface_terms<V>(v,s);}
     // The same payloads as the forward pass's lit result, without lighting it.
     if (V.has_lit && P.lit && P.lit_material(v)) {r=unreplaced(r,r);}
     var output=pack_response(v,r);
 #ifdef VORK_DENOISE
-    // Signed coverage is decoded before OIDN sees its ordinary guide weight.
-    output.albedo.a=(protect ? -1. : 1.)*float(v.object+1u);
+    output.albedo.a=1.;
 #endif
     return output;
 }

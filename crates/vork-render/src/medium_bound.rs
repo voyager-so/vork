@@ -14,7 +14,7 @@ pub(crate) fn certify(
 /// Include every render view's shutter, including captured render images.
 pub(crate) fn certification_times(scene:&v2::Scene)->[f32;2] {
     std::iter::once(scene.render.clone())
-        .chain(scene.images.values().filter_map(|image|image.render.as_ref()).map(|render|render.resolve(&scene.render)))
+        .chain(scene.images.values().filter_map(|image|image.resolved_render(&scene.render)))
         .map(|render| {
             let shutter=render.motion_blur.as_ref().map_or(0.,|m|m.shutter/render.fps.as_f32());
             let offset=render.motion_blur.as_ref().map_or(0.,|m|m.position.offset());

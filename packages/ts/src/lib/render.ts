@@ -1,3 +1,4 @@
+import type { OutputDestination } from '../schema.js';
 import { engine, launchError } from './engine.js';
 import {callKeys} from './call-keys.js';
 import { execFileSync } from 'node:child_process';
@@ -7,7 +8,7 @@ import { checkOptions } from './validate.js';
 
 export interface RenderOptions {
   /** MP4, MOV, one still .png, PNG/control directory or %06d.exr frames; several render together. */
-  out: string | string[];
+  out: string | OutputDestination | (string | OutputDestination)[];
   /** Still time in seconds. */
   at?: number;
   /** First frame index to render (inclusive, absolute; `--frame-start`). */
@@ -26,6 +27,7 @@ export interface ExposureSummary {
   frames: number;
   /** Mean alpha; exposure values are null when no frame has coverage. */
   coverage: number;
+  /** Share with a display channel at 99% or more; also null for a canvas with no world, view or compositor. */
   clipped: number | null;
   near_black: number | null;
   mean: number | null;
@@ -54,7 +56,8 @@ export function render(scene: string, options: RenderOptions): RenderResult {
   }
   const exposure: RenderResult['exposure'] = [];
   const warnings = new Map<string, RenderWarning>();
-  for (const output of typeof options.out === 'string' ? [options.out] : options.out) {
+  for (const destination of Array.isArray(options.out) ? options.out : [options.out]) {
+    const output = typeof destination === 'string' ? destination : destination.file;
     const directory = output.endsWith('/') || output.endsWith(sep);
     const file = !directory && ['.png','.mp4','.mov','.exr'].includes(extname(output).toLowerCase());
     let name = basename(output);
@@ -71,7 +74,7 @@ export function render(scene: string, options: RenderOptions): RenderResult {
 function renderArguments(scene: string, options: RenderOptions): string[] {
   checkOptions(options, ['out','at','frameStart','frameEnd','profile','set','channels']);
   const args = ['render', scene];
-  for (const out of typeof options.out === 'string' ? [options.out] : options.out) args.push('--out', out);
+  for (const out of Array.isArray(options.out) ? options.out : [options.out]) args.push('--out', typeof out === 'string' ? out : JSON.stringify(out));
   if (options.at !== undefined) args.push('--at', String(options.at));
   if (options.frameStart !== undefined) args.push('--frame-start', String(options.frameStart));
   if (options.frameEnd !== undefined) args.push('--frame-end', String(options.frameEnd));

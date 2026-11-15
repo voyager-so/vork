@@ -55,3 +55,8 @@ key from the device name (Metal reports no PCI ids), and `CreatePipelineCacheErr
 (`src/pipeline.rs`, `src/device/resource.rs`) carries a backend's refusal of cache
 data as a validation error without losing the device. Regression: wgpu-hal
 `metal::device::binary_archive_tests`. Remove with the wgpu-hal Metal binary archive patch.
+
+Local native geometry extension: axis-aligned bounding-box BLAS descriptions and
+build inputs use the existing Vulkan/Metal HAL AABB implementation. Core checks
+geometry counts, compatible flags, stride/alignment, buffer range, usage and device
+ownership, and tracks initialization and build-input transitions.

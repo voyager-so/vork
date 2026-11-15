@@ -15,7 +15,6 @@ pub const FEATURE_COAT: FeatureMask = 1 << 44;
 pub const FEATURE_FUZZ: FeatureMask = 1 << 45;
 pub const FEATURE_TINT: FeatureMask = 1 << 46;
 pub const FEATURE_MASK: FeatureMask = 1 << 47;
-pub const FEATURE_SIDED: FeatureMask = 1 << 48;
 pub const FEATURE_PUNCTUAL: FeatureMask = 1 << 49;
 pub const FEATURE_FINITE: FeatureMask = 1 << 50;
 /// Installed finite-emitter geometry. Radius/angle animation may enable an ellipse;
@@ -33,7 +32,13 @@ pub const FEATURE_LIT: FeatureMask = 1 << 56;
 pub const FEATURE_TRANSMISSION: FeatureMask = 1 << 61;
 pub const FEATURE_SOLID_TRANSMISSION: FeatureMask = 1 << 62;
 pub const FEATURE_ANISOTROPY: FeatureMask = 1 << 64;
+/// Coat quadrature is independent of the base lobe's anisotropy.
+pub const FEATURE_COAT_ANISOTROPY: FeatureMask = 1 << 72;
 pub const FEATURE_FILM: FeatureMask = 1 << 65;
+/// A closure may modulate dielectric IOR away from its authored value.
+pub const FEATURE_WEIGHTED_IOR: FeatureMask = 1 << 73;
+/// Imported glTF boundary tint and vertex base colour.
+pub const FEATURE_GLTF_TINT: FeatureMask = 1 << 74;
 /// Camera results consumed by installed screen effects; shared by all material bins.
 pub const FEATURE_CAMERA_RECEIVERS: FeatureMask = 1 << 66;
 pub const FEATURE_REFLECTIONS: FeatureMask = 1 << 67;
@@ -49,6 +54,27 @@ pub const FEATURE_RECORD_WORDS: FeatureMask = FEATURE_CAMERA_RECEIVERS | FEATURE
 pub const FEATURE_EXACT_RECORD: FeatureMask = 1 << 70;
 /// Installed implicit geometry; path-only scene union, never a per-material key.
 pub const FEATURE_IMPLICIT_GEOMETRY: FeatureMask = 1 << 71;
+/// Some installed material can pass a straight path connection through a
+/// covered point (materials.rs `null_connection`); path-only scene union,
+/// never a per-material key.
+pub const FEATURE_NULL_CONNECTION: FeatureMask = 1 << 75;
+/// Installed proof that no camera sample starts inside a solid
+/// (passes::path::camera_exterior). Unlike the capability bits, absence is the
+/// safe value: only the path key of an install that holds the proof sets it,
+/// and a union of keys must not carry it unless every member does.
+pub const FEATURE_CAMERA_EXTERIOR: FeatureMask = 1 << 78;
+/// Some installed closure can have a subsurface lobe (a nonzero, bound or tracked
+/// `subsurface_weight`, or a program whose proofs leave it possible), and some
+/// installed material is a fibre program. Path-only scene unions like the field
+/// above, never per-material keys: raster keys carry neither.
+pub const FEATURE_SUBSURFACE: FeatureMask = 1 << 76;
+pub const FEATURE_HAIR: FeatureMask = 1 << 77;
+/// The key is the union of every installed material (materials.rs
+/// `installed_features`), so a capability it lacks is absent from the whole scene.
+/// Only such a key may state the scene-wide proofs (surface.slang
+/// `installed_surface`): a raster or hit key without this bit never carries the
+/// unions above, and reading them as proofs would drop a lobe.
+pub const FEATURE_INSTALLED: FeatureMask = 1 << 79;
 /// Hashed (dithered) camera coverage: the entry declares SV_PrimitiveID.
 /// Declaring that input costs every draw of the pipeline, measured +8% of a
 /// motion-blurred car's controls pass on L4, so table entries declare it only
@@ -59,8 +85,17 @@ pub const FEATURE_DITHERED: FeatureMask = 1 << 69;
 /// Four emitter kinds, matching Light.position.w (sun, point, spot, area).
 pub const FEATURE_LIGHT_SHIFT: u32 = 51;
 pub const FEATURE_LIGHT_TYPES: FeatureMask = 15 << FEATURE_LIGHT_SHIFT;
+/// The light kinds a scene-union key carries. Transport folds on the kind only
+/// when a scene installs exactly one (vork_prelude.slang `specialized_light`):
+/// no lights, or several kinds, compile the same kernel as every kind. Those
+/// masks are therefore written as every kind, so equal kernels have one key
+/// and one cache identity.
+pub const fn folded_light_kinds(installed: FeatureMask) -> FeatureMask {
+    let kinds = installed & FEATURE_LIGHT_TYPES;
+    if kinds.count_ones() == 1 { kinds } else { FEATURE_LIGHT_TYPES }
+}
 /// Texture-presence bits from bit 2: every OpenPBR input plus glTF occlusion.
-pub const TEXTURE_FEATURES: usize = 38;
+pub const TEXTURE_FEATURES: usize = 40;
 const _: () = assert!(TEXTURE_FEATURES + 2 <= 44);
 
 /// The control-pass fragment stage a variant compiles: the opaque or the
@@ -134,8 +169,8 @@ impl ForwardKey {
         // Primitive identity preserves averaging on one surface; pixel depth slopes join continuous creases.
         let (primitive, assign) = (", uint primitive : SV_PrimitiveID", "v.primitive=primitive;");
         let body = format!(
-            "import forward;\n[shader(\"fragment\")]\n\
-             Output {entry}(Varying v, bool front : SV_IsFrontFace{primitive}) {{{assign}return {function}<Key,{program}>(v,front);}}\n"
+            "import forward;\n#ifdef VORK_SOFTWARE_RASTER\nimport software_surface;\nimport frame;\nimport vork_constants;\n#define SOFTWARE_SAMPLE , float2 sample_position:SV_VulkanSamplePosition\n#else\n#define SOFTWARE_SAMPLE\n#endif\n[shader(\"fragment\")]\n\
+             Output {entry}(Varying v, bool front : SV_IsFrontFace{primitive} SOFTWARE_SAMPLE) {{{assign}\n#ifdef VORK_SOFTWARE_RASTER\nif ((objects[v.object].metadata.y&REG_OBJECT_IMPLICIT)==0u) v=software_surface(v.object,primitive,v.position,floor(v.position.xy)+sample_position,float2(0.));\n#endif\nreturn {function}<Key,{program}>(v,front);}}\n"
         );
         variant_module(self.features, false, false, false, programs, &body)
     }
@@ -155,6 +190,9 @@ pub fn variant_capabilities(f: FeatureMask, ray_shadows: bool, subsurface: bool,
     let specialized = f & FEATURE_SPECIALIZED != 0;
     let bit = |b: FeatureMask| !specialized || f & b != 0;
     let record = |b: FeatureMask| if f & FEATURE_EXACT_RECORD != 0 {f & b != 0} else {bit(b)};
+    // A scene union is a proof only in a key that is one. Every other key, the
+    // specialized raster and hit keys included, keeps the capability.
+    let scene = |b: FeatureMask| f & FEATURE_INSTALLED == 0 || f & b != 0;
     let textures = (f >> 2) & ((1 << TEXTURE_FEATURES) - 1);
     let (lo, hi, light_types) = if specialized {
         (
@@ -179,7 +217,6 @@ pub fn variant_capabilities(f: FeatureMask, ray_shadows: bool, subsurface: bool,
         ("has_film", Capability::Bool(bit(FEATURE_FILM))),
         ("has_tint", Capability::Bool(bit(FEATURE_TINT))),
         ("has_mask", Capability::Bool(bit(FEATURE_MASK))),
-        ("has_sided", Capability::Bool(bit(FEATURE_SIDED))),
         ("has_punctual", Capability::Bool(bit(FEATURE_PUNCTUAL))),
         ("has_finite", Capability::Bool(bit(FEATURE_FINITE))),
         ("has_rectangle", Capability::Bool(bit(FEATURE_RECTANGLE))),
@@ -195,12 +232,23 @@ pub fn variant_capabilities(f: FeatureMask, ray_shadows: bool, subsurface: bool,
         ("has_lit", Capability::Bool(bit(FEATURE_LIT))),
         ("light_types", Capability::Uint(light_types)),
         ("has_implicit_geometry", Capability::Bool(bit(FEATURE_IMPLICIT_GEOMETRY))),
+        ("has_coat_anisotropy", Capability::Bool(bit(FEATURE_COAT_ANISOTROPY))),
+        ("has_weighted_ior", Capability::Bool(bit(FEATURE_WEIGHTED_IOR))),
+        ("has_gltf_tint", Capability::Bool(bit(FEATURE_GLTF_TINT))),
+        ("has_null_connection", Capability::Bool(scene(FEATURE_NULL_CONNECTION))),
+        // Every key keeps camera containment except one carrying the proof.
+        ("has_camera_interior", Capability::Bool(!specialized || f & FEATURE_CAMERA_EXTERIOR == 0)),
+        ("has_subsurface", Capability::Bool(scene(FEATURE_SUBSURFACE))),
+        ("has_hair", Capability::Bool(scene(FEATURE_HAIR))),
+        ("installed", Capability::Bool(f & FEATURE_INSTALLED != 0)),
     ]
 }
 
+// Static-only policies need an explicit empty initializer: pinned Slang
+// crashes synthesizing one under -zero-initialize with the combined capabilities.
 pub fn variant_module(f: FeatureMask, ray_shadows: bool, subsurface: bool, emitter_profiles: bool, programs: Option<&str>, body: &str) -> String {
     use std::fmt::Write;
-    let mut text=format!("// Generated by forward_variant.rs: features {f:#x}.\nimport variant;\nimport stream;\nimport surface;\n{}\nstruct Key : IVariant {{\n",programs.unwrap_or_default());
+    let mut text=format!("// Generated by forward_variant.rs: features {f:#x}.\nimport variant;\nimport stream;\nimport surface;\n{}\nstruct Key : IVariant {{\n    __init() {{}}\n",programs.unwrap_or_default());
     for (name,value) in variant_capabilities(f,ray_shadows,subsurface,emitter_profiles) {
         writeln!(text,"    static const {} {name} = {};",value.ty(),value.literal()).unwrap();
     }
@@ -220,7 +268,7 @@ pub fn late_variant_module(body: &str, ray_shadows: bool) -> String {
         let zero=match value {Capability::Bool(_)=>"false",Capability::Uint(_)=>"0u"};
         writeln!(text,"[vk::constant_id({id})] const {} vork_cap_{name} = {zero};",value.ty()).unwrap();
     }
-    text.push_str("struct Key : IVariant {\n");
+    text.push_str("struct Key : IVariant {\n    __init() {}\n");
     for (name,value) in fields {
         // This capability selects descriptor types, so it belongs to the
         // resource interface rather than the driver's late feature values.
@@ -262,10 +310,10 @@ pub fn probe_registers(first: u32) -> [String; 3] {
 /// verify every index against the renderer's actual bind-group entries.
 pub fn hit_kernel_registers(module: &str, adaptive: bool, probes: bool) -> Vec<String> {
     let material = match module {
-        "gi_ray" => 10,
-        "reflections_hits" => 13,
-        "probe_update" => 13,
-        "path" => 15 + u32::from(adaptive),
+        "gi_ray" => 11,
+        "reflections_hits" => 14,
+        "probe_update" => 14,
+        "path" => 18 + u32::from(adaptive),
         _ => return Vec::new(),
     };
     let mut defines = material_registers(material);
@@ -281,8 +329,9 @@ pub fn hit_kernel_registers(module: &str, adaptive: bool, probes: bool) -> Vec<S
         defines.push(format!("-DVORK_REFLECTION_MEDIUM_REGISTER=b{}",material+7+if probes {3} else {0}));
     }
     if module == "path" {
-        defines.push("-DVORK_CATCHER_REGISTER=u13".to_owned());
-        defines.push("-DVORK_CATCHER_PIXELS_REGISTER=u14".to_owned());
+        defines.push("-DVORK_PATH_ENVIRONMENT_REGISTER=t16".to_owned());
+        defines.push("-DVORK_CATCHER_REGISTER=u14".to_owned());
+        defines.push("-DVORK_CATCHER_PIXELS_REGISTER=u15".to_owned());
     }
     if module == "path" && adaptive {defines.push("-DVORK_PATH_ADAPTIVE_NATIVE".to_owned());}
     if probes {
@@ -310,8 +359,108 @@ mod capability_tests {
         assert_eq!(has_fields(0), Capability::Bool(true));
         assert_eq!(has_fields(FEATURE_SPECIALIZED), Capability::Bool(false));
         assert_eq!(has_fields(FEATURE_SPECIALIZED | FEATURE_IMPLICIT_GEOMETRY), Capability::Bool(true));
-        // The new capability is appended: existing late-specialization IDs stay stable.
-        assert_eq!(variant_capabilities(0, false, false, false).last().unwrap().0, "has_implicit_geometry");
+        // Existing late-specialization IDs stay stable when capabilities are appended.
+        assert_eq!(variant_capabilities(0, false, false, false)[27].0, "has_implicit_geometry");
+    }
+
+    #[test]
+    fn coat_and_dielectric_capabilities_are_independent() {
+        let fields = [("has_coat_anisotropy", FEATURE_COAT_ANISOTROPY),
+            ("has_weighted_ior", FEATURE_WEIGHTED_IOR), ("has_gltf_tint", FEATURE_GLTF_TINT)];
+        for mask in 0..8 {
+            let features = fields.iter().enumerate().fold(FEATURE_SPECIALIZED,
+                |f, (i, (_, bit))| if mask & (1 << i) != 0 {f | bit} else {f});
+            let capabilities = variant_capabilities(features, false, false, false);
+            for (i, (name, _)) in fields.iter().enumerate() {
+                assert_eq!(capabilities.iter().find(|(field, _)| field == name).unwrap().1,
+                    Capability::Bool(mask & (1 << i) != 0), "{name}, mask {mask}");
+            }
+        }
+    }
+
+    #[test]
+    fn dielectric_capabilities_fold_only_with_installed_proofs() {
+        for (field,bit) in [("has_weighted_ior",FEATURE_WEIGHTED_IOR),("has_gltf_tint",FEATURE_GLTF_TINT)] {
+            let value=|features| variant_capabilities(features,false,false,false).into_iter().find(|(name,_)|*name==field).unwrap().1;
+            assert_eq!(value(0),Capability::Bool(true));
+            assert_eq!(value(FEATURE_SPECIALIZED),Capability::Bool(false));
+            assert_eq!(value(FEATURE_SPECIALIZED|bit),Capability::Bool(true));
+        }
+    }
+
+    /// Raster refraction, shipped surfaces and every other key that never
+    /// receives the installed proof must keep camera containment.
+    #[test]
+    fn camera_containment_stays_unless_a_key_carries_the_proof() {
+        let interior=|features| variant_capabilities(features,false,false,false).into_iter().find(|(name,_)|*name=="has_camera_interior").unwrap().1;
+        assert_eq!(interior(0),Capability::Bool(true));
+        assert_eq!(interior(FEATURE_CAMERA_EXTERIOR),Capability::Bool(true));
+        assert_eq!(interior(FEATURE_SPECIALIZED),Capability::Bool(true));
+        assert_eq!(interior(FEATURE_SPECIALIZED|FEATURE_TRANSMISSION|FEATURE_SOLID_TRANSMISSION),Capability::Bool(true));
+        assert_eq!(interior(FEATURE_SPECIALIZED|FEATURE_CAMERA_EXTERIOR),Capability::Bool(false));
+        assert!(variant_module(FEATURE_SPECIALIZED,false,false,false,None,"").contains("static const bool has_camera_interior = true;"));
+    }
+
+    /// The generated key module is compiler input, so the compiled-shader cache
+    /// identity follows the feature set: one key, one text, and any capability
+    /// added or removed is a different kernel.
+    #[test]
+    fn a_kernel_key_names_its_scene_unions() {
+        let module=|features| variant_module(FEATURE_SPECIALIZED|FEATURE_INSTALLED|features,false,false,false,None,"");
+        for (name,bit) in [("has_null_connection",FEATURE_NULL_CONNECTION),("has_subsurface",FEATURE_SUBSURFACE),("has_hair",FEATURE_HAIR)] {
+            assert!(module(0).contains(&format!("static const bool {name} = false;")),"{name}");
+            assert!(module(bit).contains(&format!("static const bool {name} = true;")),"{name}");
+            assert_ne!(module(0),module(bit),"{name}");
+        }
+        assert!(module(0).contains("static const bool installed = true;"));
+    }
+
+    /// A scene union is absent from a raster or hit key because that key is not the
+    /// scene's, not because the scene lacks it. Only a key that says it is the
+    /// union turns the absence into a proof; every other key keeps the capability.
+    #[test]
+    fn scene_unions_are_proofs_only_in_a_scene_key() {
+        let value=|features,field:&str| variant_capabilities(features,false,false,false).into_iter().find(|(name,_)|*name==field).unwrap().1;
+        for (field,bit) in [("has_null_connection",FEATURE_NULL_CONNECTION),("has_subsurface",FEATURE_SUBSURFACE),("has_hair",FEATURE_HAIR)] {
+            for other in [0,FEATURE_SPECIALIZED,FEATURE_SPECIALIZED|FEATURE_COAT|FEATURE_TRANSMISSION,(SHADING_LAYERS|SHADING_METAL) as FeatureMask] {
+                assert_eq!(value(other,field),Capability::Bool(true),"{field}: {other:#x} is not a scene key");
+            }
+            assert_eq!(value(FEATURE_SPECIALIZED|FEATURE_INSTALLED,field),Capability::Bool(false),"{field}");
+            assert_eq!(value(FEATURE_SPECIALIZED|FEATURE_INSTALLED|bit,field),Capability::Bool(true),"{field}");
+        }
+        for (features,installed) in [(0,false),(FEATURE_SPECIALIZED,false),(u128::MAX & !FEATURE_INSTALLED,false),(FEATURE_SPECIALIZED|FEATURE_INSTALLED,true)] {
+            assert_eq!(value(features,"installed"),Capability::Bool(installed),"{features:#x}");
+        }
+    }
+
+    /// One installed light kind is the only light fact a transport kernel folds
+    /// on. Every other mix is the all-kinds key, as the unspecialized key has it.
+    #[test]
+    fn a_key_names_a_light_kind_only_when_it_is_the_only_one() {
+        let kind=|index:u32| (1 as FeatureMask) << (FEATURE_LIGHT_SHIFT+index);
+        let light_types=|features| variant_capabilities(FEATURE_SPECIALIZED|FEATURE_INSTALLED|features,false,false,false)
+            .into_iter().find(|(name,_)|*name=="light_types").unwrap().1;
+        for index in 0..4 {
+            assert_eq!(folded_light_kinds(kind(index)),kind(index));
+            assert_eq!(light_types(folded_light_kinds(kind(index))),Capability::Uint(1<<index));
+            // Other installed light facts never change which kinds the key names.
+            assert_eq!(folded_light_kinds(kind(index)|FEATURE_SHADOW_RAYS|FEATURE_FINITE|FEATURE_ELLIPSE),kind(index));
+        }
+        // No analytic light and every mix of kinds are one key.
+        let mut mixes=vec![0];
+        for mask in 0..16u32 {
+            if mask.count_ones()>1 {mixes.push((mask as FeatureMask)<<FEATURE_LIGHT_SHIFT);}
+        }
+        assert_eq!(mixes.len(),12);
+        for mix in mixes {
+            assert_eq!(folded_light_kinds(mix),FEATURE_LIGHT_TYPES,"{mix:#x}");
+            assert_eq!(light_types(folded_light_kinds(mix)),Capability::Uint(15),"{mix:#x}");
+        }
+        let module=|features| variant_module(FEATURE_SPECIALIZED|FEATURE_INSTALLED|folded_light_kinds(features),false,false,false,None,"");
+        assert_eq!(module(0),module(kind(0)|kind(3)),"equal kernels have one key text");
+        assert_eq!(module(kind(1)|kind(2)),module(FEATURE_LIGHT_TYPES));
+        assert_ne!(module(kind(0)),module(kind(3)),"a single kind stays its own kernel");
+        assert_ne!(module(kind(0)),module(0));
     }
 
     #[test]

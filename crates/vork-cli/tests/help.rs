@@ -12,6 +12,20 @@ fn help_args(args: &[&str]) -> String {
 fn help(topic: &str) -> String { help_args(&[topic]) }
 
 #[test]
+fn primitive_and_object_topics_resolve_generated_fields() {
+    for topic in ["text", "path", "composition", "camera", "mesh", "light", "asset"] {
+        let fields = help_args(&["field", topic]);
+        assert_eq!(help(topic), fields, "{topic}");
+        assert_eq!(help_args(&[topic, "--all"]), fields, "{topic}");
+    }
+    assert!(help("text").contains("node.font-size (text):"));
+    assert!(!help("text").contains("node.d (path):"));
+    assert!(help("path").contains("node.pathLength (path):"));
+    assert!(!help("path").contains("node.font (text):"));
+    assert!(help("composition").contains("composition.space:"));
+}
+
+#[test]
 fn help_routes_concepts_fields_and_diagnostics_without_losing_the_schema() {
     for (topic, knob) in [("profiles", "settings.seed"), ("profiles", "settings.denoise")] {
         assert!(!help(topic).lines().any(|line| line.starts_with(knob)), "field line in the {topic} concept page");
@@ -44,11 +58,6 @@ fn help_routes_concepts_fields_and_diagnostics_without_losing_the_schema() {
     assert!(root.contains("all includes render.aovs"));
     assert!(root.contains("applies to every --out"));
     let std_all = help_args(&["std", "--all"]);
-    assert!(std_all.contains("preserving exact planar faces"));
-    assert_eq!(std_all.matches("Rounded-box radii fit").count(), 1);
-    assert!(std_all.contains("Extrusion rims fit depth/2") && std_all.contains("profile clearance"));
-    assert!(!root.contains("rejects unsafe profile clearance"));
-    assert!(!root.contains("preserving exact planar faces"));
     // Deep library signatures and inputs remain one --all away.
     for (library, detail) in [("std", "std.color: blackbody"), ("blender", "blender/filmic look:")] {
         assert!(!help(library).contains(detail), "{library} default shows {detail}");
@@ -99,7 +108,7 @@ fn field_and_program_routes_and_topic_suggestions() {
     assert!(!help_args(&[]).contains("JSON shape:"));
     let abi = help_args(&["programs", "--all"]);
     assert!(abi.lines().any(|line| line.starts_with("program.bindings:") && line.contains("JSON shape: {name: string|Buffer object}")));
-    for name in ["struct ShadingContext", "struct DisplayContext", "struct Closure"] {
+    for name in ["struct ShadingContext", "struct ViewContext", "struct Closure"] {
         assert!(abi.contains(name), "missing {name}");
     }
     let typo = Command::new(env!("CARGO_BIN_EXE_vork")).args(["help", "camras"]).output().unwrap();
@@ -108,9 +117,24 @@ fn field_and_program_routes_and_topic_suggestions() {
 }
 
 #[test]
+fn styled_run_fields_are_listed_with_text_nodes() {
+    let nodes = help_args(&["nodes", "--all"]);
+    let runs = help_args(&["field", "run"]);
+    let fields: Vec<_> = include_str!("../../vork-scene/src/v2/reference.txt")
+        .lines().filter(|line| line.starts_with("run.")).collect();
+    assert!(!fields.is_empty(), "styled-run field reference is missing");
+    for field in fields {
+        assert_eq!(nodes.lines().filter(|line| *line == field).count(), 1,
+            "nodes --all lost styled-run field {field}");
+        assert_eq!(runs.lines().filter(|line| *line == field).count(), 1,
+            "run object lookup lost {field}");
+    }
+}
+
+#[test]
 fn every_field_remains_addressable_without_duplicate_topic_listings() {
     let topics: String = ["contract", "nodes", "cameras", "lights", "materials", "geometry", "buffers",
-        "images", "animation", "render", "profiles", "programs", "compositor", "std"]
+        "images", "animation", "render", "outputs", "profiles", "programs", "compositor", "std"]
         .iter().map(|topic| help_args(&[topic, "--all"])).collect();
     let root = help_args(&[]);
     // Parse API object blocks back to full wire paths, independent of field selection.
@@ -124,6 +148,8 @@ fn every_field_remains_addressable_without_duplicate_topic_listings() {
                 "Asset (type: asset)" => ("node", "asset"),
                 "Camera (type: camera)" => ("node", "camera"),
                 "Light (type: light)" => ("node", "light"),
+                "Text (type: text, canvas)" => ("node", "text"),
+                "Path (type: path, canvas)" => ("node", "path"),
                 "Material" => ("material", ""), "Texture binding" => ("material.texture", ""),
                 "Attribute binding" => ("material.attribute", ""), "AOV binding" => ("material.aov", ""),
                 "Geometry" => ("geometry", ""), "Buffer" => ("buffer", ""), "Image" => ("image", ""),
@@ -185,9 +211,10 @@ fn every_field_remains_addressable_without_duplicate_topic_listings() {
 #[test]
 fn image_render_help_matches_capture_fields_and_settings() {
     let help = help_args(&["field", "image.render"]);
-    for field in ["camera", "root", "resolution", "background", "compositor"] {
+    for field in ["camera", "root", "resolution", "background"] {
         assert!(help.contains(&format!("image.render.{field}:")), "{field}");
     }
+    assert!(help_args(&["field", "image.composition"]).contains("image.composition.compositor:"));
     assert!(help.contains("sampling budget follows quality/cost level"));
     assert!(help.contains("closed shutter"));
     assert!(help_args(&["images", "--all"]).contains("aperture sampling is renderer-selected"));
@@ -239,7 +266,7 @@ fn library_and_program_field_lookups_point_to_library_help() {
 #[test]
 fn field_typos_rank_full_paths_leaves_and_prefix_areas() {
     for (path, expected) in [
-        ("render.disply", "render.display"),
+        ("composition.veiw", "composition.view"),
         ("node.enrgy", "node.energy (light)"),
         ("settings.sed", "settings.seed"),
         ("render.motion_blur.shuter", "render.motion_blur.shutter"),
@@ -329,24 +356,6 @@ fn bundled_program_contracts_are_exactly_addressable() {
 }
 
 #[test]
-fn first_render_guidance_explains_profiles_and_display_white() {
-    let root = help_args(&[]);
-    let profiles = help_args(&["profiles"]);
-    assert!(root.contains("vork help profiles"));
-    assert!(root.contains("vork init"));
-    assert!(root.contains("vork render"));
-    assert!(!root.contains("Main omissions"));
-    for term in ["std/previs", "std/draft", "std/final", "std/path", "fastest", "slowest", "omissions"] {
-        assert!(profiles.contains(term), "missing {term}");
-    }
-    let render = help_args(&["render"]);
-    assert!(render.contains("white RGB background looks grey"));
-    assert!(render.contains("std/standard"));
-    assert!(render.contains("sample passes recorded"));
-    assert!(help_args(&["fluid"]).contains("vork.fluid"));
-}
-
-#[test]
 fn every_bundled_program_input_is_addressable() {
     for library in vork_scene::libraries::LIBRARIES {
         let listing = help_args(&[library.name, "--all"]);
@@ -427,5 +436,41 @@ fn fluid_help_names_geometry_and_buffer_output_namespaces() {
         ] {
             assert!(text.contains(key), "{args:?} lost output contract {key}");
         }
+    }
+}
+
+#[test]
+fn active_help_describes_built_output() {
+    let field = help_args(&["field", "node.active"]);
+    assert!(field.contains("false removes picture and sound"), "{field}");
+}
+
+#[test]
+fn path_stroke_shape_includes_supported_image_paint() {
+    for field in ["node.stroke (path)", "node.fill (path)"] {
+        let paint = help_args(&["field", field]);
+        assert!(paint.contains("ImagePaint object"), "{paint}");
+    }
+}
+
+#[test]
+fn canvas_limits_are_explicit_where_the_features_are_advertised() {
+    for topic in ["render", "sdk", "limits"] {
+        for args in [vec![topic], vec![topic, "--all"]] {
+            assert!(!help_args(&args).contains("Sessions reject canvas documents"), "{args:?}");
+        }
+    }
+    for topic in ["ask", "limits"] {
+        for args in [vec![topic], vec![topic, "--all"]] {
+            assert!(help_args(&args).contains("Canvas documents support audio answers only"), "{args:?}");
+        }
+    }
+    for topic in ["nodes", "images", "limits"] {
+        for args in [vec![topic], vec![topic, "--all"]] {
+            assert!(help_args(&args).contains("A canvas inside a canvas cannot set viewBox or preserveAspectRatio"), "{args:?}");
+        }
+    }
+    for field in ["composition.viewBox", "composition.preserveAspectRatio"] {
+        assert!(help_args(&["field", field]).contains("unsupported on a canvas inside a canvas"), "{field}");
     }
 }

@@ -200,6 +200,8 @@ examples/water/scene.json
 examples/water/scene.std.bin
 examples/water/table.slang
 skills/vork/SKILL.md
+skills/vork/references/shot.md
+skills/vork/references/assets.md
 
 # Public authoring examples and their repository-authored/CC0 companions.
 examples/sweep.json

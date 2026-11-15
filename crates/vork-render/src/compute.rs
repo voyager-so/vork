@@ -154,9 +154,10 @@ fn prepare_program(r:&Renderer,source:&v2::Scene,base:&std::path::Path,named:&Pr
                 .values()
                 .flat_map(|b| attributes.bindings[b].spans.iter().map(|s| s.page))
                 .collect();
+            let storage_limit=crate::pipelines::scalar_storage_limit(&r.device.limits(),r.adapter_info.backend==wgpu::Backend::Metal,2);
             ensure!(
-                used.len() as u32 <= r.device.limits().max_storage_buffers_per_shader_stage,
-                "{}", crate::gpu_memory::limit_message(format_args!("compute {name}"), format_args!("{} storage buffer pages",used.len()), format_args!("{} storage bindings",r.device.limits().max_storage_buffers_per_shader_stage), "reduce compute buffer pool sizes or the number of input buffers")
+                used.len() as u32 <= storage_limit,
+                crate::gpu_memory::device_limit(format_args!("compute {name}"), format_args!("{} storage buffer pages",used.len()), format_args!("{} storage bindings",storage_limit), "reduce compute buffer pool sizes or the number of input buffers")
             );
             let atomic_pages: BTreeSet<_> = program.bindings.values()
                 .filter(|name| matches!(source.buffers[*name].element_type, v2::BufferType::U32 | v2::BufferType::F32))
@@ -214,10 +215,11 @@ fn prepare_program(r:&Renderer,source:&v2::Scene,base:&std::path::Path,named:&Pr
                 geometry, packed, named, attributes, program, &used, used.len() as u32 + 2)?;
             let input_binding = used.len() as u32 + 2 + implicit.len() as u32;
             let (text, origin) = programs::program_source(base, name, program)?;
+            let compiler=vork_slang::Compiler::discover();
             let key = blake3::hash(
                 format!(
                     "compute-tiled:{threads:?}:{}:{}:{}:{}:{}:{header}:{text}",
-                    vork_slang::VERSION,
+                    programs::admit(&|key|r.disk_cache.path("slang-input",1,key),&compiler)?.version(),
                     vork_slang::ABI_VERSION,
                     constants::PROGRAM_WORKGROUP,
                     origin.display(),
@@ -226,7 +228,6 @@ fn prepare_program(r:&Renderer,source:&v2::Scene,base:&std::path::Path,named:&Pr
                 .as_bytes(),
             );
             let abi=programs::abi();
-            let compiler=vork_slang::Compiler::discover();
             let inputs=programs::bound_program_identity(&r.disk_cache,&compiler,&abi,&text,&origin,&header)?;
             let compiler=compiler.with_identity(&inputs);
             let artifact = programs::cached(
@@ -564,7 +565,7 @@ impl Compute {
     #[cfg(test)]
     pub(crate) fn test_install(r:&Renderer,source:&v2::Scene,base:&std::path::Path,attributes:Option<&ProgramBuffers>,sources:&[Option<&v2::Node>],roots:&[install::MeshRoot],draws:&[install::Draw],rate:vork_time::Time,duration:impl Into<vork_time::Clock>)->Result<Option<Self>> {
         let prepared=prepare(r,source,base,attributes,sources)?;
-        Self::install(r,source,base,attributes,&prepared,None,sources,roots,draws,rate,duration,None,None)
+        Self::install(r,source,base,attributes,&prepared,None,sources,roots,draws,rate,duration,None,None,&Default::default())
     }
     pub(crate) fn install(
         r: &Renderer,
@@ -580,6 +581,7 @@ impl Compute {
         duration: impl Into<vork_time::Clock>,
         geometry_inputs: Option<crate::geometry_sampling::Inputs>,
         mut sample: Option<&mut InputSampler<'_>>,
+        opened: &crate::footage::Opened,
     ) -> Result<Option<Self>> {
         if !source.programs.values().any(|p| p.is_compute()) && !draws.iter().any(|draw|draw.computed) {
             return Ok(None);
@@ -754,8 +756,9 @@ impl Compute {
                 types.push((binding.binding, Some(true)));
                 implicit_buffers.push((binding.binding, buffer));
             }
-            ensure!(types.iter().filter(|(_, ty)| ty.is_some()).count() as u32 <= r.device.limits().max_storage_buffers_per_shader_stage,
-                "{}", crate::gpu_memory::limit_message(format_args!("compute {name}: geometry/previous-state inputs and buffer pages"), format_args!("{} storage bindings",types.iter().filter(|(_,ty)|ty.is_some()).count()), format_args!("{} storage bindings",r.device.limits().max_storage_buffers_per_shader_stage), "reduce compute buffer pool sizes or the number of input buffers"));
+            let storage_limit=crate::pipelines::scalar_storage_limit(&r.device.limits(),r.adapter_info.backend==wgpu::Backend::Metal,2);
+            ensure!(types.iter().filter(|(_, ty)| ty.is_some()).count() as u32 <= storage_limit,
+                crate::gpu_memory::device_limit(format_args!("compute {name}: geometry/previous-state inputs and buffer pages"), format_args!("{} storage bindings",types.iter().filter(|(_,ty)|ty.is_some()).count()), format_args!("{} storage bindings",storage_limit), "reduce compute buffer pool sizes or the number of input buffers"));
             let query_program=!artifact.queries.is_empty();
             let group=if query_program {1} else {0};
             let pipeline=if query_program {trace.as_ref().unwrap().pipeline(r,prepared,&types)?}
@@ -785,7 +788,7 @@ impl Compute {
                     let target=value.get("geometry").and_then(serde_json::Value::as_str).with_context(||format!("compute input {name}: Geometry requires {{geometry: mesh-node-name}}"))?;
                     crate::geometry_reference::handle(source,target)
                 })?;
-                let animation = material.map(|(name, _)| programs::InputAnimation::new(source, base, name, &artifact.inputs, &mut words)).transpose()?.flatten();
+                let animation = material.map(|(name, _)| programs::InputAnimation::new_in(source, base, name, &artifact.inputs, &mut words, opened)).transpose()?.flatten();
                 if program.schedule == Some(ComputeSchedule::Simulation) {
                     if let Some(animation) = &animation { identity.update(animation.identity().as_bytes()); }
                 }
@@ -1642,9 +1645,10 @@ impl Compute {
     )> {
         let mut code = String::from(FINITE_WGSL);
         let count = self.named_pages;
+        let storage_limit=crate::pipelines::scalar_storage_limit(&r.device.limits(),r.adapter_info.backend==wgpu::Backend::Metal,0);
         ensure!(
-            2 * count as u32 + 5 <= r.device.limits().max_storage_buffers_per_shader_stage,
-            "{}", crate::gpu_memory::limit_message("compute instance bridge", format_args!("{} storage bindings",2*count+5), format_args!("{} storage bindings",r.device.limits().max_storage_buffers_per_shader_stage), "reduce compute buffer pool size or the number of named buffers")
+            2 * count as u32 + 5 <= storage_limit,
+            crate::gpu_memory::device_limit("compute instance bridge", format_args!("{} storage bindings",2*count+5), format_args!("{} storage bindings",storage_limit), "reduce compute buffer pool size or the number of named buffers")
         );
         for i in 0..count {
             writeln!(

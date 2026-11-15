@@ -100,14 +100,15 @@
       "type": "light"
     }
   ],
-  "render": {
-    "camera": "camera",
-    "display": {
+  "composition": {"space": "3d", "view": {
       "inputs": {
-        "dither_intensity": 0
+
       },
       "program": "std/agx"
-    },
+    }},
+  "render": {
+    "camera": "camera",
+
     "duration": 10.0,
     "fps": 24,
     "motion_blur": {

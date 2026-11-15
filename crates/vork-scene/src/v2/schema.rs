@@ -1,6 +1,19 @@
 //! Generated authoring schema shared by the CLI and SDK.
 /// Shared fields on each definition; source-exclusive alternatives name only their source fields.
+/// The published form.
 pub(super) fn authored_schema() -> schemars::Schema {
+    // Everything derived below iterates object keys; see `sorted_keys`.
+    let mut schema: schemars::Schema = serde_json::from_value(sorted_keys(full_schema().to_value())).unwrap();
+    let values = schema.clone().to_value();
+    let reference = reference(&values);
+    schema.as_object_mut().unwrap().insert(
+        "x-vork-differences".into(),
+        serde_json::json!(reference.lines().collect::<Vec<_>>()),
+    );
+    schema
+}
+/// Every authored type: what the decode diagnostics walk.
+pub(super) fn full_schema() -> schemars::Schema {
     let mut schema = schemars::generate::SchemaSettings::draft2020_12()
         .for_deserialize()
         .into_generator()
@@ -12,12 +25,12 @@ pub(super) fn authored_schema() -> schemars::Schema {
         serde_json::json!({
             "materials":"OpenPBR Surface 1.1.1",
             "hair":"Blender 5.2.1 Principled Hair; Chiang scattering in raster and path",
-            "cameras":"Blender physical camera (Blender 5.2.1)",
+            "cameras":"Blender 5.2.1 physical camera, except the names fit, shift, projection",
             "camera JSON":"OpenCV",
             "colour":"AgX as Blender 5.2.1",
             "assets":"glTF 2.0",
             "animation":"glTF 2.0 interpolation",
-        "lights":"Blender 5.2.1 normalized lights",
+        "lights":"Blender 5.2.1 lights, except radius (Blender: shadow_soft_size)",
         "geometry":"glTF 2.0 topology and attribute semantics",
         "textures":"glTF 2.0 samplers; KHR_texture_transform lowered on import"
         }),
@@ -32,6 +45,14 @@ pub(super) fn authored_schema() -> schemars::Schema {
     }
     settings.as_object_mut().unwrap().remove("$schema");
     schema.get_mut("$defs").unwrap()["Profile"] = settings;
+    let mut destination = schemars::generate::SchemaSettings::draft2020_12().for_deserialize()
+        .into_generator().into_root_schema_for::<super::OutputDestination>().to_value();
+    let definitions = destination.as_object_mut().unwrap().remove("$defs").unwrap();
+    for (name, definition) in definitions.as_object().unwrap() {
+        schema.get_mut("$defs").unwrap()[name.as_str()] = definition.clone();
+    }
+    destination.as_object_mut().unwrap().remove("$schema");
+    schema.get_mut("$defs").unwrap()["OutputDestination"] = destination;
     // Resolved settings serialize for in-memory round trips; they are not scene content.
     schema.get_mut("$defs").unwrap()["Render"]["default"].as_object_mut().map(|d| d.remove("settings"));
     schema.get_mut("properties").unwrap()["render"]["default"].as_object_mut().map(|d| d.remove("settings"));
@@ -56,7 +77,10 @@ pub(super) fn authored_schema() -> schemars::Schema {
         ("Buffer", "data", "file", "InlineBuffer", "FileBuffer"),
         ("Program", "file", "source", "FileProgram", "SourceProgram"),
         ("Layer", "tracks", "clip", "TrackLayer", "ClipLayer"),
+        ("NodeLayer", "tracks", "clip", "NodeTrackLayer", "NodeClipLayer"),
     ] {
+        // A definition absent from the document schema (a type hidden with `schemars(skip)`) has no variants to split.
+        if defs.get(name).is_none() { continue; }
         // Optional fields serialize as null; exactly one must contain a value.
         fn nonnull(mut property: serde_json::Value) -> serde_json::Value {
             if let Some(types) = property
@@ -100,12 +124,6 @@ pub(super) fn authored_schema() -> schemars::Schema {
     dense_file["properties"]["grid"] = serde_json::json!({"type":"null"});
     defs["Buffer"]["oneOf"].as_array_mut().unwrap().push(dense_file);
     defs["Program"]["oneOf"][0]["properties"]["source_origin"]=serde_json::json!({"type":"null"});
-    let values = schema.clone().to_value();
-    let reference = reference(&values);
-    schema.as_object_mut().unwrap().insert(
-        "x-vork-differences".into(),
-        serde_json::json!(reference.lines().collect::<Vec<_>>()),
-    );
     schema
 }
 
@@ -142,7 +160,8 @@ pub fn schema() -> schemars::Schema {
     builder.as_object_mut().unwrap().remove("$schema");
     builder["not"] = serde_json::json!({"required": ["name"]});
     defs["Geometry"] = serde_json::json!({"anyOf": [geometry, builder]});
-    schema
+    // Merged branch properties above follow map order; publish sorted keys.
+    serde_json::from_value(sorted_keys(schema.to_value())).unwrap()
 }
 
 fn help_default(value: &serde_json::Value) -> String {
@@ -499,16 +518,23 @@ pub fn api_field(line: &str) -> bool {
     if ["scene.propagation", "scene.simulation", "node.is_holdout", "node.is_shadow_catcher",
         "node.light_link_tags", "node.pass_index", "node.visible_diffuse", "node.visible_glossy",
         "node.visible_shadow", "node.visible_transmission", "node.instances", "node.illuminates",
-        "node.shadowed_by", "node.image", "material.node", "material.aov", "render.aovs", "render.root",
+        "node.shadowed_by", "node.image", "material.step", "material.aov", "render.aovs", "render.root",
         "render.motion_blur.position", "geometry", "buffer", "animation.layer", "animation.track",
         "material.attribute", "node.angle", "node.radius", "node.size_y", "node.spot_blend",
-        "node.spot_size", "node.temperature", "image.time", "image.wrap_s", "image.wrap_t"].iter().any(|prefix| path == *prefix ||
+        "node.spot_size", "node.temperature", "image.time", "image.wrap_s", "image.wrap_t", "image.composition",
+        "node.animation.layer"].iter().any(|prefix| path == *prefix ||
             path.strip_prefix(prefix).is_some_and(|rest| rest.starts_with('.') || rest.starts_with(" ("))) {
         return false;
     }
     if path.starts_with("scene.") { return true; }
     if path.starts_with("node [") { return true; }
     if path.starts_with("node.") {
+        // CSS/SVG properties keep their full contracts in field lookup and --all;
+        // the root page names them once in the Text and Path blocks.
+        if (path.ends_with(" (path)") || path.ends_with(" (text)"))
+            && !matches!(path, "node.content (text)" | "node.font (text)" | "node.width (text)" | "node.fill (text)" | "node.d (path)" | "node.fill (path)") {
+            return false;
+        }
         // instances.count is a compute-written buffer, not an instance number; it lives in the nodes topic.
         return !["skin", "morph", "nodes", "instances.count"].iter().any(|part| path.contains(part))
             && (!path.ends_with(" (asset)") || path == "node.file (asset)");
@@ -539,6 +565,8 @@ fn api_page_fields(store: &str) -> String {
         ("Asset (type: asset)", "node.", "asset"),
         ("Camera (type: camera)", "node.", "camera"),
         ("Light (type: light)", "node.", "light"),
+        ("Text (type: text, canvas)", "node.", "text"),
+        ("Path (type: path, canvas)", "node.", "path"),
         ("Material", "material.", ""),
         ("Texture binding", "material.texture.", ""),
         ("Attribute binding", "material.attribute.", ""),
@@ -683,8 +711,24 @@ fn help_shapes(schema: &serde_json::Value) -> std::collections::BTreeMap<String,
 }
 
 /// Checked-in documentation produced without requiring the TypeScript toolchain.
+/// The schema with every object's keys in sorted order. serde_json iterates maps
+/// in insertion order whenever any crate in the build enables its
+/// `preserve_order` feature (the Moda crates do), and sorted otherwise; generated
+/// documents must not depend on which packages a build happens to include.
+fn sorted_keys(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut entries: Vec<_> = map.into_iter().collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            serde_json::Value::Object(entries.into_iter().map(|(key, value)| (key, sorted_keys(value))).collect())
+        }
+        serde_json::Value::Array(items) => serde_json::Value::Array(items.into_iter().map(sorted_keys).collect()),
+        other => other,
+    }
+}
+
 pub fn documents() -> Vec<(&'static str, String)> {
-    let schema = authored_schema().to_value();
+    let schema = sorted_keys(authored_schema().to_value());
     let reference = schema["x-vork-differences"]
         .as_array()
         .unwrap()
@@ -905,6 +949,25 @@ mod tests {
         assert!(settings.get("oneOf").is_none());
         assert_eq!(settings["properties"]["seed"]["default"], 0);
         assert_eq!(settings["properties"]["denoise"]["default"], false);
+    }
+
+    #[test]
+    fn published_schemas_list_keys_in_sorted_order() {
+        // Order must not depend on serde_json's preserve_order (enabled by any
+        // crate in a build), or generated documents differ between builds.
+        fn check(value: &serde_json::Value, path: &str) {
+            match value {
+                serde_json::Value::Object(map) => {
+                    let keys: Vec<_> = map.keys().collect();
+                    assert!(keys.windows(2).all(|pair| pair[0] <= pair[1]), "{path}: {keys:?}");
+                    for (key, value) in map { check(value, &format!("{path}/{key}")); }
+                }
+                serde_json::Value::Array(items) => for (index, item) in items.iter().enumerate() { check(item, &format!("{path}/{index}")); },
+                _ => {}
+            }
+        }
+        check(&super::schema().to_value(), "schema");
+        check(&super::authored_schema().to_value(), "authored");
     }
 
     #[test]

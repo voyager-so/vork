@@ -42,17 +42,17 @@ import subsurface_transport;
 import probes;
 #endif
 // rt::gi_entries: the scene globals (frame.slang) occupy bindings 0-9.
-[[vk::binding(10,0)]] Texture2D<float4> receivers : register(t4);
-[[vk::binding(11,0)]] Texture2D<float4> normals : register(t5);
-[[vk::binding(12,0)]] [[vk::image_format("rgba32f")]] RWTexture2D<float4> output : register(u6);
-[[vk::binding(13,0)]] [[vk::image_format("rgba32f")]] RWTexture2D<float4> incident_output : register(u7);
-[[vk::binding(14,0)]] RaytracingAccelerationStructure ray_scene : register(t5);
-[[vk::binding(15,0)]] StructuredBuffer<uint> ray_alpha : register(t6);
-[[vk::binding(16,0)]] [[vk::image_format("rgba32f")]] RWTexture2D<float4> cell_receivers : register(u8);
+[[vk::binding(11,0)]] Texture2D<float4> receivers : register(t4);
+[[vk::binding(12,0)]] Texture2D<float4> normals : register(t5);
+[[vk::binding(13,0)]] [[vk::image_format("rgba32f")]] RWTexture2D<float4> output : register(u6);
+[[vk::binding(14,0)]] [[vk::image_format("rgba32f")]] RWTexture2D<float4> incident_output : register(u7);
+[[vk::binding(15,0)]] RaytracingAccelerationStructure ray_scene : register(t6);
+[[vk::binding(16,0)]] StructuredBuffer<uint> ray_alpha : register(t7);
+[[vk::binding(17,0)]] [[vk::image_format("rgba32f")]] RWTexture2D<float4> cell_receivers : register(u8);
 struct GiSources {uint4 topology;uint4 batch;uint4 tile;};
-[[vk::binding(17,0)]] ConstantBuffer<GiSources> gi_source_data : register(b7);
+[[vk::binding(18,0)]] ConstantBuffer<GiSources> gi_source_data : register(b8);
 #define gi_sources gi_source_data.topology
-[[vk::binding(18,0)]] StructuredBuffer<float> gi_emitter_weights : register(t8);
+[[vk::binding(19,0)]] StructuredBuffer<float> gi_emitter_weights : register(t9);
 
 struct GiGuide {float4 point;float4 moments;};
 #ifdef VORK_METAL
@@ -257,13 +257,13 @@ float3 gi_field_source<V:IVariant,P:IProgram>(float3 from,float3 normal,float3 g
 }
 
 // Shared surface shadows at GI hits: one ray toward each light (hit_lighting).
-struct GiShadows<P:IProgram> : IShadows {
+struct GiShadows<V:IVariant,P:IProgram> : IShadows {
     static const bool probe_rays=true;
     static bool probe_visible(float3 world,float3 normal,float3 position_error,float3 probe) {return probe_connection_visible<P,GiGeometry>(GiGeometry(ray_alpha,ray_hit_buffers),ray_scene,ray_alpha,world,normal,position_error,probe);}
     static uint integration_count(uint index,out float3 normalization) {let count=index==0xffffffffu ? sample_count() : 1u;normalization=float3(float(count));return count;}
     static float3 integration_sample(uint tap,inout uint index,inout float3 world) {if(index==0xffffffffu) {index=tap;}return float3(1.);}
     static uint sample_count() {return uint(frame.temporal.y)*max(frame.sampling.w,1u)*uint(frame.ao.z);}
-    static float3 visibility_direction(float3 world,float3 normal,LightValues record,uint light,float3 direction,float distance,float3 position_error,uint index,uint count,bool fibre=false) {return hit_shadow_direction<P,GiGeometry>(GiGeometry(ray_alpha,ray_hit_buffers),ray_scene,ray_alpha,light,world,normal,position_error,direction,distance,index,count,false);}
+    static float3 visibility_direction(float3 world,float3 normal,LightValues record,uint light,float3 direction,float distance,float3 position_error,uint index,uint count,bool fibre=false) {return hit_shadow_direction<P,GiGeometry,V>(GiGeometry(ray_alpha,ray_hit_buffers),ray_scene,ray_alpha,light,world,normal,position_error,direction,distance,index,count,false);}
     static const bool subsurface=true;
     static float thickness(uint object,float3 world,float3 direction) {return subsurface_exit(ray_scene,object,world,direction);}
 };
@@ -275,14 +275,14 @@ float3 hit_shading<V:IVariant,P:IProgram>(RayIntersection hit,float3x4 world_to_
     let u=select(P.lobes,float(screen_ray_hash(pixel,index,REG_SAMPLING_STREAM_RAY_GI_LOBE))*REG_RADICAL_INVERSE_SCALE,0.);
     var h=hit_surface<V,P,GiGeometry>(GiGeometry(ray_alpha,ray_hit_buffers),hit.instance_index,hit.primitive_index,hit.instance_custom_data,world_to_object,hit.barycentrics,direction,float2(2.)/float2(image_size(receivers)),Lobe(select(P.lobes,LOBE_PICK,0u),u));
     float3 emitted;
-    let radiance=finalized_hit_radiance<V,GiShadows<P>,P>(h,pixel,index,REG_RAY_DIFFUSE,emitted,false,false,gi_hit_light<V>(h.v.world,pixel,index,count,pilot,P.lit && P.lit_material(h.v)));
+    let radiance=finalized_hit_radiance<V,GiShadows<V,P>,P>(h,pixel,index,REG_RAY_DIFFUSE,emitted,false,false,gi_hit_light<V>(h.v.world,pixel,index,count,pilot,P.lit && P.lit_material(h.v)));
     // Source MIS weights emission only. Nonemitting hits need no source-tree
     // probability, triangle reconstruction or solid-angle PDF in either pass.
     let source_pdf=any(emitted!=float3(0.)) ? gi_emitter_pdf<P>(hit,world_to_object,from) : 0.;
     return (radiance-emitted*(1.-gi_mis(continuation_pdf,source_pdf)))*frame.radiance.w;
 }
 // Absolute cell addressing: the mask contains the exact full-support OR.
-[[vk::binding(21,0)]] Texture2D<uint> demand_mask : register(t10);
+[[vk::binding(22,0)]] Texture2D<uint> demand_mask : register(t10);
 bool gi_consumed(uint2 cell) {return demand_mask.Load(int3(cell,0))!=0u;}
 // Scenes with programs compile their own entry with their Programs (SlangForward::program_kernel).
 void gi_pixel<V:IVariant,P:IProgram>(uint3 gid) {
@@ -399,8 +399,11 @@ void gi_pixel<V:IVariant,P:IProgram>(uint3 gid) {
         }
         let origin=light_pilot ? light_origin : ray_origin(position,ng,direction,position_error);
         RayDesc ray;ray.Origin=origin;ray.Direction=direction;ray.TMin=0.;ray.TMax=REG_FP32_MAX;
-        RayQuery<RAY_FLAG_NONE> query;
-        query.TraceRayInline(ray_scene,RAY_FLAG_FORCE_NON_OPAQUE,light_pilot ? REG_RAY_SHADOW : REG_RAY_GI_OCCLUDER,ray);
+        // Explicit candidates avoid Metal's repeat drift in automatic opaque
+        // closest-hit traversal. Keep one admission/commit path on every GPU;
+        // hardware still culls single-sided back faces and selects the closest hit.
+        RayQuery<RAY_FLAG_FORCE_NON_OPAQUE> query;
+        query.TraceRayInline(ray_scene,RAY_FLAG_CULL_BACK_FACING_TRIANGLES,light_pilot ? REG_RAY_SHADOW : REG_RAY_GI_OCCLUDER,ray);
         while (query.Proceed()) {
             let candidate=RayIntersection(query.CandidateInstanceIndex(),query.CandidateInstanceID(),query.CandidatePrimitiveIndex(),query.CandidateTriangleBarycentrics());
             if (diffuse_candidate_accepts<P,GiGeometry>(GiGeometry(ray_alpha,ray_hit_buffers),ray_alpha,candidate,query.CandidateTriangleFrontFace(),query.CandidateWorldToObject3x4(),direction,float2(2.)/float2(image_size(receivers)))) {query.CommitNonOpaqueTriangleHit();}
@@ -427,7 +430,7 @@ void gi_pixel<V:IVariant,P:IProgram>(uint3 gid) {
             let h=dielectric_surface<V,P,GiGeometry>(GiGeometry(ray_alpha,ray_hit_buffers),closest,shading_direction,float2(2.)/float2(image_size(receivers)),Lobe(0u,0.));
             hits+=direction_weight;
             float3 emitted;
-            var radiance=finalized_hit_radiance<V,GiShadows<P>,P>(h,sample_pixel,first+k,REG_RAY_DIFFUSE,emitted,false,false,gi_hit_light<V>(h.v.world,sample_pixel,first+k,count,pilot,P.lit && P.lit_material(h.v)));
+            var radiance=finalized_hit_radiance<V,GiShadows<V,P>,P>(h,sample_pixel,first+k,REG_RAY_DIFFUSE,emitted,false,false,gi_hit_light<V>(h.v.world,sample_pixel,first+k,count,pilot,P.lit && P.lit_material(h.v)));
             let continuation=direction_weight>0. ? max(dot(n,direction),0.)/(REG_PI*direction_weight) : 0.;
             if(any(emitted!=float3(0.)))
                 radiance-=emitted*(1.-gi_mis(continuation,field_emitter_pdf<GiGeometry>(GiGeometry(ray_alpha,ray_hit_buffers),gi_fields(),closest.instance,position)));

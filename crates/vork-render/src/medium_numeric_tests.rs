@@ -3,7 +3,7 @@ use wgpu::util::DeviceExt;
 #[test]
 #[ignore = "requires pinned Slang and Vulkan (lavapipe works)"]
 fn path_medium_free_flight_and_phase() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(());};
+    let r = crate::test_renderer()?;
     let source=r#"
 import path_medium;
 import vork_medium_point;
@@ -71,8 +71,9 @@ import vork_constants;
 
 /// Compare retained exponential optical-depth numerics to an f64 reference.
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn exponential_optical_depth_matches_f64_in_all_ray_limits() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(());};
+    let r = crate::test_renderer()?;
     let source=r#"
 import vork_constants;
 import vork_medium_point;
@@ -178,8 +179,9 @@ export uint native_material_word(uint index) {{return 0u;}}
 /// Sampling lighting cells must reproduce the complete source quadrature while
 /// keeping extinction identical, including coloured and height-varying tails.
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn exponential_free_flights_invert_integrated_majorants()->Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(());};
+    let r = crate::test_renderer()?;
     let mut cases=Vec::<[f32;4]>::new();
     for slope in [0.,1e-7,-1e-7,0.7,-0.7,10.,-10.] {
         for constant in [0.,0.3] {for log_density in [-20.,-0.3,20.] {for optical in [1e-5,0.4,20.] {for limit in [2.,f32::MAX] {
@@ -224,7 +226,7 @@ import path_medium;
 #[test]
 #[ignore = "requires pinned Slang and a real GPU; Decision D program preparation"]
 fn decision_d_candidate_point_coefficients_match_physical_oracle() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else { anyhow::bail!("Decision D requires a real GPU"); };
+    let r = crate::test_renderer()?;
     for (name, source, height) in [
         ("constantcandidate", include_str!("../tests/fixtures/fog-constant.slang"), false),
         ("heightcandidate", include_str!("../tests/fixtures/fog-height.slang"), true),
@@ -278,14 +280,14 @@ export uint native_material_word(uint index) {{ uint words[{}] = {{{literals}}};
 #[test]
 #[ignore = "Decision D convex spike requires a real GPU and pinned Slang"]
 fn decision_d_convex_slabs_match_beer_and_emission() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {anyhow::bail!("Decision D requires a real GPU");};
+    let r = crate::test_renderer()?;
     for (density,emission,inside,copies) in [(0.5_f32,0.,false,1),(0.5,0.,true,1),(0.5,0.,false,2),(0.,2.,false,1),(0.000001,2.,false,1)] {
         let mut s:serde_json::Value=vork_scene::v2::with_test_settings(include_str!("../tests/fixtures/analytic.json"),include_str!("../tests/presets/analytic-7fefd52a.json"))?;
         s["animation"]=serde_json::json!([]);
         s["buffers"].as_object_mut().unwrap().retain(|name,_|name.starts_with("shape_box_"));
         s["geometry"].as_object_mut().unwrap().retain(|name,_|name=="shape_box");
         s["render"]=serde_json::json!({"resolution":[3,3],"background":"environment","settings":{"integrator":"path","denoiser":null,"samples":1}});
-        s["materials"]=serde_json::json!({"fog":{"program":"std/fog","inputs":{"density":density,"scattering":[0,0,0],"absorption":[1,1,1],"emission":[emission,emission*0.5,emission*0.25]}}});
+        s["materials"]=serde_json::json!({"fog":{"program":{"source":include_str!("../../vork-scene/tests/fixtures/medium.slang")},"inputs":{"density":density,"scattering":[0,0,0],"absorption":[1,1,1],"emission":[emission,emission*0.5,emission*0.25]}}});
         let mut nodes=vec![serde_json::json!({"name":"camera","type":"camera","translation":[0,0,if inside {0.}else{2.}],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":0.1,"clip_start":0.0001}}}),serde_json::json!({"name":"env","type":"light","shape":"environment","color":[1,1,1],"energy":1})];
         for i in 0..copies {nodes.push(serde_json::json!({"name":format!("fog{i}"),"type":"mesh","geometry":"shape_box","materials":["fog"],"scale":[2,2,1]}));}
         s["nodes"]=serde_json::json!(nodes);
@@ -300,9 +302,7 @@ fn decision_d_convex_slabs_match_beer_and_emission() -> Result<()> {
             frame.submit_outputs(&installed,&r,0.,ReadbackOutputs {float:FloatOutputs {color:true,..Default::default()},..Default::default()})?;
             let collected=frame.collect(&r);
             if work_limit==Some(0) {
-                let output=collected?;
-                ensure!(output.timing.terminated_medium_paths>0,"exhausted paths were not counted");
-                ensure!(output.linear_rgba.as_ref().unwrap().iter().flatten().all(|x|x.is_finite()),"non-finite capped output");
+                expect_medium_work_refusal(collected)?;
                 continue;
             }
             let output=collected?.linear_rgba.context("missing float output")?;
@@ -337,8 +337,8 @@ fn decision_d_convex_slabs_match_beer_and_emission() -> Result<()> {
 #[test]
 #[ignore = "Decision D packet refusal oracle requires a real GPU and pinned Slang"]
 fn decision_d_packet_refusals() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {anyhow::bail!("Decision D requires a real GPU");};
-    for (absorption,limit,expected_error) in [(0.5_f32,0,None),(-1.,131072,Some("invalid physical coefficients")),(0.5,131072,None)] {
+    let r = crate::test_renderer()?;
+    for (absorption,limit,expected_error) in [(0.5_f32,0,Some("fog path exceeded the work limit")),(-1.,131072,Some("invalid physical coefficients")),(0.5,131072,None)] {
         let mut s:serde_json::Value=vork_scene::v2::with_test_settings(include_str!("../tests/fixtures/analytic.json"),include_str!("../tests/presets/analytic-7fefd52a.json"))?;
         s["animation"]=serde_json::json!([]);
         s["buffers"].as_object_mut().unwrap().retain(|name,_|name.starts_with("shape_box_"));
@@ -365,10 +365,7 @@ fn decision_d_packet_refusals() -> Result<()> {
             let mut successor=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
             let retry=successor.submit_outputs(&installed,&r,0.,ReadbackOutputs::default()).unwrap_err();
             ensure!(format!("{retry:#}").contains("reinstall"),"{retry:#}");
-        } else if limit==0 {
-            let output=collected?;
-            ensure!(output.timing.terminated_medium_paths==9,"every capped camera path must be counted");
-            ensure!(output.linear_rgba.unwrap().iter().all(|p|p[..3]==[0.;3]),"capped path contributed radiance");
+
         } else {
             // Valid rendering after a capped and an invalid exposure verifies reuse.
             let pixels=collected?.linear_rgba.context("missing recovery image")?;
@@ -395,7 +392,7 @@ fn decision_d_convex_packet() -> Result<()> {
     let general=std::env::var("VORK_FOG_GENERAL").as_deref()==Ok("1");
     let uncapped=packet["uncapped"].as_bool()==Some(true);
     let renderer_start=std::time::Instant::now();
-    let Some(mut r)=crate::test_renderer()? else {anyhow::bail!("Decision D requires a real GPU");};
+    let mut r = crate::test_renderer()?;
     let renderer_ms=renderer_start.elapsed().as_secs_f64()*1000.;
     let install_start=std::time::Instant::now();
     let roi:Option<[u32;4]>=packet.get("float_roi").map(|v|serde_json::from_value(v.clone())).transpose()?;
@@ -463,7 +460,7 @@ fn decision_d_convex_packet() -> Result<()> {
 #[test]
 #[ignore = "Decision D single-scatter oracle requires a real GPU and pinned Slang"]
 fn decision_d_single_scatter_sun_slab() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {anyhow::bail!("Decision D requires a real GPU");};
+    let r = crate::test_renderer()?;
     let mut s:serde_json::Value=vork_scene::v2::with_test_settings(include_str!("../tests/fixtures/analytic.json"),include_str!("../tests/presets/analytic-7fefd52a.json"))?;
     s["animation"]=serde_json::json!([]);
     s["buffers"].as_object_mut().unwrap().retain(|name,_|name.starts_with("shape_box_"));
@@ -504,7 +501,7 @@ fn decision_d_single_scatter_sun_slab() -> Result<()> {
 #[test]
 #[ignore = "Decision D world closure oracle requires a real GPU and pinned Slang"]
 fn decision_d_world_infinity_closure() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {anyhow::bail!("Decision D requires a real GPU");};
+    let r = crate::test_renderer()?;
     for (absorption,emission,divergent) in [
         ([0_f32;3],[0_f32;3],false),
         ([0.5,1.,2.],[1.,0.5,0.25],false),
@@ -550,7 +547,7 @@ fn decision_d_world_infinity_closure() -> Result<()> {
 #[test]
 #[ignore = "Decision D height Beer oracle requires a real GPU and pinned Slang"]
 fn decision_d_height_world_beer_closure() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {anyhow::bail!("Decision D requires a real GPU");};
+    let r = crate::test_renderer()?;
     // Upward has finite optical depth; horizontal and downward tails are opaque
     // in each positive-extinction channel. Rotation keeps upward film points at
     // one world height, so no pixel-center or film-footprint approximation enters.
@@ -575,7 +572,7 @@ fn decision_d_height_world_beer_closure() -> Result<()> {
             frame.submit_outputs(&installed,&r,0.,ReadbackOutputs {float:FloatOutputs {color:true,..Default::default()},..Default::default()})?;
             let collected=frame.collect(&r);
             if work_limit==Some(0) {
-                ensure!(collected?.timing.terminated_medium_paths>0,"exhausted height paths were not counted");continue;
+                expect_medium_work_refusal(collected)?;continue;
             }
             let pixels=collected?.linear_rgba.context("missing height float output")?;
             if let Some(control)=&control {crate::test_linear::assert_linear_eq(control,&pixels);}
@@ -593,8 +590,8 @@ fn decision_d_height_world_beer_closure() -> Result<()> {
 /// geometry; transparent cutouts cannot bypass the safety bound.
 #[test]
 #[ignore = "requires real GPU and pinned Slang"]
-fn fog_alpha_candidates_exhaust_shared_budget() -> Result<()> {
-    let Some(mut r)=crate::test_renderer()? else {anyhow::bail!("real GPU required");};
+fn fog_alpha_candidates_use_actual_work_reserve() -> Result<()> {
+    let mut r = crate::test_renderer()?;
     r.test_gpu_segment_times=Some(Default::default());
     let mut positions=Vec::new();
     for i in 0..4096 {
@@ -616,15 +613,15 @@ fn fog_alpha_candidates_exhaust_shared_budget() -> Result<()> {
             {"type":"mesh","geometry":"cutouts","materials":["cutout"]}]
     });
     let scene:vork_scene::v2::Scene=vork_scene::v2::from_test_value(value)?;
-    for (limit,operation) in [(96,8),(97,7),(131072,8)] {
+    for limit in [96,97,131072] {
         let installed=r.install_with_options(scene.clone(),Path::new("."),InstallOptions {
             test_convex_media:true,test_convex_work_limit:Some(limit),..Default::default()
         })?;
         let mut frame=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
         frame.submit_outputs(&installed,&r,0.,ReadbackOutputs::default())?;
-        let output=frame.collect(&r)?;
-        ensure!(output.timing.terminated_medium_paths>0,"alpha candidates bypassed the step cap");
-        println!("FOG_ALPHA_CAP limit={limit} former_operation={operation} count={}",output.timing.terminated_medium_paths);
+        let collected=frame.collect(&r);
+        if limit<131072 {expect_medium_work_refusal(collected)?;}
+        else {ensure!(collected?.timing.terminated_medium_paths==0,"finite cutout stack exhausted the reserve");}
     }
     fog_admission_segment_witness(&r)?;
     Ok(())
@@ -632,47 +629,31 @@ fn fog_alpha_candidates_exhaust_shared_budget() -> Result<()> {
 
 #[test]
 #[ignore = "requires real GPU and pinned Slang"]
-fn fog_capped_paths_preserve_queued_publications() -> Result<()> {
-    let Some(mut r)=crate::test_renderer()? else {anyhow::bail!("real GPU required");};
-    r.test_gpu_segment_times=Some(Default::default());
-    let mut value:serde_json::Value=vork_scene::v2::with_test_settings(include_str!("../tests/fixtures/analytic.json"),include_str!("../tests/presets/analytic-7fefd52a.json"))?;
-    value["animation"]=serde_json::json!([]);
-    value["buffers"].as_object_mut().unwrap().retain(|n,_|n.starts_with("shape_box_"));
-    value["geometry"].as_object_mut().unwrap().retain(|n,_|n=="shape_box");
-    let mut positions=Vec::new();
-    for i in 0..4096 {
-        let z=-(i as f32)*0.001;
-        positions.extend([[-10.,-10.,z],[10.,-10.,z],[0.,10.,z]]);
-    }
-    value["buffers"]["cutout_positions"]=serde_json::json!({"type":"vec3","data":positions});
-    value["geometry"]["cutouts"]=serde_json::json!({"attributes":{"POSITION":"cutout_positions"}});
-    value["render"]=serde_json::json!({"camera":"main","root":"screen","resolution":[3,3],"settings":{"integrator":"path","samples":1,"denoiser":null}});
-    value["images"]=serde_json::json!({"capture":{"render":{"camera":"capture_camera","root":"cutouts","resolution":[3,3]}}});
-    value["materials"]=serde_json::json!({
-        "fog":{"program":"constant-fog","inputs":{"scattering":[0,0,0],"absorption":[0.01,0.01,0.01]}},
-        "cutout":{"inputs":{"geometry_opacity":0.1,"alpha_cutoff":0.5}},
-        "monitor":{"inputs":{"base_color":{"image":"capture"}}}
+fn fog_work_ceiling_refuses_queued_publications() -> Result<()> {
+    let r = crate::test_renderer()?;
+    let value=serde_json::json!({"version":2,
+        "render":{"resolution":[3,3],"settings":{"integrator":"path","samples":1,"denoiser":null}},
+        "programs":{"fog":{"source":include_str!("../tests/fixtures/fog-constant.slang")}},
+        "materials":{"fog":{"program":"fog","inputs":{"absorption":[0.01,0.01,0.01],"scattering":[0,0,0]}}},
+        "nodes":[{"type":"camera"},{"type":"light","shape":"environment","energy":1,"medium":"fog"}]
     });
-    value["programs"]=serde_json::json!({"constant-fog":{"source":include_str!("../tests/fixtures/fog-constant.slang")}});
-    value["nodes"]=serde_json::json!([
-        {"type":"camera","name":"main","translation":[0,0,3]},
-        {"type":"camera","name":"capture_camera","translation":[0,0,2]},
-        {"type":"light","shape":"environment","energy":1,"medium":"fog"},
-        {"type":"mesh","name":"screen","geometry":"shape_box","materials":["monitor"],"scale":[2,2,0.1]},
-        {"type":"mesh","name":"cutouts","geometry":"cutouts","materials":["cutout"]}
-    ]);
     let installed=r.install_with_options(vork_scene::v2::from_test_value(value)?,Path::new("."),InstallOptions {
-        test_convex_media:true,test_convex_work_limit:Some(4096),..Default::default()
+        test_convex_media:true,test_convex_work_limit:Some(0),..Default::default()
     })?;
     let mut first=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
     let mut successor=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
     first.submit_outputs(&installed,&r,0.,ReadbackOutputs::ALL)?;
     successor.submit_outputs(&installed,&r,1.,ReadbackOutputs::ALL)?;
-    ensure!(successor.collect(&r)?.timing.terminated_medium_paths>0,"successor did not report capped paths");
-    ensure!(first.collect(&r)?.timing.terminated_medium_paths>0,"capture did not report capped paths");
-    successor.submit_outputs(&installed,&r,2.,ReadbackOutputs::ALL)?;
-    successor.collect(&r)?;
-    fog_admission_segment_witness(&r)?;
+    expect_medium_work_refusal(successor.collect(&r))?;
+    expect_medium_work_refusal(first.collect(&r))?;
+    let error=successor.submit_outputs(&installed,&r,2.,ReadbackOutputs::ALL).unwrap_err();
+    ensure!(format!("{error:#}").contains("reinstall"),"{error:#}");
+    Ok(())
+}
+
+fn expect_medium_work_refusal(result:Result<FrameOutput>) -> Result<()> {
+    let error=result.err().context("work ceiling published an image")?;
+    ensure!(format!("{error:#}").contains("fog path exceeded the work limit; simplify the scene or render fog separately; frame refused"),"{error:#}");
     Ok(())
 }
 
@@ -697,7 +678,7 @@ fn fog_admission_segment_witness(r:&Renderer)->Result<()> {
 #[test]
 #[ignore="requires real GPU and pinned Slang"]
 fn general_fog_carriers_exceed_old_shape_and_count_limits() -> Result<()> {
-    let Some(mut r)=crate::test_renderer()? else {anyhow::bail!("real GPU required");};
+    let mut r = crate::test_renderer()?;
     r.test_gpu_segment_times=Some(Default::default());
     // Three disjoint closed boxes make one nonconvex, 36-triangle carrier.
     let fixture:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/analytic.json"))?;
@@ -743,7 +724,7 @@ fn general_fog_carriers_exceed_old_shape_and_count_limits() -> Result<()> {
 #[test]
 #[ignore = "requires pinned Slang and a real GPU"]
 fn height_carriers_preserve_uncapped_radiance() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {anyhow::bail!("fog regression requires a real GPU");};
+    let r = crate::test_renderer()?;
     let mut value:serde_json::Value=serde_json::from_str(include_str!("../tests/fixtures/fog-height-carriers.json"))?;
     value["render"]["settings"]=serde_json::json!({"integrator":"path","samples":32,"denoiser":null});
     let scene:vork_scene::v2::Scene=vork_scene::v2::from_test_value(value)?;
@@ -759,17 +740,99 @@ fn height_carriers_preserve_uncapped_radiance() -> Result<()> {
             })?;
             let mut frame=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
             frame.submit_outputs(&installed,&r,0.,ReadbackOutputs {float:FloatOutputs {color:true,..Default::default()},..Default::default()})?;
-            let output=frame.collect(&r)?;
-            let image=output.linear_rgba.context("missing linear radiance")?;
-            println!("HEIGHT_CARRIERS force_general={force_general} limit={limit:?} capped={} discarded={} gpu_ms={}",output.timing.terminated_medium_paths,output.timing.discarded_medium_radiance,output.timing.gpu_ms);
+            let collected=frame.collect(&r);
             if limit==Some(256) {
-                ensure!(output.timing.terminated_medium_paths>0,"injected watchdog did not fire");
-                ensure!(output.timing.discarded_medium_radiance>0.,"watchdog must report erased accumulated radiance");
+                expect_medium_work_refusal(collected)?;
             } else {
+                let output=collected?;
+                let image=output.linear_rgba.context("missing linear radiance")?;
                 ensure!(output.timing.terminated_medium_paths==0,"ordinary fog reached watchdog");
                 ensure!(output.timing.discarded_medium_radiance==0.,"ordinary fog discarded energy");
                 if let Some(control)=&reference {crate::test_linear::assert_linear_eq(control,&image);}
                 else {reference=Some(image);}
+            }
+        }
+    }
+    Ok(())
+}
+
+
+/// Exercise the production reserve for every finite initial-solid count up to
+/// the hard ceiling, including the shared allowance across auxiliary ledgers.
+#[test]
+#[ignore = "requires pinned Slang and Vulkan (lavapipe works)"]
+fn fog_coverage_reserve_covers_containing_solids() -> Result<()> {
+    let r = crate::test_renderer()?;
+    const LIMIT:u32=131072;
+    let source=r#"
+import path_medium_work;
+[[vk::binding(0,0)]] RWStructuredBuffer<uint4> values;
+[shader("compute")][numthreads(1,1,1)] void numerical_test(uint3 id:SV_DispatchThreadID) {
+    PathMediumWork work={VORK_MEDIUM_WORK_LIMIT,false};
+    values[0]=uint4(1u,work.remaining,invocation_medium_steps,0u);
+    for(uint n=1u;n<=VORK_MEDIUM_WORK_LIMIT;n++) {
+        let ok=medium_work_step(work);
+        values[n]=uint4(ok ? 1u : 0u,work.remaining,invocation_medium_steps,work.failed ? 1u : 0u);
+    }
+    PathMediumWork auxiliary={VORK_MEDIUM_WORK_LIMIT,false};
+    let exhausted=!medium_work_step(auxiliary);
+    let sticky=!medium_work_step(auxiliary);
+    values[VORK_MEDIUM_WORK_LIMIT+1u]=uint4(exhausted ? 1u : 0u,sticky ? 1u : 0u,work.remaining,invocation_medium_steps);
+}"#;
+    let bytes=u64::from(LIMIT+2)*16;
+    let output=r.device.create_buffer(&wgpu::BufferDescriptor {label:None,size:bytes,usage:wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_SRC,mapped_at_creation:false});
+    let readback=r.device.create_buffer(&wgpu::BufferDescriptor {label:None,size:bytes,usage:wgpu::BufferUsages::MAP_READ|wgpu::BufferUsages::COPY_DST,mapped_at_creation:false});
+    let define=format!("-DVORK_MEDIUM_WORK_LIMIT={LIMIT}");
+    let pipeline=test_pipeline_defines(&r,source,&Native::default(),&[pipelines::buffer_entry(0,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:false})],(1,1,1),&[&define])?;
+    let bind=r.device.create_bind_group(&wgpu::BindGroupDescriptor {label:None,layout:&pipeline.get_bind_group_layout(0),entries:&[entry(0,output.as_entire_binding())]});
+    let mut encoder=r.device.create_command_encoder(&Default::default());
+    {let mut pass=encoder.begin_compute_pass(&Default::default());pass.set_pipeline(&pipeline);pass.set_bind_group(0,&bind,&[]);pass.dispatch_workgroups(1,1,1);}
+    encoder.copy_buffer_to_buffer(&output,0,&readback,0,bytes);
+    let submission=r.queue.submit([encoder.finish()]);let (tx,rx)=std::sync::mpsc::channel();
+    readback.map_async(wgpu::MapMode::Read,..,move |v| {let _=tx.send(v);});
+    r.device.poll(wgpu::PollType::Wait {submission_index:Some(submission),timeout:None})?;rx.recv()??;
+    let mapped=readback.get_mapped_range(..);let values:&[[u32;4]]=bytemuck::cast_slice(&mapped);
+    for n in 0..=LIMIT {assert_eq!(values[n as usize],[1,LIMIT-n,n,0],"{n} containing solids");}
+    assert_eq!(values[(LIMIT+1) as usize],[1,1,0,LIMIT],"auxiliary ledger renewed the invocation allowance");
+    Ok(())
+}
+
+/// Finite overlapping glass/liquid needs 2N initial coverage reservations,
+/// before any camera, shadow or contact work. No fog path may erase the emitter.
+#[test]
+#[ignore = "requires pinned Slang and a rendering device"]
+fn fog_containing_glass_and_liquid_preserve_light() -> Result<()> {
+    let r = crate::test_renderer()?;
+    for (count,fog_x) in [(1,0.),(31,0.),(32,0.),(33,0.),(33,1000.),(65,0.)] {
+        let mut value=serde_json::json!({"version":2,
+            "render":{"resolution":[3,3],"background":[1,1,1]},
+            "programs":{"fog":{"source":include_str!("../tests/fixtures/fog-constant.slang")}},
+            "materials":{
+                "fog":{"program":"fog","inputs":{"absorption":[1e-12,1e-12,1e-12],"scattering":[0,0,0]}},
+                "glass":{"inputs":{"base_weight":0,"transmission_weight":1,"specular_ior":1.5,"specular_roughness":0}},
+                "liquid":{"priority":1,"inputs":{"base_weight":0,"transmission_weight":1,"specular_ior":1.33,"specular_roughness":0}},
+                "white":{"inputs":{"base_weight":0,"specular_weight":0,"emission_color":[1,1,1],"emission_luminance":1}}},
+            "nodes":[
+                {"type":"camera","material":{"program":"std/camera","inputs":{"clip_start":0.001}}},
+                {"type":"mesh","geometry":{"std":"rounded_box","radius":0,"size":[2,2,2]},"materials":["fog"],"translation":[fog_x,0,0]},
+                {"type":"mesh","geometry":{"attributes":{"POSITION":{"type":"vec3","data":[[-0.1,-0.1,-0.05],[0.1,-0.1,-0.05],[0.1,0.1,-0.05],[-0.1,0.1,-0.05]]}},"indices":{"type":"u32","data":[0,1,2,0,2,3]}},"materials":["white"]}]
+        });
+        for n in 0..count {
+            let size=0.4+0.02*n as f64;
+            value["nodes"].as_array_mut().unwrap().push(serde_json::json!({"type":"mesh",
+                "geometry":{"std":"rounded_box","radius":0,"size":[size,size,size]},"materials":[if n==0 {"liquid"} else {"glass"}]}));
+        }
+        for profile in ["std/draft","std/final","std/path"] {
+            let mut scene=crate::test_scene(value.clone(),Path::new("."))?;
+            scene.render.settings=vork_scene::v2::Profile::load(profile)?.resolve(serde_json::json!({"samples":1,"denoise":false}).as_object().unwrap())?;
+            let installed=r.install(scene,Path::new("."))?;
+            let mut frame=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
+            frame.submit_outputs(&installed,&r,0.,ReadbackOutputs {float:FloatOutputs {color:true,..Default::default()},..Default::default()})?;
+            let output=frame.collect(&r)?;
+            assert_eq!(output.timing.terminated_medium_paths,0,"{count} solids, {profile}");
+            assert_eq!(output.timing.discarded_medium_radiance,0.);
+            for pixel in output.linear_rgba.context("missing linear output")? {
+                for channel in &pixel[..3] {assert!((*channel-1.).abs()<1e-6,"lost emitter: {count} solids, {profile}, {pixel:?}");}
             }
         }
     }

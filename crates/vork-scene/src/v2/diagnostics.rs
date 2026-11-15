@@ -20,10 +20,31 @@ pub fn distance(a: &str, b: &str) -> usize {
     d[a.len()][b.len()]
 }
 
+/// One step of an authored path: `parent.key` for an identifier key, `parent["key"]` (escaped) for any other,
+/// the form inline resource paths write table keys in. A name with a dot or a line break stays one step on one line.
+pub fn member(parent: &str, key: &str) -> String {
+    let identifier = key.chars().next().is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
+        && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    if !identifier { format!("{parent}[{key:?}]") } else if parent.is_empty() { key.to_owned() } else { format!("{parent}.{key}") }
+}
+
 /// Nearest spelling by Unicode edit distance; ties resolve lexically for stable errors.
 /// Dotted paths compare segment by segment, so an omitted intermediate object costs
 /// one (`render.shutter` finds `render.motion_blur.shutter`).
 pub fn unknown<'a>(kind: &str, name: &str, valid: impl IntoIterator<Item = &'a str>) -> String {
+    if kind == "field" && matches!(name, "preservesPitch" | "preserves_pitch") {
+        return format!("unknown field {name:?}; use time.pitch: keep; see `vork help upgrade`");
+    }
+    if kind == "program" && let Some(message) = crate::libraries::removed_module(name) {
+        return message;
+    }
+    // blender.nodes MathOperation: an author's own enum that still declares the old member never reaches here.
+    let valid: Vec<&str> = valid.into_iter().collect();
+    for (old, new) in [("FRACTION", "FRACT"), ("fraction", "fract")] {
+        if matches!(kind, "member" | "token") && name == old && valid.contains(&new) {
+            return format!("unknown {kind} {name:?}; it was renamed {new:?}; see `vork help upgrade`");
+        }
+    }
     if kind == "program" && matches!(name,
         "std/fog" | "blender/principled_volume" | "blender.volume" |
         "post/vignette" | "post/lens_distortion" | "post/glare" | "std/highlight") {
@@ -37,8 +58,8 @@ pub fn unknown<'a>(kind: &str, name: &str, valid: impl IntoIterator<Item = &'a s
         ("field", "use_shadow", "shadowed_by: [] to disable shadows"),
         ("field", "film_transparent", "render.background: \"transparent\""),
         ("field", "resolution_percentage", "render.resolution (final pixel dimensions)"),
-        ("field", "look", "render.display with the std/agx or blender/filmic display program"),
-        ("value", "Filmic", "render.display with the blender/filmic display program"),
+        ("field", "look", "composition.view with the std/agx or blender/filmic display program"),
+        ("value", "Filmic", "composition.view with the blender/filmic display program"),
         ("value", "ORTHO", "ortho (lowercase)"),
         ("field", "extension", "wrap_s/wrap_t on the image"),
         ("program", "blender/principled", "std/openpbr"),
@@ -109,10 +130,30 @@ pub fn without_bom(bytes: &[u8]) -> &[u8] {
     bytes.strip_prefix(b"\xEF\xBB\xBF").unwrap_or(bytes)
 }
 
+/// A user's JSON document as a value: without a byte-order mark, and with the reader's nesting limit said
+/// in scene terms. Every loader that reads authored scene text before expanding it starts here.
+pub fn read_document(bytes: &[u8]) -> anyhow::Result<Value> {
+    serde_json::from_slice(without_bom(bytes)).map_err(|error| nesting_error(&error, "scene").unwrap_or_else(|| error.into()))
+}
+
+/// The JSON reader admits [`super::MAX_JSON_DEPTH`] nested arrays and objects. A node's children nest two
+/// each, so a hierarchy about 62 nodes deep reaches it: say that, not only the reader's words. `None` for
+/// any other error.
+pub fn nesting_error(error: &serde_json::Error, what: &str) -> Option<anyhow::Error> {
+    error.to_string().contains("recursion limit exceeded").then(|| anyhow::anyhow!(
+        "the {what} nests arrays and objects more than {} deep (about 62 nested nodes); flatten the hierarchy ({error})",
+        super::MAX_JSON_DEPTH))
+}
+
 pub(super) fn decode_error(bytes: &[u8], original: serde_json::Error) -> anyhow::Error {
-    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+    if let Ok(mut value) = serde_json::from_slice::<Value>(bytes) {
+        value.sort_all_objects();
+        if value.get("animation").and_then(Value::as_array)
+            .is_some_and(|layers| layers.iter().any(|layer| layer.get("blend").and_then(Value::as_str) == Some("add"))) {
+            return anyhow::anyhow!("animation.layer.blend: use \"combine\" instead of \"add\"; see `vork help upgrade`");
+        }
         // The walker expects shared fields on the parent (see inspect).
-        let schema = super::schema::authored_schema().to_value();
+        let schema = super::schema::full_schema().to_value();
         if let Err(error) = inspect(&value, &schema, &schema, "scene") {
             return error;
         }
@@ -121,7 +162,8 @@ pub(super) fn decode_error(bytes: &[u8], original: serde_json::Error) -> anyhow:
 }
 
 pub(super) fn profile_error(bytes: &[u8], original: serde_json::Error) -> anyhow::Error {
-    if let Ok(value) = serde_json::from_slice::<Value>(bytes) {
+    if let Ok(mut value) = serde_json::from_slice::<Value>(bytes) {
+        value.sort_all_objects();
         let schema = super::schema::authored_schema().to_value();
         if let Err(error) = inspect(&value, &schema["$defs"]["Profile"], &schema, "profile") {
             return error;
@@ -304,13 +346,29 @@ pub fn joined(errors: Vec<anyhow::Error>) -> Result<()> {
     match errors.len() {
         0 => Ok(()),
         1 => Err(errors.into_iter().next().unwrap()),
-        _ => bail!("{}", errors.iter().map(|e| format!("{e:#}")).collect::<Vec<_>>().join("\n")),
+        _ => {
+            let messages = errors.iter().map(|e| format!("{e:#}")).collect::<Vec<_>>().join("\n");
+            // Keep the primary typed cause (and its CLI category), as a
+            // single-error result does; the context lists every sibling.
+            Err(errors.into_iter().next().unwrap().context(messages))
+        },
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn joined_diagnostics_preserve_primary_typed_cause() {
+        let error = joined(vec![
+            anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::NotFound)).context("first file"),
+            anyhow::anyhow!("second file"),
+        ]).unwrap_err();
+        assert_eq!(error.downcast_ref::<std::io::Error>().unwrap().kind(), std::io::ErrorKind::NotFound);
+        let text = format!("{error:#}");
+        assert!(text.contains("first file") && text.contains("second file"), "{text}");
+    }
+
     #[test]
     fn decimal_timestep_does_not_mask_invalid_field() {
         let bytes = br#"{"version":2,"nodes":[{"type":"light","shape":"rectangle","size":[0.16,0.22]}],"simulation":{"dt":0.0020833333333333333}}"#;
@@ -655,7 +713,7 @@ mod blender_hints {
             ("field", "use_shadow", "shadowed_by", "shadowed_by: []"),
             ("field", "film_transparent", "background", "render.background: \"transparent\""),
             ("field", "resolution_percentage", "resolution", "render.resolution"),
-            ("field", "look", "display", "std/agx or blender/filmic"),
+            ("field", "look", "view", "std/agx or blender/filmic"),
             ("value", "Filmic", "AgX", "blender/filmic"),
             ("value", "ORTHO", "ortho", "ortho (lowercase)"),
             ("field", "extension", "wrap_s", "wrap_s/wrap_t"),

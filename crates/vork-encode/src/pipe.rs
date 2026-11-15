@@ -130,13 +130,32 @@ mod tests {
 
     #[test]
     fn broken_pipe_completes_every_queued_ring_entry() -> Result<()> {
+        for script in ["exit 0", "exec 3<&0; sleep 0.1 <&3 & exit 0"] {
+            check_broken_pipe(script)?;
+        }
+        Ok(())
+    }
+
+    fn check_broken_pipe(script: &str) -> Result<()> {
         let mut child = std::process::Command::new("sh")
-            .args(["-c", "exit 0"])
+            .args(["-c", script])
             .stdin(std::process::Stdio::piped())
             .spawn()?;
         let input = child.stdin.take().unwrap();
-        child.wait()?; // No reader remains before any entry is handed off.
+        child.wait()?;
         let mut writer = Writer::new(input)?;
+        // Waiting for this child does not exclude inherited readers: another
+        // concurrent spawn can retain the read end between fork and exec.
+        // Observe the broken pipe before asserting that its error is latched.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let (returned, completed) = mpsc::channel();
+            writer.send(vec![0; 4096], returned)?;
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            if completed.recv_timeout(remaining)?.is_err() {
+                break;
+            }
+        }
         let completions: Vec<_> = (0..3)
             .map(|_| {
                 let (returned, completed) = mpsc::channel();

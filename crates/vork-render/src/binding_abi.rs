@@ -69,7 +69,7 @@ pub fn material_source() -> String {
             "#ifndef {}\n#define {} {}\n#endif",
             b.define,
             b.define,
-            b.register(5 + binding as u32)
+            b.register(6 + binding as u32)
         )
         .unwrap();
         let ty = match b.resource {
@@ -103,8 +103,9 @@ mod tests {
     // installed texture/sampler fallback must declare and bind exactly 8 bytes,
     // including the probe and shadow kernels reached by an ordinary render.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn argument_buffer_scene_render() -> anyhow::Result<()> {
-        let Some(renderer) = crate::test_renderer()? else { return Ok(()); };
+        let renderer = crate::test_renderer()?;
         let input = serde_json::json!({"version":2,
             "render":{"resolution":[16,16],"settings":{"samples":1}},
             "nodes":[

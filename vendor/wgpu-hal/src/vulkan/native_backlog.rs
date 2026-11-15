@@ -3,8 +3,8 @@ use super::map_host_device_oom_and_lost_err;
 use alloc::{collections::VecDeque, vec::Vec};
 use ash::{vk, Device};
 
-// Scheduling budget established by the L4/gVisor deep-backlog reproducer.
-pub(super) const LIMIT: usize = 128;
+// Scheduling budget established by the L4/gVisor deep-backlog reproducer; Metal keeps the same one.
+pub(super) const LIMIT: usize = crate::MAX_PENDING_NATIVE_BUFFERS;
 
 #[derive(Default)]
 pub(super) struct NativeBacklog {

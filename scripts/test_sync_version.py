@@ -29,7 +29,7 @@ class VersionTests(unittest.TestCase):
                 for name in ['scripts/sync-version', 'docs/help/index.md',
                              'packages/ts/package.json',
                              'packages/ts/package-lock.json',
-                             'install.sh', 'install.ps1', 'packages/python/pyproject.toml']:
+                             'install.sh', 'install.ps1', 'packages/python/pyproject.toml', 'packages/python/vork/_version.py']:
                     dest = root / name
                     dest.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copyfile(ROOT / name, dest)
@@ -38,6 +38,7 @@ class VersionTests(unittest.TestCase):
                 subprocess.run(command, check=True, capture_output=True)
                 subprocess.run(command + ['--check', '--tag', 'v' + version], check=True, capture_output=True)
                 self.assertEqual(json.loads((root / 'packages/ts/package.json').read_text())['version'], version)
+                self.assertIn(f'VERSION = {version!r}', (root / 'packages/python/vork/_version.py').read_text())
                 self.assertIn(f'version = "{python}"', (root / 'packages/python/pyproject.toml').read_text())
                 schema_url = f'https://raw.githubusercontent.com/voyager-so/vork/v{version}/packages/ts/scene.schema.json'
                 for name in ['docs/help/index.md']:

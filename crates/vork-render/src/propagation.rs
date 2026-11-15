@@ -114,7 +114,7 @@ import vork;
     #[test]
     #[ignore="real GPU and pinned Slang"]
     fn segments_identity_absorption_and_media()->Result<()> {
-        let r=crate::test_renderer()?.context("a real GPU is required")?;
+        let r=crate::test_renderer()?;
         for medium in [false,true] {
             let straight=render(&r,scene(None,medium))?;
             let segmented=render(&r,scene(Some(""),medium))?;
@@ -128,7 +128,7 @@ import vork;
     #[test]
     #[ignore="real GPU and pinned Slang"]
     fn segments_reject_invalid_steps_with_their_diagnostic()->Result<()> {
-        let r=crate::test_renderer()?.context("a real GPU is required")?;
+        let r=crate::test_renderer()?;
         let error=render(&r,scene(Some("s.distance=0.;"),false)).unwrap_err().to_string();
         assert!(error.contains("authored propagation failed"),"invalid steps need their own diagnostic: {error}");
         Ok(())
@@ -137,7 +137,7 @@ import vork;
     #[test]
     #[ignore="real GPU and pinned Slang"]
     fn segments_turn_camera_bounces_and_escape_direction()->Result<()> {
-        let r=crate::test_renderer()?.context("a real GPU is required")?;
+        let r=crate::test_renderer()?;
         let mut turned=scene(Some("s.direction=float3(1.,0.,0.);s.distance=4.;s.radiance=float3(.5,.25,1.);"),false);
         turned["buffers"]["p"]["data"]=json!([[2,-10,-10],[2,10,-10],[2,0,10]]);
         let pixels=render(&r,turned)?;
@@ -169,7 +169,7 @@ import vork;
     #[test]
     #[ignore="real GPU and pinned Slang"]
     fn segments_apply_to_delta_connections_even_without_occlusion()->Result<()> {
-        let r=crate::test_renderer()?.context("a real GPU is required")?;
+        let r=crate::test_renderer()?;
         for shadows in [true,false] {
             let mut input=scene(Some("if(c.direction.z>.1) s.direction=float3(1.,0.,0.);"),false);
             input["render"]["background"]=json!([0,0,0]);

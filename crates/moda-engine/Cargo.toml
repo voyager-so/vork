@@ -1,0 +1,48 @@
+# Ported from Moda (desktop-moda native/crates/moda-engine); the changes are listed in PROVENANCE.md.
+[package]
+name = "moda-engine"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Moda's 2D GPU engine: frame walk, tessellation, paints, masks, effects, two-phase draw and readback."
+
+[dependencies]
+wgpu = "29"
+pollster = "0.4"
+bytemuck = { version = "1", features = ["derive"] }
+# float_roundtrip: outline requests round-trip node JSON through host workers
+# (the worker must see bit-identical floats); on for native too, so canvas = export.
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+serde = { version = "1", features = ["derive"] }
+anyhow = "1"
+png = "0.18"
+# The striped zlib IDAT (encode.rs `zlib_png_rows`): raw deflate per stripe, and the stripes' Adler-32s.
+flate2 = { version = "1", features = ["zlib-rs"] }
+simd-adler32 = "0.3"
+image = { version = "0.25.10", default-features = false, features = ["png", "jpeg"] }
+base64 = "0.22"
+rustc-hash = "2"
+half = "2"
+moda-wgsl = { path = "../moda-wgsl" }
+# Path FILL tessellation: sweep-line fill with nonzero/evenodd on self-intersecting outlines.
+lyon_tessellation = "1"
+# Aligned (inside / outside) dashed or trimmed strokes: the centred stroke clipped
+# to the shape (tess::tessellator::clip_stroke_to_shape). Same pin as moda-scene.
+i_overlay = { version = "=9.0.0", default-features = false }
+moda-assets = { path = "../moda-assets", default-features = false }
+moda-scene = { path = "../moda-scene" }
+moda-color = { path = "../moda-color" }
+moda-shaders = { path = "../moda-shaders" }
+moda-text = { path = "../moda-text" }
+# Moda's text drawing (its GPU side and vector batch builder), ported once in vork as moda-text-draw.
+moda-text-draw = { path = "../moda-text-draw" }
+unicode-segmentation = "1"
+
+[features]
+default = ["native-io"]
+native-io = ["moda-assets/native-io"]
+
+[lints.rust]
+# Moda's `jpeg-parity` feature (mozjpeg's C build) is not ported; its cfg stays declared.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("jpeg-parity"))'] }

@@ -1,23 +1,24 @@
-vork — headless 3D rendering from scene JSON.
-Supported GPUs: Apple Silicon (Metal) and recent NVIDIA (Vulkan).
+vork — 2D and 3D rendering from scene JSON.
+Supported GPUs: Apple Silicon (Metal), recent NVIDIA (Vulkan), and AMD GPUs on a Vulkan driver that exposes ray queries and storage buffer arrays (tested with Mesa RADV on RDNA3).
 Linux CPU rendering: opt in with --gpu cpu or VORK_GPU=cpu; see vork help limits.
 Unknown fields are errors; omit anything at its default.
+Colour: composition.color_space is working RGB; composition.view is local (worlds std/agx, canvases std/standard).
+Choose each destination with output.display; see vork help outputs for supported pairs.
 
 FIRST IMAGE
 vork init my-shot
 cd my-shot
 vork render scene.json --out shot.png
 vork help
-vork init [DIR] [--language json|typescript|python] (default DIR: ., language: json).
-Always writes scene.json and README.md; TypeScript adds scene.ts and package.json; Python adds scene.py.
-Existing files are never overwritten. Source authoring requires the matching SDK.
-Edit the source, regenerate JSON, then render.
+Scaffold languages, files and conflict policy: vork help init. SDK setup: vork help sdk.
+Edit SDK source, regenerate JSON, then render.
 Paths are relative to scene.json. RGB background changes the backdrop, not lighting.
 
 Sun angular size: `vork help lights`. Tone curve and grain: `vork help render`.
-Shape/revolve examples: `vork help geometry`. Movie rendering: `vork help render`.
+Shape builders: `vork help geometry`. Movie rendering: `vork help render`.
 
 Supported features and known limits: vork help limits. Source builds: vork help build.
+Authoring skill: vork skills add
 
 RENDERING
 vork render SCENE --out PATH [--at SECONDS | --frame-start N --frame-end N] [--profile P]
@@ -35,39 +36,37 @@ Quality, sample budgets and denoising: vork help profiles.
 <!-- generated-call-keys:end -->
 Values are JSON; resolution also accepts WxH or W,H.
 vork check SCENE|- [--profile P]       CPU-only validation; see vork help check.
+vork ask SCENE QUESTIONS|-  Read scene values without rendering; see vork help ask.
 vork export SCENE --out ASSET.glb [--root NODE] [--at SECONDS]  static asset; vork help export
 vork std FUNCTION JSON                 JSON argument; '-' reads stdin; JSON result
-vork setup                             GPU report and init starter warmup at std/final (10 min shader budget)
+vork setup                             GPU report; builds the path engine, warms the init starter at std/final (10 min shader budget)
 vork setup --all                       Warm bundled program/profile catalog and built-in descriptors (no shader time limit)
 vork setup --skip-warmup               GPU/tools report without shader warmup
 vork setup --skip-warmup --verbose     Include raw encoder probe diagnostics
-Other scene kinds compile once on first use.
+Without setup, a cold path render compiles its scene kernel before the picture, then exits
+(about 50–60 s for path-glass and path-many-lights at std/path on an NVIDIA L4); vork help limits.
+Other scene kinds also compile once on first use.
 vork help [TOPIC [--all] | field PATH]  topic details or exact field/object lookup
+Animation recipes: vork help springs, vork help sequences, vork help captions.
+2D canvas (text, paths, CSS paint): vork help nodes, then vork help composition, vork help text, vork help path.
 
 CONVENTIONS
 Units: metres, seconds, radians; lens/sensor mm; linear Rec.709.
 <!-- generated-standards:start -->
 animation: follows glTF 2.0 interpolation
 assets: follows glTF 2.0
-cameras: follows Blender physical camera (Blender 5.2.1)
+cameras: follows Blender 5.2.1 physical camera, except the names fit, shift, projection
 colour: follows AgX as Blender 5.2.1
 geometry: follows glTF 2.0 topology and attribute semantics
-lights: follows Blender 5.2.1 normalized lights
+lights: follows Blender 5.2.1 lights, except radius (Blender: shadow_soft_size)
 materials: follows OpenPBR Surface 1.1.1
 textures: follows glTF 2.0 samplers; KHR_texture_transform lowered on import
 <!-- generated-standards:end -->
 Coordinates: right-handed Y-up; camera local -Z. Names exclude '/'; paths are scene-relative.
 Resources accept a name or inline definition. Named tables use {name: definition}.
 Node type fields are flat siblings; type: node has only common fields.
+A field path names one object, not its table: node.font-size, material.inputs, render.fps; the table is scene.nodes.
 Normal maps: tangent-space +Y; TEXCOORD v=0 is the image top. Topology and program code are fixed during rendering.
-
-INSTANCES
-Mesh Node.instances takes equal-length custom attribute columns in instances.attributes;
-a material reads a column with {"attribute": name}. Two instances with different colours:
-{"type":"mesh","geometry":{"std":"sphere"},
- "instances":{"attributes":{"TRANSLATION":{"type":"vec3","data":[[0,0,0],[2,0,0]]},
-                            "tint":{"type":"vec3","data":[[1,0,0],[0,0,1]]}}},
- "materials":[{"inputs":{"base_color":{"attribute":"tint"}}}]}
 
 COMMON FIELDS (advanced fields: vork help TOPIC --all; exact field: vork help field PATH)
 <!-- generated-api:start -->
@@ -76,6 +75,7 @@ Scene {
   $schema: string; editor schema URL
   animation: layer[] = []
   buffers: {name:buffer} = {}
+  composition: composition|null; space 2d = canvas, 3d = world; null = 3D world
   geometry: {name:geometry} = {}
   geometry_stages: (deform|compute|displace)[] = [deform,compute,displace]; ordered, each at most once; default [deform,compute,displace]
   images: {name:image} = {}
@@ -87,15 +87,32 @@ Scene {
 }
 
 Node {
+  active: true|false|[start,end); parent seconds; false removes picture and sound, children included; a window starts the clock at start; a boolean is keyable (step)
+  animation: layer[]; tracks on this node's clock in content seconds; paths start here; a property has one owner; the clock cannot key itself
+  audio: {file,gain}|null; file relative to scene; gain defaults to 1 and scales source plus children; active mutes, visible does not; node time controls playback and pitch
+  audio.file: file-path|null; mono/stereo; relative to scene; omitted = children only
+  audio.gain: number = 1; linear amplitude over source plus children; default 1; keyable
   children: node[] = []
+  clip-path: node-name|null; 2D; that node's shape, in this node's coordinates, clips this node; it is not painted itself
+  composition: composition|null; 2d: a canvas, its children painted to one picture; in a 3D world seen through an image's render.root; 3d: in a canvas, a closed world drawn through its one camera to one picture the size of the canvas's box
+  filter: string|null; 2D; blur() and drop-shadow(); nonzero lengths require px; blur sigma above 100 target pixels after transforms refuses
+  mask: node-name|null; 2D; that node's picture, in this node's coordinates, masks this node by luminance; it is not painted itself
   name: string = ""; globally unique, including imported nodes
+  opacity: number = 1; 2D; 0..1; the node's picture, children included, placed once
   rotation: [x,y,z,w] quaternion | {euler:[x,y,z]} (Blender XYZ) = [0,0,0,1]
   scale: [x,y,z] = [1,1,1]; any zero world-scale component hides geometry, including children
   target: node-name|[x,y,z]|null; aims -Z, world Y up; rotation is an offset on top; structural, not animatable: aim at a named node and animate its translation
+  time: {start,offset,duration,speed,loop}|null; node-owned animation/media clock; time-reading programs, conflicting movie clocks and scene-time tracks inside retimed compositions refuse; null inherits parent/active-window clock
+  time.duration: number|rational string|null; content seconds used from offset; > 0; null = the rest of the one source; only active ends the node
+  time.loop: bool = false; wraps inside [offset, offset+duration); needs an end
+  time.offset: number|rational string = 0; content seconds where the clip begins; >= 0
+  time.pitch: follow|keep = follow; keep holds sound pitch when speed changes; keep is not built yet
+  time.speed: number|rational string = 1; keyable >= 0 and integrated; a constant < 0 plays the trimmed section backwards from its end
+  time.start: number|rational string|null; parent seconds where local = offset; null = active window start, else 0; shifts loop phase
   translation: [x,y,z] = [0,0,0]; parent frame
   visible: bool = true; false hides the subtree and disables its lights; animatable (step)
   visible_camera: bool = true
-  type: node|mesh|asset|camera|light = "node"
+  type: node|mesh|asset|camera|light|text|path = "node"
 }
 
 Mesh (type: mesh) {
@@ -121,30 +138,40 @@ Light (type: light) {
   size: number = 1; only rectangle or ellipse lights; rectangle full side, ellipse diameter; size_y sets the second axis
 }
 
+Text (type: text, canvas) {
+  content: string|run[]; position by the text box's top-left; switch content with STEP keys; runs set font and paint; white-space controls newlines
+  fill: "none"|CSS colour|CSS gradient|{image, fit} = #000
+  font: file-path|file-path[]; .ttf/.otf; a list offers faces font-weight and font-style choose from
+  width: number|null; px; lines wrap and align in it; null = no wrapping
+}
+
+Path (type: path, canvas) {
+  d: string = none; SVG path data, px; "none" or empty paints nothing
+  fill: paint = #000; "none"|CSS colour|CSS linear-/radial-/conic-gradient()|{image, fit}
+}
+
 Material {
   double_sided: bool = true
   geometry.geometry: mesh-node name; read-only geometry at the program's canonical sample time
-  inputs: {name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{node}|{channel}|{geometry}} = {}
+  inputs: {name: number|vector|bool|enum-token|{image}|{attribute}|{grid}|{aov}|{step}|{channel}|{geometry}} = {}
   opacity: coverage|transmittance|null = null; null = coverage, transmittance for transmitting surfaces; coverage = occupied area fraction; transmittance = continuous attenuation by 1 - geometry_opacity; renderer chooses integration
   priority: integer = 0; highest owns overlapping solid media; equal priorities: last entered wins, simultaneous entries: later solid order wins; lower-priority boundaries change membership only
   program: program-name|inline program|<library>/<module> = std/openpbr
 }
-std/openpbr inputs: base_weight base_color base_metalness specular_weight specular_color specular_roughness specular_roughness_anisotropy specular_ior transmission_weight transmission_color transmission_depth subsurface_weight subsurface_color subsurface_radius subsurface_radius_scale subsurface_scatter_anisotropy coat_weight coat_color coat_roughness coat_ior coat_darkening fuzz_weight fuzz_color fuzz_roughness emission_luminance emission_color thin_film_weight thin_film_thickness thin_film_ior geometry_opacity geometry_thin_walled geometry_normal geometry_tangent geometry_coat_normal transmission_dispersion_scale transmission_dispersion_abbe_number alpha_cutoff
+std/openpbr inputs: base_weight base_color base_metalness specular_weight specular_color specular_roughness specular_roughness_anisotropy specular_ior transmission_weight transmission_color transmission_depth subsurface_weight subsurface_color subsurface_radius subsurface_radius_scale subsurface_scatter_anisotropy coat_weight coat_color coat_roughness coat_roughness_anisotropy coat_ior coat_darkening fuzz_weight fuzz_color fuzz_roughness emission_luminance emission_color thin_film_weight thin_film_thickness thin_film_ior geometry_opacity geometry_thin_walled geometry_normal geometry_tangent geometry_coat_normal geometry_coat_tangent transmission_dispersion_scale transmission_dispersion_abbe_number alpha_cutoff
 
 Texture binding {
   image: image-name|inline image; the program owns sampling and UV transforms
 }
 
 Image {
-  color_space: sRGB|Linear Rec.709|Non-Color|null = null; null: hdr/exr/ies linear, others sRGB
+  color_space: sRGB|Display P3|Linear Rec.709|Linear Rec.2020|ACEScg|Non-Color|null = null; omitted/null: embedded colour description, else hdr/exr/ies linear Rec.709 and other files sRGB
   file: file-path; XOR render; png jpg tif hdr exr ies mov mp4 mkv or %04d frame pattern; 8-bit may be block-compressed; 16-bit integer and floating-point inputs use uncompressed half-float precision, not exact source integer codes; ies: LM-63 Type C
 }
 
 Render {
-  background: environment|transparent|RGB = environment; RGB and transparent apply to camera escapes and opacity passthrough; path glass transmission sees the World
+  background: environment|transparent|RGB|CSS colour = environment; RGB and transparent apply to camera escapes and opacity passthrough; path glass transmission sees the World; a 2D canvas takes transparent or a CSS colour
   camera: camera-node-name|null = null; null = the only authored camera, else first imported; a camera cut track may select
-  compositor: (material-name|{material,name?,resolution?})[] = []; ordered image graph, last output; material may be inline
-  display: material-name|inline material = {"program":"std/agx"}; display program; EXR stays scene-linear
   duration: number|rational string = 125/12; seconds
   fps: number|rational string = 24; positive output frames/second
   motion_blur: MotionBlur|null = null; non-null enables; shutter in frames
@@ -153,6 +180,7 @@ Render {
 }
 <!-- generated-api:end -->
 Asset nodes also take materials and nodes overrides (vork help nodes).
+SPZ and Gaussian PLY: import through asset; replace the radiance material through materials.
 
 LIBRARIES
 Std builders return {buffers,geometry}; name sets standalone CLI/SDK fragment prefixes.
@@ -162,8 +190,8 @@ Text, bevelled extrusion and rounded boxes: vork help std --all.
 Scene geometry: {std: NAME, ...options}; omit name: the table key or inline position owns identity.
 
 <!-- generated-shapes:end -->
-Compositor: ordered {material,name?,resolution?} image graph; material may be inline.
-Image inputs bind earlier results with {node:name}; last entry is output. See vork help compositor.
+Compositor: composition.compositor, an ordered {material,name?,resolution?} image graph; material may be inline.
+Image inputs bind earlier results with {step:name}; last entry is output; see vork help compositor.
 Environment: light.material evaluates radiance; std/environment_image reads ordinary Image inputs.
 vork std environment preprocesses HDR lighting; vork std sky declares atmosphere and an ordinary sun.
 
@@ -196,15 +224,13 @@ diagnostics: timings and environment variables
 limits: hardware and rendering limits
 build: source build prerequisites
 
-Scene JSON supports `"$schema": "https://raw.githubusercontent.com/voyager-so/vork/v0.5.1/packages/ts/scene.schema.json"` for editor
+Scene JSON supports `"$schema": "https://raw.githubusercontent.com/voyager-so/vork/v0.6.0/packages/ts/scene.schema.json"` for editor
 completion and validation. `vork init` includes it; SDK writers preserve an explicit
 $schema but do not insert one. vork never fetches it or changes the render.
 
 UPDATE NOTICES
-Vork checks npm for a newer stable version at most once a day in a detached background worker
-after command completion, caches the result in your user cache directory, and shows a one-line
-notice on stderr on a later run, including when stderr is redirected for agents. Set
-VORK_NO_UPDATE_NOTIFIER (any value, including empty) to disable both checks and notices; CI also
-disables them. The check sends only a package-version request to the npm registry, with no
-identifiers or telemetry. Network and cache failures are silent and never change rendered files
-or exit status.
+Vork checks npm for stable updates at most daily after command completion and caches
+results locally. Notices appear on stderr on later runs, including redirected logs.
+VORK_NO_UPDATE_NOTIFIER (any value) or CI disables checks and notices.
+Only a package-version request is sent; no identifiers or telemetry. Network/cache
+failures are silent and never affect outputs or exit status.

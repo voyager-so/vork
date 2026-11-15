@@ -1,0 +1,15 @@
+[package]
+name = "vork-json"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = "1"
+# Vork owns its parsing precision, including when Moda is absent. Preserve the
+# decimal tokens used by exact clocks and by the sorted serialization pass.
+serde_json = { version = "1", features = ["arbitrary_precision", "float_roundtrip", "unbounded_depth"] }
+
+[features]
+# Exercise both feature graphs without changing Moda's dependencies.
+preserve_order = ["serde_json/preserve_order"]

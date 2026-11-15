@@ -1,0 +1,204 @@
+{
+  "nodes": [
+    {
+      "id": "gn-chart",
+      "type": "generated",
+      "x": 200,
+      "y": 140,
+      "width": 880,
+      "height": 520,
+      "rotation": 0,
+      "scale": 1,
+      "generatedKind": "chart",
+      "renderMode": "native-children",
+      "metadata": {
+        "name": "Bar Chart"
+      },
+      "generatedSource": {
+        "kind": "chart",
+        "chartVersion": 1,
+        "spec": {
+          "type": "bar",
+          "x": 0,
+          "y": 0,
+          "width": 880,
+          "height": 520,
+          "config": {
+            "fontFamily": "Inter",
+            "fontSize": 12,
+            "labelColor": "#666666",
+            "titleColor": "#1a1a1a",
+            "subtitleColor": "#666666",
+            "titleSize": 16,
+            "titleWeight": 600,
+            "titleAlign": "left",
+            "subtitleSize": 12,
+            "palette": [
+              "#3b82f6",
+              "#ef4444",
+              "#22c55e",
+              "#f59e0b"
+            ],
+            "background": "transparent",
+            "showGrid": true,
+            "gridColor": "#e5e5e5",
+            "gridStyle": "solid",
+            "gridWidth": 1,
+            "showXAxis": true,
+            "showYAxis": true,
+            "axisColor": "#cccccc",
+            "axisWidth": 1,
+            "showXLabels": true,
+            "showYLabels": true,
+            "yTickCount": 5,
+            "yFormat": "auto",
+            "yScale": "linear",
+            "barRadius": 3,
+            "barGap": 0.2,
+            "barGroupGap": 0.1,
+            "showLabels": true,
+            "labelPosition": "top",
+            "labelFormat": "auto",
+            "valueFormat": "auto",
+            "valueDensity": "auto",
+            "valueLabelColor": "#666666",
+            "valueLabelSize": 11,
+            "showLegend": "auto",
+            "legendPosition": "bottom",
+            "legendAlign": "center",
+            "legendGap": 8,
+            "legendMarker": "square",
+            "legendMarkerSize": 12,
+            "legendColor": "#666666",
+            "strokeWidth": 2,
+            "strokeStyle": "solid",
+            "curve": "linear",
+            "strokeCap": "round",
+            "strokeJoin": "round",
+            "showPoints": false,
+            "pointSize": 8,
+            "pointShape": "circle",
+            "pointFill": "",
+            "pointStroke": "",
+            "pointStrokeWidth": 0,
+            "fillOpacity": 0.3,
+            "baseline": 0,
+            "pointOpacity": 0.7,
+            "minPointSize": 8,
+            "maxPointSize": 40,
+            "xTickCount": 5,
+            "innerRadius": 0,
+            "startAngle": -90,
+            "direction": "cw",
+            "padAngle": 0,
+            "explode": [],
+            "explodeDistance": 10,
+            "explodeAll": false,
+            "centerLabel": "",
+            "centerSublabel": "",
+            "centerColor": "#1a1a1a",
+            "centerLabelColor": "#1a1a1a",
+            "centerSublabelColor": "#666666",
+            "centerSize": 24,
+            "pieLabelPosition": "outside",
+            "pieLabelFormat": "percent",
+            "minLabelAngle": 10,
+            "padding": 16,
+            "cornerRadius": 0,
+            "title": "Quarterly results",
+            "subtitle": "FY24, $M"
+          }
+        },
+        "data": {
+          "columns": [
+            "category",
+            "series",
+            "value"
+          ],
+          "rows": [
+            {
+              "category": "Q1",
+              "series": "Revenue",
+              "value": 120
+            },
+            {
+              "category": "Q1",
+              "series": "Profit",
+              "value": 45
+            },
+            {
+              "category": "Q2",
+              "series": "Revenue",
+              "value": 180
+            },
+            {
+              "category": "Q2",
+              "series": "Profit",
+              "value": 62
+            },
+            {
+              "category": "Q3",
+              "series": "Revenue",
+              "value": 150
+            },
+            {
+              "category": "Q3",
+              "series": "Profit",
+              "value": 38
+            },
+            {
+              "category": "Q4",
+              "series": "Revenue",
+              "value": 210
+            },
+            {
+              "category": "Q4",
+              "series": "Profit",
+              "value": 84
+            }
+          ],
+          "series": [
+            "Revenue",
+            "Profit"
+          ],
+          "categories": [
+            "Q1",
+            "Q2",
+            "Q3",
+            "Q4"
+          ],
+          "valueRange": [
+            0,
+            210
+          ]
+        }
+      }
+    }
+  ],
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "generated-chart-bar",
+      "width": 1280,
+      "height": 800,
+      "nodeIds": [
+        "gn-chart"
+      ],
+      "fills": [
+        {
+          "id": "fill-0",
+          "paint": {
+            "type": "solid",
+            "color": "#ffffff"
+          }
+        }
+      ]
+    }
+  ],
+  "config": {
+    "renderPageClipping": true
+  },
+  "variables": [],
+  "canvasRootNodeIds": [],
+  "layoutMode": "vertical"
+}

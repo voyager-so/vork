@@ -1,0 +1,13 @@
+# Ported from Moda (desktop-moda native/crates/moda-wgsl); the changes are listed in PROVENANCE.md.
+[package]
+name = "moda-wgsl"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Agent WGSL shaders: std prelude, placement ABI, naga-based checks"
+
+[dependencies]
+# The same naga as vork's wgpu 29, so a shader that passes here compiles on the device.
+naga = { version = "29", features = ["wgsl-in"] }
+serde_json = { version = "1", features = ["preserve_order"] }

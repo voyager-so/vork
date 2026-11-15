@@ -15949,12 +15949,14 @@ namespace basist
 	// Determines the best unique pbits to use to encode xl/xh
 	static void determine_unique_pbits(
 		uint32_t total_comps, uint32_t comp_bits, float xl[4], float xh[4],
-		color_quad_u8& bestMinColor, color_quad_u8& bestMaxColor, uint32_t best_pbits[2])
+		color_quad_u8& bestMinColor, color_quad_u8& bestMaxColor, uint32_t best_pbits[2], bool alpha_mode = false)
 	{
 		const uint32_t total_bits = comp_bits + 1;
 		const int iscalep = (1 << total_bits) - 1;
 		const float scalep = (float)iscalep;
 
+		// Alpha endpoints at 255 require odd shared parity in BC7 modes 6/7.
+		// Treat opacity as a representation constraint, independent of RGB error.
 		float best_err0 = 1e+9f;
 		float best_err1 = 1e+9f;
 
@@ -15987,7 +15989,7 @@ namespace basist
 				err1 += basisu::squaref(scaledHigh.m_c[i] - xh[i] * 255.0f);
 			}
 
-			if (err0 < best_err0)
+			if (err0 < best_err0 && (!alpha_mode || xl[3] < 1.0f || p == 1))
 			{
 				best_err0 = err0;
 				best_pbits[0] = p;
@@ -15998,7 +16000,7 @@ namespace basist
 				bestMinColor.m_c[3] = xMinColor.m_c[3] >> 1;
 			}
 
-			if (err1 < best_err1)
+			if (err1 < best_err1 && (!alpha_mode || xh[3] < 1.0f || p == 1))
 			{
 				best_err1 = err1;
 				best_pbits[1] = p;
@@ -16100,7 +16102,7 @@ namespace basist
 			basisu::clear_obj(best_pbits);
 
 			color_quad_u8 bestMinColor, bestMaxColor;
-			determine_unique_pbits((total_comps == 2) ? 4 : total_comps, 7, xl, xh, bestMinColor, bestMaxColor, best_pbits);
+			determine_unique_pbits((total_comps == 2) ? 4 : total_comps, 7, xl, xh, bestMinColor, bestMaxColor, best_pbits, true);
 
 			dst_blk.m_low[0] = bestMinColor;
 			dst_blk.m_high[0] = bestMaxColor;
@@ -16502,7 +16504,7 @@ namespace basist
 				color_quad_u8 bestMinColor, bestMaxColor;
 				memset(&bestMinColor, 0, sizeof(bestMinColor));
 				memset(&bestMaxColor, 0, sizeof(bestMaxColor));
-				determine_unique_pbits(4, 5, xl, xh, bestMinColor, bestMaxColor, best_pbits);
+				determine_unique_pbits(4, 5, xl, xh, bestMinColor, bestMaxColor, best_pbits, true);
 
 				const uint32_t bc7_subset_index = invert_partition ? (1 - astc_subset) : astc_subset;
 

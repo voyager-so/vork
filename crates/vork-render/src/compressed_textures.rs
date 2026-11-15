@@ -33,7 +33,7 @@ impl Preparation {
             drop(worker.tx.take());
             if let Some(join) = worker.join.take() {
                 join.join()
-                    .map_err(|_| anyhow::anyhow!("BC7 preparation worker panicked"))??;
+                    .map_err(|panic| crate::failure::panicked("BC7 preparation worker", panic))??;
             }
         }
         if let Some(workers) = self.cpu.borrow_mut().take() {
@@ -118,7 +118,7 @@ impl Preparation {
             drop(worker.tx.take());
             if let Some(join) = worker.join.take() {
                 join.join()
-                    .map_err(|_| anyhow::anyhow!("BC7 preparation worker panicked"))??;
+                    .map_err(|panic| crate::failure::panicked("BC7 preparation worker", panic))??;
             }
             bail!("BC7 preparation worker exited unexpectedly");
         }
@@ -285,6 +285,37 @@ pub(crate) fn load_or_encode(
     Ok(Some(texture.create_view(&Default::default())))
 }
 
+/// The SIMD RGBA search may trade opacity for RGB through shared p-bits in
+/// modes 6/7. Opaque blocks use RGB-only modes 1/3, whose alpha is exactly 255.
+#[cfg(target_arch = "x86_64")]
+fn bc7_settings(opaque: bool) -> intel_tex_2::bc7::EncodeSettings {
+    if opaque {
+        let mut settings = intel_tex_2::bc7::opaque_very_fast_settings();
+        settings.mode_selection[3] = false; // mode 6 also loses alpha in RGB mode
+        settings
+    } else {
+        intel_tex_2::bc7::alpha_very_fast_settings()
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn encode_bc7_level(input: &[u8], w: u32, h: u32) -> Vec<u8> {
+    let opaque = input.chunks_exact(4).all(|p| p[3] == 255);
+    let mut blocks = intel_tex_2::bc7::compress_blocks(
+        &bc7_settings(opaque),
+        &intel_tex_2::RgbaSurface {
+            data: input,
+            width: w,
+            height: h,
+            stride: w * 4,
+        },
+    );
+    if !opaque {
+        encode_bc7_selected_blocks(input, w, h, &mut blocks, true);
+    }
+    blocks
+}
+
 /// SIMD BC7 avoids the UASTC intermediate on NVIDIA hosts. Mips use linear
 /// radiance for sRGB and bilinear sampling at the same texel centres as mip.slang.
 #[cfg(target_arch = "x86_64")]
@@ -293,15 +324,7 @@ fn native_bc7(pixels: &[u8], mut w: u32, mut h: u32, srgb: bool) -> Vec<u8> {
     // every filtered mip has the same texels, so run the identical codec once.
     if pixels.chunks_exact(4).all(|pixel| pixel == &pixels[..4]) {
         let texels: [u8; (EDGE * EDGE * 4) as usize] = std::array::from_fn(|i| pixels[i % 4]);
-        let block = intel_tex_2::bc7::compress_blocks(
-            &intel_tex_2::bc7::alpha_very_fast_settings(),
-            &intel_tex_2::RgbaSurface {
-                data: &texels,
-                width: EDGE,
-                height: EDGE,
-                stride: EDGE * 4,
-            },
-        );
+        let block = encode_bc7_level(&texels, EDGE, EDGE);
         let mut result = Vec::new();
         loop {
             let blocks = (w.div_ceil(EDGE) * h.div_ceil(EDGE)) as usize;
@@ -323,17 +346,7 @@ fn native_bc7(pixels: &[u8], mut w: u32, mut h: u32, srgb: bool) -> Vec<u8> {
             let handles: Vec<_> = blocks_input
                 .chunks((pw * rows * 4) as usize)
                 .map(|data| {
-                    scope.spawn(move || {
-                        intel_tex_2::bc7::compress_blocks(
-                            &intel_tex_2::bc7::alpha_very_fast_settings(),
-                            &intel_tex_2::RgbaSurface {
-                                data,
-                                width: pw,
-                                height: data.len() as u32 / (pw * 4),
-                                stride: pw * 4,
-                            },
-                        )
-                    })
+                    scope.spawn(move || encode_bc7_level(data, pw, data.len() as u32 / (pw * 4)))
                 })
                 .collect();
             handles
@@ -350,7 +363,18 @@ fn native_bc7(pixels: &[u8], mut w: u32, mut h: u32, srgb: bool) -> Vec<u8> {
 /// opaque blocks stay on the GPU; no second cache or texture representation.
 #[cfg(target_arch = "x86_64")]
 pub(crate) fn refine_bc7_alpha_level(input: &[u8], w: u32, h: u32, encoded: &mut [u8]) -> bool {
-    if input.chunks_exact(4).all(|p| p[3] == input[3]) {
+    encode_bc7_selected_blocks(input, w, h, encoded, false)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn encode_bc7_selected_blocks(
+    input: &[u8],
+    w: u32,
+    h: u32,
+    encoded: &mut [u8],
+    opaque: bool,
+) -> bool {
+    if !opaque && input.chunks_exact(4).all(|p| p[3] == input[3]) {
         return false;
     }
     let (pw, ph) = (w.div_ceil(EDGE) * EDGE, h.div_ceil(EDGE) * EDGE);
@@ -364,7 +388,11 @@ pub(crate) fn refine_bc7_alpha_level(input: &[u8], w: u32, h: u32, encoded: &mut
             let alpha = input[base + 3];
             let varying = (0..EDGE)
                 .any(|y| (0..EDGE).any(|x| input[at(bx * EDGE + x, by * EDGE + y) + 3] != alpha));
-            if varying {
+            if if opaque {
+                alpha == 255 && !varying
+            } else {
+                varying
+            } {
                 indices.push((by * (pw / EDGE) + bx) as usize);
                 for y in 0..EDGE {
                     for x in 0..EDGE {
@@ -397,7 +425,7 @@ pub(crate) fn refine_bc7_alpha_level(input: &[u8], w: u32, h: u32, encoded: &mut
                 }
             }
             intel_tex_2::bc7::compress_blocks(
-                &intel_tex_2::bc7::alpha_very_fast_settings(),
+                &bc7_settings(opaque),
                 &intel_tex_2::RgbaSurface {
                     data: &packed,
                     width: count as u32 * EDGE,
@@ -634,7 +662,7 @@ mod tests {
                     let ph = h.div_ceil(EDGE) * EDGE;
                     let full_surface = color.repeat((pw * ph) as usize);
                     expected.extend(intel_tex_2::bc7::compress_blocks(
-                        &intel_tex_2::bc7::alpha_very_fast_settings(),
+                        &bc7_settings(color[3] == 255),
                         &intel_tex_2::RgbaSurface {
                             data: &full_surface,
                             width: pw,
@@ -730,7 +758,7 @@ impl CpuWorkers {
         for join in self.joins {
             let outcome = join
                 .join()
-                .map_err(|_| anyhow::anyhow!("CPU texture preparation worker panicked"))
+                .map_err(|panic| crate::failure::panicked("CPU texture preparation worker", panic))
                 .and_then(|r| r);
             if result.is_ok() {
                 result = outcome;

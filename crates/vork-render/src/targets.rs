@@ -58,10 +58,18 @@ impl Plan {
         for &(camera, _) in &focus { nodes[camera].dynamic = true; }
         Ok(Self { order, aims, focus, parents: nodes.iter().map(|node| node.parent).collect() })
     }
-    pub fn aim(&self, i: usize, world: Mat4, worlds: &[Mat4], node: &vork_scene::Node) -> Result<Mat4> {
+    /// `absent` says which nodes do not exist at this sample: a node never aims at one (rule 1).
+    pub fn aim(&self, i: usize, world: Mat4, worlds: &[Mat4], node: &vork_scene::Node, absent: impl Fn(usize) -> bool) -> Result<Mat4> {
         let Some(target) = self.aims[i] else { return Ok(world); };
         let eye = world.w_axis.truncate();
-        let target = match target {Aim::Node(index)=>worlds[index].w_axis.truncate(),Aim::Point(point)=>point};
+        let target = match target {
+            Aim::Node(index) => {
+                let name = match &node.target { Some(vork_scene::AimTarget::Node(name)) => name.as_str(), _ => "" };
+                ensure!(!absent(index), "node {:?}: target {name:?} is absent (active); aim at a node that exists", node.name);
+                worlds[index].w_axis.truncate()
+            }
+            Aim::Point(point) => point,
+        };
         let direction = target - eye;
         ensure!(direction.length_squared() > super::constants::ORIENTATION_EPSILON,
             "node {:?}: target coincides with the node origin", node.name);
@@ -114,7 +122,7 @@ mod tests {
         for angle in [0.,std::f32::consts::FRAC_PI_4,std::f32::consts::FRAC_PI_2] {
             nodes[1].node.transform.rotation = Some(glam::Quat::from_rotation_z(angle).to_array());
             let world = parent * nodes[1].node.transform.matrix();
-            let actual = plan.aim(1,world,&[parent,world],&nodes[1].node).unwrap();
+            let actual = plan.aim(1,world,&[parent,world],&nodes[1].node,|_|false).unwrap();
             let expected = Mat4::from_rotation_z(angle) * stretch * Mat4::from_scale(Vec3::new(1.,2.,3.));
             assert!(actual.abs_diff_eq(expected,1e-5),"angle {angle}: {actual:?}");
         }
@@ -133,7 +141,7 @@ mod tests {
             let plan=Plan::compile(&mut nodes).unwrap();
             let expected=Mat4::look_to_rh(Vec3::ZERO,Vec3::new(1.,0.,-1.).normalize(),Vec3::Y).inverse()
                 * Mat4::from_rotation_z(0.4) * Mat4::from_scale(Vec3::new(2.,3.,4.));
-            let actual=plan.aim(0,nodes[0].world,&[nodes[0].world],&nodes[0].node).unwrap();
+            let actual=plan.aim(0,nodes[0].world,&[nodes[0].world],&nodes[0].node,|_|false).unwrap();
             assert!(actual.abs_diff_eq(expected,1e-6),"{kind}: {actual:?}");
         }
     }
@@ -141,7 +149,7 @@ mod tests {
     fn aiming_preserves_direction_at_large_world_translations() {
         let mut nodes=nodes(serde_json::json!([{"type":"camera","name":"camera","target":[100000096,100000064,99999872],"translation":[100000000,100000000,100000000]}]));
         let plan=Plan::compile(&mut nodes).unwrap();let world=nodes[0].world;
-        let aimed=plan.aim(0,world,&[world],&nodes[0].node).unwrap();
+        let aimed=plan.aim(0,world,&[world],&nodes[0].node,|_|false).unwrap();
         assert!(aimed.transform_vector3(Vec3::NEG_Z).normalize().abs_diff_eq(Vec3::new(96.,64.,-128.).normalize(),1e-6));
     }
 
@@ -156,7 +164,7 @@ mod tests {
         for x in [5.,10.] {
             let parent=Mat4::from_translation(Vec3::new(x,0.,0.));
             let world=parent*nodes[0].world;
-            let aimed=plan.aim(0,world,&[world,parent],&nodes[0].node).unwrap();
+            let aimed=plan.aim(0,world,&[world,parent],&nodes[0].node,|_|false).unwrap();
             assert!(aimed.transform_vector3(Vec3::NEG_Z).normalize().abs_diff_eq(-world.w_axis.truncate().normalize(),1e-6));
             assert!(aimed.to_scale_rotation_translation().0.abs_diff_eq(Vec3::new(2.,3.,4.),1e-6));
         }
@@ -172,7 +180,7 @@ mod tests {
         assert_eq!(plan.order, [1, 0]);
         assert!(nodes[0].dynamic);
         let worlds = nodes.iter().map(|n| n.world).collect::<Vec<_>>();
-        let aimed = plan.aim(0, worlds[0], &worlds, &nodes[0].node).unwrap();
+        let aimed = plan.aim(0, worlds[0], &worlds, &nodes[0].node, |_| false).unwrap();
         let direction = aimed.transform_vector3(Vec3::NEG_Z).normalize();
         assert!(direction.abs_diff_eq(Vec3::new(1.,0.,-1.).normalize(), 1e-6));
         assert!(aimed.to_scale_rotation_translation().0.abs_diff_eq(Vec3::new(2.,3.,4.), 1e-6));

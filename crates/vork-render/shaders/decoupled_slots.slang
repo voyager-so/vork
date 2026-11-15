@@ -23,7 +23,10 @@ public struct SlotLayout {
     }
     // A slot record index shared by reflection and diffusion: one
     // per dense slot, then one per overflow pool entry.
-    public uint record(uint at) {
+    public uint record(uint at,bool direct=false) {
+        // Direct visibility visits only dense slot zero; its retained records
+        // need no space for the other dense slots or an overflow pool.
+        if(direct) {return at/(REG_VISIBILITY_SLOTS*stride);}
         let dense=pixels*REG_VISIBILITY_SLOTS;
         let index=select(at<dense*stride,at/stride,dense+(at-entry(0u)-1u)/(1u+stride));
         return index;
@@ -33,7 +36,7 @@ public struct SlotLayout {
         return index<dense ? index*stride : entry(index-dense)+1u;
     }
     public uint diffusion(uint at) {return record(at)*REG_VISIBILITY_DIFFUSION_WORDS;}
-    public uint reflection(uint at) {return record(at);}
+    public uint reflection(uint at,bool direct) {return record(at,direct);}
     // Every consumer follows the same dense/pool list and empty-slot rule.
     public uint first(StructuredBuffer<uint> slots, uint pixel) {
         let at=dense(pixel,0u);

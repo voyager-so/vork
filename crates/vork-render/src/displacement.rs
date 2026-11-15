@@ -128,7 +128,7 @@ impl Pipeline {
     ) -> Result<Self> {
         ensure!(
             r.device.limits().max_storage_buffers_per_shader_stage >= 11,
-            "{}", crate::gpu_memory::limit_message("material displacement", "11 storage buffer bindings", format_args!("{} storage buffer bindings",r.device.limits().max_storage_buffers_per_shader_stage), "remove material displacement or use a GPU supporting at least eleven storage buffer bindings")
+            crate::gpu_memory::device_limit("material displacement", "11 storage buffer bindings", format_args!("{} storage buffer bindings",r.device.limits().max_storage_buffers_per_shader_stage), "remove material displacement or use a GPU supporting at least eleven storage buffer bindings")
         );
         let entries: Vec<_> = (0..8)
             .map(|binding| {
@@ -298,7 +298,7 @@ pub(crate) fn page_layout(
         let bytes = mesh.output_size();
         ensure!(
             bytes <= capacity,
-            "{}", crate::gpu_memory::limit_message("displaced geometry", format_args!("{} endpoint bytes",bytes*2), format_args!("{} endpoint bytes",capacity*2), "reduce displacement subdivision or split geometry into smaller objects")
+            crate::gpu_memory::device_limit("displaced geometry", format_args!("{} endpoint bytes",bytes*2), format_args!("{} endpoint bytes",capacity*2), "reduce displacement subdivision or split geometry into smaller objects")
         );
         if pages
             .last()

@@ -1,6 +1,7 @@
+import {writeExecutable} from './executable-fixture.mjs';
 import assert from 'node:assert/strict';
 import {test} from 'node:test';
-import {mkdtempSync, writeFileSync, chmodSync, rmSync} from 'node:fs';
+import {mkdtempSync, rmSync} from 'node:fs';
 import {tmpdir} from 'node:os';
 import {join} from 'node:path';
 import {environmentImage, sky} from '../dist/index.js';
@@ -9,8 +10,7 @@ test('environment helpers lower camelCase options to CLI JSON and reject aliases
   const dir = mkdtempSync(join(tmpdir(), 'vork-options-'));
   const binary = join(dir, 'vork');
   const previous = process.env.VORK_BIN;
-  writeFileSync(binary, '#!/usr/bin/env node\nprocess.stdin.pipe(process.stdout);\n');
-  chmodSync(binary, 0o755);
+  writeExecutable(binary, '#!/usr/bin/env node\nprocess.stdin.pipe(process.stdout);\n', {mode:0o755});
   process.env.VORK_BIN = binary;
   try {
     assert.deepEqual(environmentImage({file:'sky.exr', output:'weight.exr', colorSpace:'Non-Color', fps:30}),

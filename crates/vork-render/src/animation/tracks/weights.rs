@@ -224,7 +224,7 @@ mod tests {
             "animation":[
                 {"loop":true,"offset":1,"speed":-2,"tracks":[{"path":["animation","driver","weight"],"keys":[[0,0.2],[0.4,0.8],[1,0.1]]}]},
                 {"name":"driver","weight":0,"tracks":[{"path":["animation","cut","weight"],"keys":[[0,0,0,4],[1,0,-4,0]],"interpolation":"CUBICSPLINE"}]},
-                {"blend":"add","weight":0.25,"tracks":[{"path":["animation","cut","weight"],"keys":[[0,0.1],[1,0.7]]}]},
+                {"blend":"combine","weight":0.25,"tracks":[{"path":["animation","cut","weight"],"keys":[[0,0.1],[1,0.7]]}]},
                 {"name":"cut","weight":0,"tracks":[{"path":["render","camera"],"keys":[[0,"b"]]}]}
             ]
         }))?;

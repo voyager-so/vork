@@ -63,8 +63,10 @@ pub(crate) enum Display<'a> {
 pub struct Exposure {
     /// Mean alpha; zero coverage makes the exposure values undefined (JSON null).
     pub coverage: f64,
-    /// Any display channel at or above 99% (ARRI false-colour white clipping).
-    pub clipped: f64,
+    /// Any display channel at or above 99% (ARRI false-colour white clipping): where a view ran out of display
+    /// range, so brighter light is no longer told apart. None for a picture no view made: a canvas that shows
+    /// its authored display colours as they are has nothing to clip, and a full channel there is the colour asked for.
+    pub clipped: Option<f64>,
     /// Display Rec.709 luma below 2.5% (ARRI false-colour black clipping).
     pub near_black: f64,
     /// Mean display Rec.709 luma.
@@ -134,11 +136,13 @@ impl Stats {
             entries: &entries,
         });
         {
+            // Canvas exports share Moda's opt-in query stream; 3D keeps its own query addresses.
+            let canvas_queries = queries.is_none().then(moda_engine::gpu_profile::pass_timestamps).flatten();
             let timestamp_writes = queries.map(|query_set| wgpu::ComputePassTimestampWrites {
                 query_set,
                 beginning_of_pass_write_index: Some(crate::timing::query("exposure")),
                 end_of_pass_write_index: Some(crate::timing::query("exposure") + 1),
-            });
+            }).or_else(|| moda_engine::gpu_profile::compute_writes(&canvas_queries));
             let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some("exposure report"), timestamp_writes });
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind, &[]);
@@ -165,19 +169,28 @@ impl Stats {
     }
 }
 
-/// Coverage may legitimately be zero, but every display pixel must be visited.
+/// Coverage may legitimately be zero, but every display pixel must be visited: a count
+/// that disagrees is GPU work that did not complete, whatever the scene.
 fn decode(words: &[u32], pixels: u64) -> Result<Exposure> {
     let wide = |i: usize| u64::from(words[2 * i]) | (u64::from(words[2 * i + 1]) << 32);
     let processed = wide(4);
-    anyhow::ensure!(processed == pixels,
-        "incomplete GPU exposure readback: expected {pixels} pixels, got {processed}");
+    if processed != pixels {
+        return Err(anyhow::anyhow!("incomplete GPU exposure readback: expected {pixels} pixels, got {processed}")
+            .context(crate::failure::FailureKind::Device));
+    }
     let coverage = wide(3) as f64;
     Ok(Exposure {
         coverage: coverage / (pixels as f64 * 255.),
-        clipped: wide(0) as f64 / coverage,
+        clipped: Some(wide(0) as f64 / coverage),
         near_black: wide(1) as f64 / coverage,
         mean: wide(2) as f64 / coverage / f64::from(EXPOSURE_LUMA_SCALE),
     })
+}
+
+/// Create the reduction pipelines before the first frame, with the frame slots' pipelines: preparation
+/// owns pipeline creation. Left alone they are created while the frame's last sample is recorded.
+pub(crate) fn prepare(r: &Renderer) {
+    pipelines(r);
 }
 
 fn pipelines(r: &Renderer) -> &[wgpu::ComputePipeline; 2] {
@@ -229,10 +242,21 @@ mod tests {
         assert!(decode(&words, 60).is_err(), "duplicate reduction was accepted");
     }
 
+    /// A frame whose counters say fewer pixels were visited did not complete on the GPU:
+    /// a device failure for the canvas and the 3D frame alike, even inside a scene boundary.
+    #[test]
+    fn an_incomplete_readback_is_a_device_failure() {
+        let error = decode(&[0; 10], 60).err().expect("a zeroed readback was accepted");
+        assert!(format!("{error:#}").contains("incomplete GPU exposure readback"), "{error:#}");
+        assert_eq!(crate::failure::exit_code(&error), 4);
+        assert_eq!(crate::failure::exit_code(&crate::failure::scene(error)), 4);
+    }
+
     /// Both reductions preserve opaque statistics and weight mixed/empty coverage.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn exposure_counts_clipped_near_black_and_mean_luma() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()) };
+        let r = crate::test_renderer()?;
         // 20x3 so partial workgroups and several groups are exercised.
         let (w, h) = (20u32, 3u32);
         let mut texels = vec![[128u8, 128, 128, 255]; (w * h) as usize];
@@ -279,13 +303,13 @@ mod tests {
                 let e = stats.read(u64::from(w * h))?.unwrap();
                 assert_eq!(e.coverage, coverage / (f64::from(w * h) * 255.));
                 if coverage == 0. {
-                    assert!(e.clipped.is_nan() && e.near_black.is_nan() && e.mean.is_nan());
+                    assert!(e.clipped.is_some_and(f64::is_nan) && e.near_black.is_nan() && e.mean.is_nan());
                     assert!(e.json()["mean"].is_null());
                     continue;
                 }
                 let clipped = if case == "opaque" { 510. } else { 128. };
                 let black = if case == "opaque" { 510. } else { 64. };
-                assert_eq!((e.clipped, e.near_black), (clipped / coverage, black / coverage), "counters reset between exposures");
+                assert_eq!((e.clipped, e.near_black), (Some(clipped / coverage), black / coverage), "counters reset between exposures");
                 let luma = |c: [u8; 4]| {
                     let c = if format == wgpu::TextureFormat::Bgra8Unorm { [c[2], c[1], c[0]] } else { [c[0], c[1], c[2]] };
                     let y = (0.2126 * f64::from(c[0]) + 0.7152 * f64::from(c[1]) + 0.0722 * f64::from(c[2])) / 255.;

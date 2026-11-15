@@ -573,7 +573,7 @@ proptest! {
         extrude in prop_oneof![Just(0.), 0f64..0.5],
         bevel in prop_oneof![Just(0.), 0f64..0.05],
         resolution in 0u32..6,
-        align_x in prop::sample::select(vec!["left", "center", "right", "justify", "flush"]),
+        align_x in prop::sample::select(vec!["left", "center", "right"]),
         align_y in prop::sample::select(
             vec!["top_baseline", "top", "center", "bottom_baseline", "bottom"]
         ),

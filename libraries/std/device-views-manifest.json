@@ -1,0 +1,78 @@
+{
+  "hdr_conversion": "BT.2100 inverse HLG OETF, 1000 nit OOTF gamma 1.2; OCIO inverse surround floor 1e-4^(1/1.2)/3; ST 2084 encoding. OCIO v2.6.0 Displays.cpp and FixedFunctionOpCPU.cpp reference.",
+  "source": "https://github.com/blender/blender/tree/v5.2.1/release/datafiles/colormanagement",
+  "ocio": "2.6.0",
+  "license": "BSD-3-Clause; see dist/licenses/ocio-configuration.txt",
+  "preset": {
+    "view": "AgX - HDR 1000 nits",
+    "peak_cd_m2": 1000,
+    "reference_white_cd_m2": 100,
+    "gamut": "P3 D65 limited in Rec.2020 PQ"
+  },
+  "size": {
+    "Display P3": 57,
+    "Rec.2100-PQ": 57,
+    "Rec.2100-HLG": 57
+  },
+  "min_log2": -12.47393,
+  "max_log2": 12.5260688117,
+  "looks": [
+    "None"
+  ],
+  "rec709_to_egamut": [
+    [
+      0.5593711137771606,
+      0.30478334426879883,
+      0.13584555685520172
+    ],
+    [
+      0.07622070610523224,
+      0.7879717946052551,
+      0.13580746948719025
+    ],
+    [
+      0.06552670896053314,
+      0.16454675793647766,
+      0.7699264883995056
+    ]
+  ],
+  "format": "Original target cube samples; OpenEXR float RGB; x=N*b+r, y=g; tetrahedral interpolation in E-Gamut log2 coordinates; P3 cube returns gamma-2.4 P3, HDR cube returns HLG Rec.2020; the 203 recipe reads the HDR cube with its own shifted log2 bounds",
+  "source_sha256": {
+    "ocio-license-reference.txt": "e39e97c2149a821e3e3b3c07839f8cadf6a98fb0a816b8ed69f16dd8817066fc",
+    "config.ocio": "47a7d83e79c1d21f49ba6c505efe311da723471688c614b5c366e1da7eb8ea3a",
+    "luts/AgX_Base_P3.cube": "6075ac4726cc41ca2d36de65782959d060d20cc9306202c02395796d3b3f7328",
+    "luts/luminance_compensation_bt2020.cube": "e3f5adcd8c08f77a96be141e8d504d58125cc80216a7a641abc970c85840cfd2",
+    "luts/AgX_Rec2100-HLG_p3_lim.cube": "4422eb9a8d3ecc16836d241287b171758e2f2db202934d9ff51865543dd360c0",
+    "ocio-FixedFunctionOpCPU.cpp": "4152acdd09b61dfb46e51685206e0c985ab49cee68782755b4cff5ab38ca0825",
+    "ocio-LICENSE": "82a40c52065ee968aa62015735e84378ac11425db7a233e6a2dcd2c83fc24276",
+    "ocio-Displays.cpp": "445e42533e80687c68730506feeedec9c13d80830c2f9431c6b1b7a218b27629"
+  },
+  "data_sha256": {
+    "agx-p3.exr": "376fb7cf0f7f352f08c96156e6a68be49b99dfd172ebe3ed70bd933ba6abb22d",
+    "agx-pq.exr": "7f765c4e82be4d7f27a0e0698534a2c0467c8278a8dcd74391ab4d9741cea206"
+  },
+  "recipes": [
+    {
+      "data": "agx-pq.exr",
+      "size": 57,
+      "peak_cd_m2": 1000,
+      "reference_white_cd_m2": 100,
+      "white_definition": "Unmodified Blender preset; 100 cd/m\u00b2 per display-reference unit, not per scene unit",
+      "min_log2": -12.47393,
+      "max_log2": 12.5260688117
+    },
+    {
+      "data": "agx-pq.exr",
+      "size": 57,
+      "peak_cd_m2": 1000,
+      "reference_white_cd_m2": 203,
+      "white_definition": "Neutral scene-linear Rec.709 input [1,1,1] has display Y=203 cd/m\u00b2",
+      "scene_exposure_gain": 1.2957664132118243,
+      "scene_exposure_stops": 0.3738056681654702,
+      "min_log2": -12.84773566816547,
+      "max_log2": 12.15226314353453,
+      "derivation": "Scalar exposure before the pinned AgX HDR view; original shoulder and gamut mapping",
+      "output": "HLG Rec.2020; PQ destinations use the existing 1000-nit HLG-to-PQ conversion"
+    }
+  ]
+}

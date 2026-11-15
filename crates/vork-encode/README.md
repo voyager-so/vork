@@ -3,14 +3,15 @@
 Unstable, internal Rust crate; everything in it is free to change.
 
 Rust package `vork-encode`.
-`Encoder::open(DeviceInfo { device, queue, backend }, width, height, fps, EncodeSettings::default(), path, ring_depth)`,
+`Encoder::open(DeviceInfo { device, queue, backend }, width, height, fps, EncodeSettings::default(), path, frames, ring_depth)`,
 `create_surface() -> Surface`, `push(index, texture, &mut surface)`, `release(index, &mut surface)`,
 `finish() -> PathBuf`. Errors use `anyhow::Result`.
 
 `Encoder::prepare(backend, width, height, fps, settings, path) -> PreparedEncoder`
 creates device-independent codec resources without creating or truncating the output.
 It may run on a worker while the render device starts. `PreparedEncoder::open(device,
-queue, ring_depth)` validates device limits, creates the output and attaches GPU resources.
+queue, frames, ring_depth)` validates device limits, creates the output and attaches GPU resources.
+The selected frame count lets FFmpeg readback validate exact movie timing before opening its destination, including when native macOS attachment fails.
 Dropping a preparation without opening it cancels and reclaims its native session,
 leaving an existing output untouched. On Linux, driver loading and CUDA initialization
 run in prepare; context creation, Vulkan UUID matching and NVENC attachment remain in open.
@@ -38,15 +39,15 @@ Texture values represent encoded sRGB components; do not supply linear-light col
   before reuse, and finish
   drains the remaining slots. Vulkan ownership barriers cover each slot’s buffer range.
   Stage totals for copy/wait, NVENC submit/drain and mux writes/finish are printed at finish.
-  If native initialization is unavailable, fall back to the previous readback NVENC/libx264 path.
+  If native initialization is unavailable, use readback NVENC or the reported libx264 fallback.
   `uses_pixel_readback()` reports which path opened; failures after the first frame are errors.
 * Readback: the ring entry’s padded staging buffer -> libx264 through ffmpeg on every platform.
-* HardwareReadback: readback -> ffmpeg VideoToolbox (Mac) or NVENC (Linux), for measurement.
+* HardwareReadback: readback -> ffmpeg VideoToolbox (Mac) or NVENC (NVIDIA), for measurement.
 
 Linux MP4 muxing and portable fallback require ffmpeg on PATH (libx264 for software encoding).
-Before opening a readback stream on any platform, the selected encoder must appear in
-ffmpeg’s video encoder list; missing codecs fail with the portable encoding dependency
-message before writing pixels or touching the destination.
+Before opening a readback stream, hardware must pass its initialization probe;
+software codecs must appear in ffmpeg’s video encoder list. Missing codecs fail
+before writing pixels or touching the destination.
 Native Linux loads libcuda.so.1 and libnvidia-encode.so.1 dynamically; no CUDA SDK is needed
 to build. Native macOS needs no ffmpeg for encoding.
 Hardware initialization errors can be handled by reopening with Readback. `finish` flushes hardware
@@ -71,8 +72,10 @@ output ring has three entries per active frame: one GPU flight and two consumer 
 PNG, EXR, portable video and native encoder surfaces share entry lifetimes; the encoder has
 no independent reorder queue, staging recycler or surface-capacity policy.
 
-All video outputs use limited-range Rec.709 YUV with matching matrix, primaries
-and transfer tags on native VideoToolbox/NVENC and readback ffmpeg. The ffmpeg path explicitly converts RGB to limited-range BT.709
+All video outputs use limited-range Rec.709 YUV with matching matrix and transfer
+tags on native VideoToolbox/NVENC and readback ffmpeg. The primaries tag is the
+frames' display's (`EncodeSettings.primaries`): BT.709 for sRGB pictures, P3 at D65
+(H.273 code 12) for Display P3 pictures. The frames are 8-bit, so they carry SDR displays only. The ffmpeg path explicitly converts RGB to limited-range BT.709
 YUV before encoding, so its conversion agrees with the stream metadata.
 
 MOV destinations select ProRes 4444 (full chroma plus alpha). Auto uses a native
@@ -88,3 +91,12 @@ existing H.264 hardware path and cannot carry alpha. The renderer supplies strai
 The ordering test checks BT.709 tags and decodes with explicit BT.709/video range.
 On Mac, set `VORK_REQUIRE_VT_PRORES=1` for that test to require Auto MOV to use
 VideoToolbox (no pixel readback); without it, Auto may legitimately fall back.
+
+Linux hardware encoding follows the rendering adapter. On NVIDIA, Auto uses NVENC.
+On every other adapter Auto encodes MP4 with libx264 at its quality target (CRF):
+hardware encoders run at a fixed bitrate, and the default must not look worse than
+software on hard content. `PreparedEncoder::validate_fallback(frames, Some(&device))` performs selection
+before output cleanup and retains the result. Software-only preflight accepts
+`None` for the device. Hardware unavailability is reported before libx264 fallback;
+HardwareReadback refuses. FFmpeg movies are staged beside their destination and
+published only after successful finish, with no retry after streaming starts.

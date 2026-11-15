@@ -24,21 +24,21 @@ import vork_prelude;
 // One shadow ray toward the light's centre, respecting shadowed_by selection.
 // Retained volumes use
 // spatial coverage, independent of the camera exposure that triggers an update.
-float3 hit_shadow<P:IProgram,G:IHitGeometry>(G g,RaytracingAccelerationStructure scene,StructuredBuffer<uint> words,uint i,float3 world,float3 normal,float3 position_error,uint index,uint count,bool retained=false) {
+float3 hit_shadow<P:IProgram,G:IHitGeometry,V:IVariant=Unspecialized>(G g,RaytracingAccelerationStructure scene,StructuredBuffer<uint> words,uint i,float3 world,float3 normal,float3 position_error,uint index,uint count,bool retained=false) {
     let ray_flags=lights[i].shadow_offsets[REG_LIGHT_RAY_WORD];
 
     if ((ray_flags&REG_LIGHT_RAY_SHADOWED)==0u) {return 1.;}
     let source=emitter_center_li<Unspecialized>(specialized_light<Unspecialized>(lights[i]),i,world,index);
-    return hit_shadow_direction<P,G>(g,scene,words,i,world,normal,position_error,source.direction,source.distance,index,count,retained);
+    return hit_shadow_direction<P,G,V>(g,scene,words,i,world,normal,position_error,source.direction,source.distance,index,count,retained);
 }
-float3 hit_shadow_direction<P:IProgram,G:IHitGeometry>(G g,RaytracingAccelerationStructure scene,StructuredBuffer<uint> words,uint i,float3 world,float3 normal,float3 position_error,float3 direction,float distance,uint index,uint count,bool retained=false) {
+float3 hit_shadow_direction<P:IProgram,G:IHitGeometry,V:IVariant=Unspecialized>(G g,RaytracingAccelerationStructure scene,StructuredBuffer<uint> words,uint i,float3 world,float3 normal,float3 position_error,float3 direction,float distance,uint index,uint count,bool retained=false) {
     let ray_flags=lights[i].shadow_offsets[REG_LIGHT_RAY_WORD];
     if ((ray_flags&REG_LIGHT_RAY_SHADOWED)==0u) {return 1.;}
     let origin=ray_origin(world,normal,direction,position_error);
     let all_casters=(ray_flags&REG_LIGHT_RAY_SHADOWED_BY_ALL)!=0u;
     let groups=lights[i].shadow_offsets[REG_LIGHT_RAY_LINK_WORD];
     RayDesc ray;ray.Origin=origin;ray.Direction=direction;ray.TMin=0.;ray.TMax=max(distance-length(origin-world),0.);
-    let fields=field_shadow_transmittance<P,G>(g,words,ray,groups,all_casters,index);
+    let fields=field_shadow_transmittance<P,G,V>(g,words,ray,groups,all_casters,index);
     // Use the same installed opacity/link proof as primary connections. No
     // candidate closure or containment evaluation is needed for opaque casters.
     if((ray_flags&REG_LIGHT_RAY_OPAQUE)!=0u) {
@@ -57,11 +57,11 @@ float3 hit_shadow_direction<P:IProgram,G:IHitGeometry>(G g,RaytracingAcceleratio
         if(!connection_owns_hit<G>(g,candidate,inverse,ray.Direction)) {continue;}
         result.transmittance*=1.-candidate_coverage<P,G>(g,words,candidate,inverse,ray.Direction,select(retained,float2(0.),frame.lens.zw));
 #else
-        result.transmittance*=shadow_candidate_transmittance<P,G>(g,scene,words,candidate,query.CandidateWorldToObject3x4(),ray,query.CandidateTriangleRayT(),select(retained,float2(0.),frame.lens.zw),index);
+        result.transmittance*=shadow_candidate_transmittance<P,G,false,true,V>(g,scene,words,candidate,query.CandidateWorldToObject3x4(),ray,query.CandidateTriangleRayT(),select(retained,float2(0.),frame.lens.zw),index);
 #endif
         if (!any(result.transmittance>float3(0.))) {return float3(0.);}
     }
-    return result.transmittance*shadow_contained_transmittance<P,G>(g,scene,words,ray,all_casters,groups,select(retained,float2(0.),frame.lens.zw),index);
+    return result.transmittance*shadow_contained_transmittance<P,G,V>(g,scene,words,ray,all_casters,groups,select(retained,float2(0.),frame.lens.zw),index);
 }
 // World radiance along a ray that escapes the scene, before exposure (diffuse rays).
 float3 world_radiance(float3 direction) {
@@ -112,6 +112,7 @@ float3 finalized_hit_radiance<V:IVariant,S:IShadows,P:IProgram>(HitSurface h,uin
         float3 scattering;float3 indirect_scattering;
         let mask=select(final,select(surface.is_hair,REG_RAY_SPECULAR,lobes),REG_RAY_DIFFUSE|REG_RAY_SPECULAR);
         var policy=AnalyticRadiance(mask,!final,indirect_only && final,capture_endpoint);
+        policy.exact_sources=lit && !final;
         policy.selected_source=int(analytic_source.x);policy.source_probability=analytic_source.y;
         let response=analytic_radiance_at<V,S>(h.v,surface,site,policy,scattering,indirect_scattering);
         if(final) {return response.color*(P.lobes ? surface.weight : 1.)+emission;}

@@ -1,14 +1,15 @@
-import material;
-import vork_constants;
-// An exhausted invocation ends its camera path and is counted at film write.
-// Coverage has an independent call bound: medium coefficient credits must not
-// authorize arbitrarily many expensive surface evaluations in dense cutouts.
+// Coverage draws from the invocation's transport allowance on demand. Initial
+// containment, contact and shadow reservations each cover at most two surface
+// evaluations; camera candidates cover one. Counting each reservation as one
+// step therefore bounds coverage by twice the work limit, without a second
+// fixed quota that can run out during finite containment or repeated queries.
+// The invocation counter prevents auxiliary ledgers from renewing the reserve.
 static uint invocation_medium_steps=0u;
-static uint invocation_alpha_steps=0u;
-struct PathMediumWork { uint remaining; uint alpha_remaining; bool failed; };
-// Watch transport progress, not a conservative static instruction estimate.
-// Free-flight sampling and roulette own normal path termination; this counter
-// catches runaway traversal. Its numerical limit is unchanged.
+struct PathMediumWork { uint remaining; bool failed; };
+// Watch actual work, not hypothetical instructions. Roulette and the profile's
+// bounce budgets own normal termination; the hard ceiling catches runaway work.
+// Preserve the existing transport accounting, including one step per coverage
+// reservation, so previously completing paths encounter the same hard ceiling.
 bool medium_work_step(inout PathMediumWork ledger) {
     let cost=1u;
     if(ledger.failed) {return false;}
@@ -21,14 +22,4 @@ bool medium_work_step(inout PathMediumWork ledger) {
         return false;
     }
     invocation_medium_steps+=cost;ledger.remaining-=cost;return true;
-}
-
-bool medium_alpha_reserve(inout PathMediumWork ledger,uint calls,uint object) {
-    if(ledger.failed) {return false;}
-    if(calls>ledger.alpha_remaining || calls>64u-invocation_alpha_steps) {
-        ledger.failed=true;
-        return false;
-    }
-    invocation_alpha_steps+=calls;ledger.alpha_remaining-=calls;
-    return medium_work_step(ledger);
 }

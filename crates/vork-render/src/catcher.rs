@@ -26,7 +26,7 @@ pub(crate) fn finish(s:&InstalledScene,r:&Renderer,uniform:&wgpu::Buffer,targets
     let group_width=constants::IMAGE_WORKGROUP_SIZE;
     let divisor=match normalization {crate::compositor::Normalization::Frame=>format!("frame.words[{temporal}].y"),_=>"1.".into()};
     let source_text=format!("struct Frame {{words:array<vec4<f32>,{words}>}};\n@group(0) @binding(0) var<uniform> frame:Frame;\n@group(0) @binding(1) var<storage,read> input:array<vec4<f32>>;\n@group(0) @binding(2) var<storage,read> sums:array<vec4<f32>>;\n@group(0) @binding(3) var<storage,read_write> output:array<vec4<f32>>;\n@compute @workgroup_size({group_width},{group_width}) fn main(@builtin(global_invocation_id) id:vec3<u32>) {{if id.x>={w}u || id.y>={h}u {{return;}}let p=id.y*{w}u+id.x;var value=input[p]/{divisor};let a=sums[p*3u];let b=sums[p*3u+1u];let bg=sums[p*3u+2u];if frame.words[{flags}].z==0. {{let valid=b.xyz!=vec3(0.);let ratio=select(vec3(1.),a.xyz/select(vec3(1.),b.xyz,valid),valid);value+=vec4(bg.xyz*ratio,0.)/max(bg.w,1.);}}output[p]=value;}}");
-    let shader=r.device.create_shader_module(wgpu::ShaderModuleDescriptor {label:Some("catcher film composition"),source:wgpu::ShaderSource::Wgsl(source_text.into())});
+    let shader=crate::timing::shader_module(&r.device,wgpu::ShaderModuleDescriptor {label:Some("catcher film composition"),source:wgpu::ShaderSource::Wgsl(source_text.into())});
     let entries=[pipelines::buffer_entry(0,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Uniform),pipelines::buffer_entry(1,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:true}),pipelines::buffer_entry(2,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:true}),pipelines::buffer_entry(3,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:false})];
     let group=r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:Some("catcher film composition"),entries:&entries});
     let layout=r.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {label:Some("catcher film composition"),bind_group_layouts:&[Some(&group)],immediate_size:0});
@@ -42,8 +42,8 @@ mod tests {
     use super::*;
     use serde_json::{json,Value};
     fn scene()->Value {
-        json!({"version":2,"render":{"resolution":[16,16],"background":"transparent",
-            "settings":{"integrator":"path","samples":64,"denoiser":null},"display":{"program":"std/standard","inputs":{"dither_intensity":0}}},
+        json!({"version":2,"composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[16,16],"background":"transparent",
+            "settings":{"integrator":"path","samples":64,"denoiser":null}},
             "buffers":{"p":{"type":"vec3","data":[[-2,-2,0],[2,-2,0],[2,2,0],[-2,2,0]]},"n":{"type":"vec3","data":[[0,0,1],[0,0,1],[0,0,1],[0,0,1]]},"i":{"type":"u32","data":[0,1,2,0,2,3]}},
             "geometry":{"quad":{"attributes":{"POSITION":"p","NORMAL":"n"},"indices":"i"}},
             "materials":{"matte":{"inputs":{"base_color":[0.5,0.5,0.5],"specular_weight":0}}},
@@ -63,7 +63,7 @@ mod tests {
     #[test]
     #[ignore="requires real GPU with ray queries and pinned Slang"]
     fn neutral_catcher_and_unlit_baseline_are_finite_and_channel_selection_preserves_colour()->Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let input=scene();
         let with=render(&r,input.clone(),true)?;
         let without=render(&r,input.clone(),false)?;
@@ -78,7 +78,7 @@ mod tests {
     #[test]
     #[ignore="requires real GPU with ray queries and pinned Slang"]
     fn holdout_and_opaque_catcher_match_film_contract()->Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let mut input=scene();
         input["render"]["background"]=json!([0.2,0.3,0.4]);
         let catcher=render(&r,input.clone(),true)?.linear_rgba.unwrap();
@@ -94,7 +94,7 @@ mod tests {
     #[test]
     #[ignore="requires real GPU with ray queries and pinned Slang"]
     fn shadow_occlusion_and_added_cg_light_are_unclamped()->Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let mut input=scene();
         input["materials"]["black"]=json!({"inputs":{"base_color":[0,0,0],"specular_weight":0}});
         input["nodes"].as_array_mut().unwrap().push(json!({"type":"mesh","geometry":"quad","materials":["black"],"translation":[0,0,1],"scale":[0.15,0.15,1],"visible_camera":false}));
@@ -131,7 +131,7 @@ mod tests {
     #[test]
     #[ignore="requires real GPU with ray queries and pinned Slang"]
     fn implicit_geometry_casts_catcher_shadows() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let mut input=scene();
         input["buffers"]["field"]=json!({"type":"f32","dims":[24,24,24]});
         input["geometry"]["sphere"]=json!({"topology":"implicit","attributes":{"phi":"field"}});

@@ -12,6 +12,13 @@ export const resourceSlots = {
           "ref": "Buffer"
         }
       },
+      "composition": {
+        "branches": [
+          {
+            "ref": "Composition"
+          }
+        ]
+      },
       "geometry": {
         "values": {
           "ref": "Geometry"
@@ -36,13 +43,17 @@ export const resourceSlots = {
         "values": {
           "ref": "Program"
         }
-      },
-      "render": {
-        "ref": "Render"
       }
     }
   },
   "defs": {
+    "Audio": {
+      "properties": {
+        "file": {
+          "file": true
+        }
+      }
+    },
     "Buffer": {
       "branches": [
         {
@@ -84,6 +95,27 @@ export const resourceSlots = {
           "ref": "NameOr"
         }
       }
+    },
+    "Composition": {
+      "properties": {
+        "compositor": {
+          "items": {
+            "ref": "CompositeEntry"
+          }
+        },
+        "view": {
+          "ref": "NameOr"
+        }
+      }
+    },
+    "Content": {
+      "branches": [
+        {
+          "items": {
+            "ref": "Run"
+          }
+        }
+      ]
     },
     "Geometry": {
       "branches": [
@@ -142,6 +174,13 @@ export const resourceSlots = {
               ]
             }
           }
+        },
+        {
+          "properties": {
+            "font": {
+              "file": true
+            }
+          }
         }
       ]
     },
@@ -161,19 +200,19 @@ export const resourceSlots = {
     },
     "Image": {
       "properties": {
-        "file": {
-          "file": true
-        },
-        "render": {
+        "composition": {
           "branches": [
             {
-              "ref": "ImageRender"
+              "ref": "ImageComposition"
             }
           ]
+        },
+        "file": {
+          "file": true
         }
       }
     },
-    "ImageRender": {
+    "ImageComposition": {
       "properties": {
         "compositor": {
           "items": {
@@ -311,19 +350,57 @@ export const resourceSlots = {
       "branches": [
         {
           "properties": {
+            "animation": {
+              "items": {
+                "ref": "NodeLayer"
+              }
+            },
+            "audio": {
+              "branches": [
+                {
+                  "ref": "Audio"
+                }
+              ]
+            },
             "children": {
               "items": {
                 "ref": "Node"
               }
+            },
+            "composition": {
+              "branches": [
+                {
+                  "ref": "Composition"
+                }
+              ]
             }
           }
         },
         {
           "properties": {
+            "animation": {
+              "items": {
+                "ref": "NodeLayer"
+              }
+            },
+            "audio": {
+              "branches": [
+                {
+                  "ref": "Audio"
+                }
+              ]
+            },
             "children": {
               "items": {
                 "ref": "Node"
               }
+            },
+            "composition": {
+              "branches": [
+                {
+                  "ref": "Composition"
+                }
+              ]
             },
             "geometry": {
               "ref": "NameOr5"
@@ -351,10 +428,29 @@ export const resourceSlots = {
         },
         {
           "properties": {
+            "animation": {
+              "items": {
+                "ref": "NodeLayer"
+              }
+            },
+            "audio": {
+              "branches": [
+                {
+                  "ref": "Audio"
+                }
+              ]
+            },
             "children": {
               "items": {
                 "ref": "Node"
               }
+            },
+            "composition": {
+              "branches": [
+                {
+                  "ref": "Composition"
+                }
+              ]
             },
             "file": {
               "file": true
@@ -368,10 +464,29 @@ export const resourceSlots = {
         },
         {
           "properties": {
+            "animation": {
+              "items": {
+                "ref": "NodeLayer"
+              }
+            },
+            "audio": {
+              "branches": [
+                {
+                  "ref": "Audio"
+                }
+              ]
+            },
             "children": {
               "items": {
                 "ref": "Node"
               }
+            },
+            "composition": {
+              "branches": [
+                {
+                  "ref": "Composition"
+                }
+              ]
             },
             "material": {
               "branches": [
@@ -384,10 +499,29 @@ export const resourceSlots = {
         },
         {
           "properties": {
+            "animation": {
+              "items": {
+                "ref": "NodeLayer"
+              }
+            },
+            "audio": {
+              "branches": [
+                {
+                  "ref": "Audio"
+                }
+              ]
+            },
             "children": {
               "items": {
                 "ref": "Node"
               }
+            },
+            "composition": {
+              "branches": [
+                {
+                  "ref": "Composition"
+                }
+              ]
             },
             "image": {
               "branches": [
@@ -411,8 +545,110 @@ export const resourceSlots = {
               ]
             }
           }
+        },
+        {
+          "properties": {
+            "animation": {
+              "items": {
+                "ref": "NodeLayer"
+              }
+            },
+            "audio": {
+              "branches": [
+                {
+                  "ref": "Audio"
+                }
+              ]
+            },
+            "children": {
+              "items": {
+                "ref": "Node"
+              }
+            },
+            "composition": {
+              "branches": [
+                {
+                  "ref": "Composition"
+                }
+              ]
+            },
+            "content": {
+              "ref": "Content"
+            },
+            "font": {
+              "branches": [
+                {
+                  "file": true
+                },
+                {
+                  "items": {
+                    "file": true
+                  }
+                }
+              ]
+            }
+          }
+        },
+        {
+          "properties": {
+            "animation": {
+              "items": {
+                "ref": "NodeLayer"
+              }
+            },
+            "audio": {
+              "branches": [
+                {
+                  "ref": "Audio"
+                }
+              ]
+            },
+            "children": {
+              "items": {
+                "ref": "Node"
+              }
+            },
+            "composition": {
+              "branches": [
+                {
+                  "ref": "Composition"
+                }
+              ]
+            }
+          }
         }
       ]
+    },
+    "NodeLayer": {
+      "branches": [
+        {
+          "properties": {
+            "tracks": {
+              "items": {
+                "ref": "Track"
+              }
+            }
+          }
+        },
+        {
+          "properties": {
+            "clip": {
+              "branches": [
+                {
+                  "ref": "Clip"
+                }
+              ]
+            }
+          }
+        }
+      ]
+    },
+    "OutputDestination": {
+      "properties": {
+        "file": {
+          "file": true
+        }
+      }
     },
     "Program": {
       "branches": [
@@ -442,15 +678,23 @@ export const resourceSlots = {
         }
       ]
     },
-    "Render": {
+    "Run": {
       "properties": {
-        "compositor": {
-          "items": {
-            "ref": "CompositeEntry"
-          }
-        },
-        "display": {
-          "ref": "NameOr"
+        "font": {
+          "branches": [
+            {
+              "branches": [
+                {
+                  "file": true
+                },
+                {
+                  "items": {
+                    "file": true
+                  }
+                }
+              ]
+            }
+          ]
         }
       }
     },

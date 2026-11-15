@@ -135,7 +135,11 @@ void cloth_contacts_gauss_seidel() {
     float3 before=w.x*old_load(ids.x)+w.y*old_load(ids.y)+w.z*old_load(ids.z)+w.w*old_load(ids.w);
     float3 travel=delta-before-contact_motion_load(slot);travel-=dot(travel,plane.xyz)*plane.xyz;
     float3 target=previous-travel/den;float limit=.6*next;float magnitude=length(target);
-    if((magnitude==0||!isfinite(magnitude))&&any(target!=float3(0))){float scale=max(abs(target.x),max(abs(target.y),abs(target.z)));magnitude=scale*length(target/scale);}
+    // Below 2^-51 the squared norm is under 2^-102: still a normal float, but
+    // within 2^24 of the subnormal boundary (2^-126), where a square keeps
+    // fewer than a float's digits before it reaches zero. Normalise by the
+    // largest component first.
+    if((magnitude<4.4408921e-16||!isfinite(magnitude))&&any(target!=float3(0))){float scale=max(abs(target.x),max(abs(target.y),abs(target.z)));magnitude=scale*length(target/scale);}
     if(magnitude>0)target*=min(1.,limit/magnitude);
     contact_tangent_lambda_store(slot,target);impulse+=target-previous;
    }

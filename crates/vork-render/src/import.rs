@@ -6,19 +6,172 @@ use std::path::Path;
 /// Reads a glTF or GLB file once and parses it from those bytes. gltf-json's
 /// validation can itself panic on malformed documents; that is reported as an error.
 pub(crate) fn open(path: &Path) -> Result<gltf::Gltf> {
+    check_extension(path)?;
+    let bytes = (|| -> Result<Vec<u8>> {
+        let mut file = crate::source_file(path)?;
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut file, &mut bytes)?;
+        Ok(bytes)
+    })().with_context(|| format!("read {}", path.display()))?;
+    let gltf = crate::failure::contain("the glTF parser", || from_slice(&bytes))?;
+    warn_instancing(&gltf.document,path);
+    Ok(gltf)
+}
+
+fn check_extension(path: &Path) -> Result<()> {
     if let Some(extension) = path.extension().and_then(|e| e.to_str()) {
         ensure!(extension.eq_ignore_ascii_case("gltf") || extension.eq_ignore_ascii_case("glb"),
-            "unsupported asset format .{extension}: {}; supported formats are glTF 2.0 (.gltf and .glb)", path.display());
+            "unsupported asset format .{extension}: {}; supported formats are glTF/GLB, SPZ and Gaussian PLY", path.display());
     }
-    let bytes = std::fs::read(path).with_context(|| format!("read {}", path.display()))?;
-    let gltf = crate::failure::contain("the glTF parser", || from_slice(&bytes))?;
-    for node in gltf.document.nodes() {
+    Ok(())
+}
+
+fn warn_instancing(document: &gltf::Document,path: &Path) {
+    for node in document.nodes() {
         if node.extension_value("EXT_mesh_gpu_instancing").is_some() {
             crate::warnings::dropped("gltf_instancing", serde_json::json!({"file":path,"node":node.index(),"name":node.name(),"extension":"EXT_mesh_gpu_instancing"}),
                 "instance placements are ignored; using the node's mesh once. Export separate mesh nodes instead of EXT_mesh_gpu_instancing.".into());
         }
     }
-    Ok(gltf)
+}
+
+/// Source admission needs the GLB document and BIN extent, not the BIN payload.
+/// Installation still uses `open` and the original buffer loader.
+pub(crate) fn validate_file(path: &Path,base: &Path) -> Result<Vec<std::path::PathBuf>> {
+    check_extension(path)?;
+    let mut file=crate::source_file(path).with_context(||format!("read {}",path.display()))?;
+    let length=file.metadata().with_context(||format!("read {}",path.display()))?.len();
+    let (gltf,bin_length)=crate::failure::contain("the glTF parser",||source_document(&mut file,length))
+        .map_err(|error|if error.is::<std::io::Error>() {error.context(format!("read {}",path.display()))} else {error})?;
+    warn_instancing(&gltf.document,path);
+    validate_sources(&gltf.document,bin_length,base)
+}
+
+fn source_document(reader: &mut (impl std::io::Read+std::io::Seek),length: u64) -> Result<(gltf::Gltf,Option<u64>)> {
+    use std::io::{Read,Seek,SeekFrom};
+    let mut magic=Vec::new();
+    (&mut *reader).take(4).read_to_end(&mut magic)?;
+    reader.seek(SeekFrom::Start(0))?;
+    if magic!=b"glTF" {
+        // A binary file with an external BOM is refused without touching BIN.
+        if magic.starts_with(b"\xEF\xBB\xBF") {
+            let mut prefix=Vec::new();
+            (&mut *reader).take(7).read_to_end(&mut prefix)?;
+            ensure!(!vork_scene::diagnostics::without_bom(&prefix).starts_with(b"glTF"),
+                "a UTF-8 byte-order mark precedes binary glTF");
+            reader.seek(SeekFrom::Start(0))?;
+        }
+        let mut bytes=Vec::new();
+        reader.read_to_end(&mut bytes)?;
+        return Ok((from_slice(&bytes)?,None));
+    }
+    ensure!(length>=12,"GLB header is truncated");
+    let mut header=[0u8;12];reader.read_exact(&mut header)?;
+    let declared=u32::from_le_bytes(header[8..12].try_into().unwrap()) as u64;
+    ensure!(declared>=12 && declared==length,"GLB header length {declared} does not match the {length}-byte file");
+    // Match check_glb: validate every chunk extent before version/type/JSON errors.
+    // gltf 1.4 only interprets the first two chunk types, ignoring later chunks.
+    let mut chunks=Vec::new();
+    let mut reader=std::io::BufReader::new(reader);
+    let mut at=12;
+    while at<length {
+        ensure!(length-at>=8,"GLB chunk header at byte {at} is truncated");
+        let mut chunk=[0u8;8];
+        // Do not read ahead into JSON or BIN. Later extension chunks can be
+        // scanned in buffered windows; seek_relative keeps small skips in
+        // memory and seeks over payloads larger than the remaining buffer.
+        if chunks.len()<2 {reader.get_mut().read_exact(&mut chunk)?;}
+        else {reader.read_exact(&mut chunk)?;}
+        let size=u32::from_le_bytes(chunk[..4].try_into().unwrap()) as u64;
+        ensure!(size<=length-at-8,"GLB chunk at byte {at} has length {size}, past the declared length {length}");
+        if chunks.len()<2 {chunks.push((size,<[u8;4]>::try_from(&chunk[4..]).unwrap()));}
+        at+=8+size;
+        reader.seek_relative(size as i64)?;
+    }
+    let current=reader.seek(SeekFrom::End(0))?;
+    ensure!(current==length,"GLB header length {declared} does not match the {current}-byte file");
+    let version=u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if version!=2 {return Err(gltf::Error::Binary(gltf::binary::Error::Version(version)).into());}
+    for (index,&(_,kind)) in chunks.iter().enumerate() {
+        use gltf::binary::{ChunkType,Error};
+        let kind=match &kind {b"JSON"=>ChunkType::Json,b"BIN\0"=>ChunkType::Bin,
+            _=>return Err(gltf::Error::Binary(Error::UnknownChunkType(kind)).into())};
+        if !matches!((index,kind),(0,ChunkType::Json)|(1,ChunkType::Bin)) {
+            return Err(gltf::Error::Binary(Error::ChunkType(kind)).into());
+        }
+    }
+    // Preserve the embedded-JSON parser, including its BOM and normalization
+    // behavior, without a placeholder BIN allocation or a second JSON parser.
+    let json_length=chunks.first().map(|&(size,_)|size);
+    let mut json_glb=header.to_vec();
+    if let Some(size)=json_length {
+        json_glb.extend((size as u32).to_le_bytes());json_glb.extend(b"JSON");
+        json_glb.resize(20+size as usize,0);
+        reader.seek(SeekFrom::Start(20))?;reader.get_mut().read_exact(&mut json_glb[20..])?;
+    }
+    let json_total=json_glb.len() as u32;
+    json_glb[8..12].copy_from_slice(&json_total.to_le_bytes());
+    Ok((from_slice(&json_glb)?,chunks.get(1).map(|&(size,_)|size)))
+}
+
+/// Check filesystem facts without loading buffer payloads or decoding images.
+/// Match gltf's URI resolution and four-byte buffer padding. Missing sampled
+/// images retain the installer's magenta substitution; other I/O errors refuse.
+fn validate_sources(gltf: &gltf::Document, bin_length: Option<u64>, base: &Path) -> Result<Vec<std::path::PathBuf>> {
+    fn external(uri: &str, base: &Path) -> Result<Option<std::path::PathBuf>> {
+        if uri.starts_with("data:") { return Ok(None); }
+        if let Some(path) = uri.strip_prefix("file://").or_else(|| uri.strip_prefix("file:")) {
+            return Ok(Some(path.into()));
+        }
+        ensure!(!uri.contains(':'), "unsupported glTF URI scheme: {uri}; use a local file or data URI");
+        Ok(Some(base.join(urlencoding::decode(uri).context("correct the percent-encoded URI")?.as_ref())))
+    }
+    let mut errors = Vec::new();
+    let mut files = Vec::new();
+    for buffer in gltf.buffers() {
+        let source = buffer.source();
+        let result = (|| -> Result<()> {
+            let length = match source {
+                gltf::buffer::Source::Uri(uri) => match external(uri, base)? {
+                    Some(path) => {
+                        // Use the importer's error type, retaining its failure category.
+                        let length = crate::source_file(&path).map_err(gltf::Error::Io)?
+                            .metadata().map_err(gltf::Error::Io)?.len();
+                        files.push(path);
+                        length
+                    }
+                    None => return Ok(()), // Embedded data is checked when consumed.
+                },
+                gltf::buffer::Source::Bin => bin_length.context("missing GLB binary chunk")?,
+            };
+            let padded = length.checked_add(3).context("buffer size overflow")? / 4 * 4;
+            ensure!(padded >= buffer.length() as u64,
+                "expected {} bytes but received {length} bytes ({} after glTF padding)", buffer.length(), padded);
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let source = match source { gltf::buffer::Source::Uri(uri) => uri, _ => "GLB binary chunk" };
+            errors.push(error.context(format!("glTF buffer {} ({source}): restore the buffer file or correct its URI/byteLength", buffer.index())));
+        }
+    }
+    for image in gltf.images() {
+        let gltf::image::Source::Uri {uri,..} = image.source() else {continue};
+        let result = (|| -> Result<()> {
+            let Some(path) = external(uri, base)? else {return Ok(())};
+            files.push(path.clone());
+            match crate::source_file(&path) {
+                Ok(_) => {},
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {},
+                Err(error) => return Err(gltf::Error::Io(error).into()),
+            }
+            Ok(())
+        })();
+        if let Err(error) = result {
+            errors.push(error.context(format!("glTF image {} ({uri}): restore the image file or correct its URI", image.index())));
+        }
+    }
+    vork_scene::v2::diagnostics::joined(errors)?;
+    Ok(files)
 }
 
 /// The document's buffers, read as `gltf::import_buffers` reads them (it checks each
@@ -79,7 +232,7 @@ pub(crate) fn from_slice(bytes: &[u8]) -> Result<gltf::Gltf> {
     let text = vork_scene::diagnostics::without_bom(bytes);
     ensure!(!bytes.starts_with(b"Kaydara FBX Binary")
         && !text.trim_ascii_start().starts_with(b"; FBX"),
-        "unsupported asset format FBX; supported formats are glTF 2.0 (.gltf and .glb)");
+        "unsupported asset format FBX; supported formats are glTF/GLB, SPZ and Gaussian PLY");
     let glb = bytes.starts_with(b"glTF");
     let bytes = if glb { bytes } else { vork_scene::diagnostics::without_bom(bytes) };
     // gltf's parser detects GLB again; a BOM must not route binary past check_glb.
@@ -424,6 +577,7 @@ impl GeometryUpload<'_> {
         *self.min = self.min.min(bounds.0);
         *self.max = self.max.max(bounds.1);
         self.draws.push(Draw {
+            splats: None,
             implicit: None,
             sort_order: 0,
             vertices: vertex_buffer,
@@ -821,7 +975,7 @@ mod tests {
         for path in ["character.fbx", "character.FBX", "mesh.obj", "external.usdz"] {
             let error = format!("{:#}", open(Path::new(path)).unwrap_err());
             assert!(error.contains("unsupported asset format"), "{error}");
-            assert!(error.contains(".gltf and .glb"), "{error}");
+            assert!(error.contains("glTF/GLB, SPZ and Gaussian PLY"), "{error}");
         }
         for bytes in [b"Kaydara FBX Binary  \0\x1a\0".as_slice(), b"  ; FBX 7.4.0 project file"] {
             let error = format!("{:#}", from_slice(bytes).unwrap_err());
@@ -913,5 +1067,190 @@ mod tests {
             let error = from_slice(&[b"\xEF\xBB\xBF".as_slice(), &glb(json, length)].concat()).unwrap_err().to_string();
             assert!(error.contains("byte-order mark precedes binary glTF"), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+
+    fn container(chunks: &[(&[u8;4],&[u8])]) -> Vec<u8> {
+        let mut bytes=b"glTF\x02\0\0\0\0\0\0\0".to_vec();
+        for &(kind,data) in chunks {
+            bytes.extend((data.len() as u32).to_le_bytes());bytes.extend(kind);bytes.extend(data);
+        }
+        let length=bytes.len() as u32;bytes[8..12].copy_from_slice(&length.to_le_bytes());bytes
+    }
+
+    fn admission(bytes: &[u8],base: &Path) -> Result<(serde_json::Value,Option<u64>,Vec<std::path::PathBuf>)> {
+        let (gltf,length)=source_document(&mut std::io::Cursor::new(bytes),bytes.len() as u64)?;
+        assert!(gltf.blob.is_none(),"admission must not manufacture a BIN payload");
+        let files=validate_sources(&gltf.document,length,base)?;
+        Ok((serde_json::to_value(gltf.document.as_json())?,length,files))
+    }
+
+    fn assert_same_admission(bytes: &[u8],base: &Path) {
+        let old=(|| -> Result<_> {
+            let gltf=from_slice(bytes)?;let length=gltf.blob.as_ref().map(|b|b.len() as u64);
+            let files=validate_sources(&gltf.document,length,base)?;
+            Ok((serde_json::to_value(gltf.document.as_json())?,length,files))
+        })().map_err(|e|format!("{e:#}"));
+        assert_eq!(admission(bytes,base).map_err(|e|format!("{e:#}")),old);
+    }
+
+    #[test]
+    fn metadata_source_admission_matches_loader_refusals() {
+        let base=Path::new(".");
+        let json=br#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":4}]}"#;
+        let basic=br#"{"asset":{"version":"2.0"}}"#;
+        let valid=container(&[(b"JSON",json),(b"BIN\0",&[1,2,3,4])]);
+        assert!(admission(&valid,base).is_ok());
+        for bytes in [
+            container(&[(b"JSON",basic)]),
+            container(&[(b"JSON",basic),(b"BIN\0",&[])]),
+            container(&[(b"JSON",json)]), // missing BIN
+            container(&[(b"JSON",json),(b"BIN\0",&[])]), // short BIN
+            container(&[(b"JSON",json),(b"BIN\0",&[1,2,3])]), // importer padding
+            container(&[(b"JSON",json),(b"BIN\0",&[1,2,3,4]),(b"JUNK",&[9])]),
+            container(&[(b"BIN\0",basic)]),
+            container(&[(b"JUNK",basic)]),
+            container(&[(b"JSON",basic),(b"JSON",&[])]),
+            container(&[(b"JSON",basic),(b"JUNK",&[])]),
+            container(&[]),
+            container(&[(b"JSON",b"not JSON")]),
+            container(&[(b"JSON",&[b"\xEF\xBB\xBF".as_slice(),basic].concat())]),
+            [b"\xEF\xBB\xBF".as_slice(),&valid].concat(),
+            [b"\xEF\xBB\xBF".as_slice(),basic].concat(),
+            b"Kaydara FBX Binary  \0".to_vec(),b"; FBX 7.4".to_vec(),
+        ] {assert_same_admission(&bytes,base);}
+        // Exact error precedence, header/chunk truncation and ignored trailing
+        // chunk behavior are compared against the unchanged installer parser.
+        for end in 0..valid.len() {assert_same_admission(&valid[..end],base);}
+        for index in 0..valid.len() {
+            for value in [0,255] {let mut bytes=valid.clone();bytes[index]=value;assert_same_admission(&bytes,base);}
+        }
+        for tail in [vec![1],vec![0;7],vec![255;8]] {
+            let mut bytes=valid.clone();bytes.extend(tail);let length=bytes.len() as u32;
+            bytes[8..12].copy_from_slice(&length.to_le_bytes());assert_same_admission(&bytes,base);
+        }
+        // The same normalization and document/range checks still run on JSON.
+        for (index,json) in [
+            serde_json::json!({"asset":{"version":"2.0"},"materials":[{"normalTexture":{"index":0,"texCoord":-1}}],"textures":[{"source":0}],"images":[{"uri":"missing-normal.png"}]}),
+            serde_json::json!({"asset":{"version":"2.0"},"extensionsRequired":["KHR_materials_clearcoat"],"materials":[{"extensions":{"KHR_materials_clearcoat":{"clearcoatFactor":1}}}]}),
+            serde_json::json!({"asset":{"version":"2.0"},"nodes":[{"children":[0]}]}),
+            serde_json::json!({"asset":{"version":"2.0"},"buffers":[{"byteLength":4}],"bufferViews":[{"buffer":0,"byteLength":8}]}),
+            serde_json::json!({"asset":{"version":"2.0"},"buffers":[{"byteLength":4}],"bufferViews":[{"buffer":0,"byteLength":4}],"accessors":[{"bufferView":0,"componentType":5126,"count":2,"type":"SCALAR"}]}),
+            serde_json::json!({"asset":{"version":"2.0"},"images":[{}]}),
+        ].into_iter().enumerate() {
+            let bytes=container(&[(b"JSON",&serde_json::to_vec(&json).unwrap()),(b"BIN\0",&[0;4])]);
+            assert_same_admission(&bytes,base);
+            assert_eq!(admission(&bytes,base).is_ok(),index<2,"normalization accepts; invalid document ranges refuse");
+        }
+    }
+
+    #[test]
+    fn metadata_source_admission_buffers_extension_chunks() -> Result<()> {
+        use std::io::{Read,Seek,SeekFrom};
+        struct Counted {bytes:std::io::Cursor<Vec<u8>>,reads:usize,seeks:usize,read_bytes:usize}
+        impl Read for Counted {
+            fn read(&mut self,out:&mut [u8])->std::io::Result<usize> {
+                self.reads+=1;
+                let count=self.bytes.read(out)?;self.read_bytes+=count;Ok(count)
+            }
+        }
+        impl Seek for Counted {
+            fn seek(&mut self,pos:SeekFrom)->std::io::Result<u64> {
+                self.seeks+=1;self.bytes.seek(pos)
+            }
+        }
+        // Zero and nonzero small payloads exercise buffered header/skip paths,
+        // including headers straddling buffer boundaries. Large payloads still
+        // seek rather than reading the whole extension into memory.
+        for size in [0,4,13,16384] {
+            let json=br#"{"asset":{"version":"2.0"}}"#;
+            let payload=vec![0;size];
+            let count=4096;
+            let mut chunks=vec![(b"JSON",json.as_slice()),(b"BIN\0",&[][..])];
+            chunks.extend(std::iter::repeat_n((b"TEST",payload.as_slice()),count));
+            let bytes=container(&chunks);let length=bytes.len() as u64;
+            let mut reader=Counted {bytes:std::io::Cursor::new(bytes),reads:0,seeks:0,read_bytes:0};
+            let (_,bin_length)=source_document(&mut reader,length)?;
+            assert_eq!(bin_length,Some(0));
+            if size<8192 {
+                assert!(reader.reads<count/100,"{} reads for {count} small chunks",reader.reads);
+                assert!(reader.seeks<20,"{} seeks for {count} small chunks",reader.seeks);
+            } else {
+                assert!(reader.read_bytes<(length as usize)/2,"large extension payloads must be skipped");
+            }
+            // Even an ignored chunk after many buffer refills must be checked.
+            let bytes=reader.bytes.get_mut();let end=bytes.len();
+            bytes[end-size-8..end-size-4].copy_from_slice(&u32::MAX.to_le_bytes());
+            assert_same_admission(bytes,Path::new("."));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_source_admission_skips_binary_payload() -> Result<()> {
+        use std::io::{Read,Seek,SeekFrom};
+        struct Guard {bytes:std::io::Cursor<Vec<u8>>,forbidden:std::ops::Range<u64>}
+        impl Read for Guard {
+            fn read(&mut self,out:&mut [u8])->std::io::Result<usize> {
+                let at=self.bytes.position();let end=(at+out.len() as u64).min(self.bytes.get_ref().len() as u64);
+                assert!(end<=self.forbidden.start || at>=self.forbidden.end,"admission read BIN bytes");
+                self.bytes.read(out)
+            }
+        }
+        impl Seek for Guard {fn seek(&mut self,pos:SeekFrom)->std::io::Result<u64>{self.bytes.seek(pos)}}
+        let json=br#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":32768}]}"#;
+        let bytes=container(&[(b"JSON",json),(b"BIN\0",&vec![0;32768]),(b"JUNK",&[1,2,3])]);
+        let length=bytes.len() as u64;let bin_start=28+json.len() as u64;
+        let mut reader=Guard {bytes:std::io::Cursor::new(bytes),forbidden:bin_start..bin_start+32768};
+        let (gltf,bin_length)=source_document(&mut reader,length)?;
+        assert_eq!(bin_length,Some(32768));assert!(gltf.blob.is_none());
+        validate_sources(&gltf.document,bin_length,Path::new("."))?;
+        Ok(())
+    }
+
+    #[test]
+    fn metadata_source_admission_validates_external_files() -> Result<()> {
+        let root=std::env::temp_dir().join(format!("vork-gltf-metadata-source-{}",std::process::id()));
+        std::fs::create_dir_all(&root)?;std::fs::write(root.join("short.bin"),[1,2,3])?;
+        std::fs::create_dir_all(root.join("directory.png"))?;
+        for (uri,length) in [("short.bin",4),("short.bin",8),("missing.bin",4),("https://example.invalid/data",4)] {
+            let json=serde_json::to_vec(&serde_json::json!({"asset":{"version":"2.0"},"buffers":[{"uri":uri,"byteLength":length}]}))?;
+            assert_same_admission(&container(&[(b"JSON",&json)]),&root);
+        }
+        for image in ["missing.png","directory.png","https://example.invalid/image"] {
+            let json=serde_json::to_vec(&serde_json::json!({"asset":{"version":"2.0"},"images":[{"uri":image}]}))?;
+            assert_same_admission(&container(&[(b"JSON",&json)]),&root);
+        }
+        let json=br#"{"asset":{"version":"2.0"},"buffers":[{"byteLength":4}]}"#;
+        let path=root.join("valid.glb");std::fs::write(&path,container(&[(b"JSON",json),(b"BIN\0",&[0;4])]))?;
+        assert!(validate_file(&path,&root)?.is_empty());
+        std::fs::remove_dir_all(root)?;Ok(())
+    }
+
+    #[test]
+    fn source_admission_matches_import_uri_and_padding_rules() -> Result<()> {
+        let root = std::env::temp_dir().join(format!("vork-gltf-source-rules-{}", std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        std::fs::write(root.join("three bytes.bin"), [1, 2, 3])?;
+        let document = from_slice(&serde_json::to_vec(&serde_json::json!({
+            "asset":{"version":"2.0"},
+            "buffers":[
+                {"uri":"three%20bytes.bin","byteLength":4},
+                {"uri":format!("file:{}",root.join("three bytes.bin").display()),"byteLength":4},
+                {"uri":"data:application/octet-stream;base64,AQID","byteLength":4}
+            ],
+            "images":[{"uri":"missing-sampled-image.png"}]
+        }))?)?;
+        assert_eq!(validate_sources(&document.document, document.blob.as_ref().map(|b|b.len() as u64), &root)?, vec![
+            root.join("three bytes.bin"), root.join("three bytes.bin"), root.join("missing-sampled-image.png")]);
+        // Installation accepts these exact external paths and pads 3 bytes to 4.
+        let payloads = buffers(&document.document, Some(&root), None)?;
+        assert!(payloads.iter().all(|data| data.len() == 4));
+        std::fs::remove_dir_all(root)?;
+        Ok(())
     }
 }

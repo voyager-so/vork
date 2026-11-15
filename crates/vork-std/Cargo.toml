@@ -5,8 +5,11 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-vork-path = { path = "../vork-path" }
-vork-text = { path = "../vork-text" }
+# Text layout and glyph outlines: Moda's text engine (crates/moda-text), shared with the 2D canvas.
+moda-text = { path = "../moda-text" }
+# Moda's path code: std/extrude reads SVG path data as Moda's path commands and flattens them as Moda's extrusion does.
+moda-engine = { path = "../moda-engine" }
+svgtypes = "0.16"
 vork-time = { path = "../vork-time" }
 anyhow = "1"
 glam = {version="0.30",features=["serde"]}
@@ -14,7 +17,7 @@ image = {version="0.25",default-features=false,features=["png","jpeg","hdr","exr
 blake3 = "1"
 exr = { version="1.74",default-features=false }
 rquickjs = "0.12.2"
-serde_json = "1"
+serde_json = { package = "vork-json", path = "../vork-json" }
 
 serde = { version = "1", features = ["derive"] }
 # Maintained 0.25.1 fork; preserves the outline, metric and legacy kern APIs.

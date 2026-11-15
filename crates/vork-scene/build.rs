@@ -115,11 +115,21 @@ fn main() {
     out.push(']');
     let count = out.matches("OpenPbrParam {").count();
     assert_eq!(
-        count, 37,
-        "36 OpenPBR parameters plus std cutoff, table has {count}"
+        count, 39,
+        "38 OpenPBR parameters plus std cutoff, table has {count}"
     );
     let dir = Path::new(&env::var("OUT_DIR").unwrap()).to_path_buf();
     fs::write(dir.join("openpbr.rs"), out).unwrap();
+    // Renderer-only optical preparation; this is absent from the authored Slang ABI.
+    // Zero denotes an unresolved interface (every physical IOR is positive).
+    fields.push_str("    optical_ior:f32,\n");
+    slang_fields.push_str("#ifndef VORK_UNIT_IOR\n    public float optical_ior;\n#endif\n");
+    defaults.push("0.0".into());
+    // Renderer-only material semantics. The authored program ABI is generated
+    // separately by vork-slang and contains only the public OpenPBR fields.
+    fields.push_str("    gltf_material:bool,\n");
+    defaults.push("false".into());
+    slang_fields.push_str("#ifndef VORK_NO_GLTF_TINT\n    public bool gltf_material;\n#endif\n");
     let closure = dir.join("closure.wgsl");
     let wgsl = format!(
         "// Generated from openpbr-params.md: OpenPBR Surface 1.1.1.\n\
@@ -134,7 +144,7 @@ fn main() {
          module closure;\n\
          public struct Closure {{\n{slang_fields}}};\n\
          // OpenPBR defaults; normals and tangents default to the unperturbed frame.\n\
-         public Closure closure_defaults(float3 normal, float3 tangent) {{\n    return Closure({});\n}}\n",
+         public Closure closure_defaults(float3 normal, float3 tangent) {{\n    return Closure({}\n#ifndef VORK_UNIT_IOR\n,0.0\n#endif\n#ifndef VORK_NO_GLTF_TINT\n,false\n#endif\n);\n}}\n",
         slang_defaults.join(",")
     );
     fs::write(dir.join("closure.slang"), slang).unwrap();

@@ -1,0 +1,58 @@
+{
+  "nodes": [
+    {
+      "id": "fx-glow-rect",
+      "type": "rectangle",
+      "x": 120,
+      "y": 120,
+      "width": 320,
+      "height": 200,
+      "rotation": 0,
+      "scale": 1,
+      "cornerRadius": 24,
+      "effects": [
+        {
+          "type": "glow",
+          "id": "effect-glow-fixture-2",
+          "color": "#ffbe0b",
+          "radiusPx": 12,
+          "intensity": 1,
+          "opacity": 1
+        }
+      ],
+      "fills": [
+        {
+          "id": "fill-0",
+          "paint": {
+            "type": "solid",
+            "color": "#3a86ff"
+          }
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "effects-structured-non-adopter",
+      "width": 1280,
+      "height": 800,
+      "nodeIds": ["fx-glow-rect"],
+      "fills": [
+        {
+          "id": "fill-0",
+          "paint": {
+            "type": "solid",
+            "color": "#10131a"
+          }
+        }
+      ]
+    }
+  ],
+  "config": {
+    "renderPageClipping": true
+  },
+  "variables": [],
+  "canvasRootNodeIds": [],
+  "layoutMode": "vertical"
+}

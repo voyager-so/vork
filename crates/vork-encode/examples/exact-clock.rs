@@ -61,6 +61,7 @@ fn main(@builtin(global_invocation_id) id:vec3<u32>) {
         fps,
         EncodeSettings::default(),
         path,
+        n as u64,
         3,
     )?;
     let pixel_readback = output.uses_pixel_readback();

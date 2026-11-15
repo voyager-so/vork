@@ -51,24 +51,15 @@ registry! {
     DENOISE_FROM_XYZ_22: f32 => f32, "DENOISE_FROM_XYZ_22" = 1.1451605977;
     /// Match the reflected response LUT grazing floor for transmitted guide albedo.
     DENOISE_GUIDE_COSINE_MIN: f32 => f32, "DENOISE_GUIDE_COSINE_MIN" = 0.0001;
-    /// Primary guides cannot locate detail when specular response exceeds a quarter of diffuse.
-    RECONSTRUCT_SPECULAR_RATIO: f32 => f32, "RECONSTRUCT_SPECULAR_RATIO" = 0.25;
-    /// Stateless final reconstruction: five wavelet scales cover a thirty-one-pixel radius.
-    RECONSTRUCT_STEPS: u32 => u32, "RECONSTRUCT_STEPS" = 5;
-    /// Bilateral guide rejection, calibrated on launch glass, hair and interior clips.
-    /// Do not average distinct material colours even at coarse wavelet scales.
-    RECONSTRUCT_ALBEDO_EDGE_SQUARED: f32 => f32, "RECONSTRUCT_ALBEDO_EDGE_SQUARED" = 0.0025;
-    RECONSTRUCT_ALBEDO_SCALE: f32 => f32, "RECONSTRUCT_ALBEDO_SCALE" = 16.;
-    RECONSTRUCT_NORMAL_SCALE: f32 => f32, "RECONSTRUCT_NORMAL_SCALE" = 32.;
-    RECONSTRUCT_ALPHA_SCALE: f32 => f32, "RECONSTRUCT_ALPHA_SCALE" = 32.;
-    /// Local RGB variance gives the colour rejection scale in scene-linear units.
-    RECONSTRUCT_COLOR_SIGMA: f32 => f32, "RECONSTRUCT_COLOR_SIGMA" = 4.;
-    RECONSTRUCT_VARIANCE_FLOOR: f32 => f32, "RECONSTRUCT_VARIANCE_FLOOR" = 1e-12;
     DENOISE_GROUP: u32 => u32, "DENOISE_GROUP" = 64;
     // Compiler effect-output slots for per-closure dispersion and wavelength
     // dependency proofs, independent of selected-lobe storage.
     // Surface emission alone defines sampled source support. Lit is authored response.
+    EFFECT_SURFACE_WEIGHTED_IOR: u32 => u32, "REG_EFFECT_SURFACE_WEIGHTED_IOR" = 26u32;
+    EFFECT_LIT_WEIGHTED_IOR: u32 => u32, "REG_EFFECT_LIT_WEIGHTED_IOR" = 27u32;
     EFFECT_SURFACE_EMISSION: u32 => u32, "REG_EFFECT_SURFACE_EMISSION" = 23u32;
+    EFFECT_SURFACE_COAT_ANISOTROPY: u32 => u32, "REG_EFFECT_SURFACE_COAT_ANISOTROPY" = 24u32;
+    EFFECT_LIT_COAT_ANISOTROPY: u32 => u32, "REG_EFFECT_LIT_COAT_ANISOTROPY" = 25u32;
     EFFECT_SURFACE_DISPERSION: u32 => u32, "REG_EFFECT_SURFACE_DISPERSION" = 19u32;
     EFFECT_LIT_DISPERSION: u32 => u32, "REG_EFFECT_LIT_DISPERSION" = 20u32;
     EFFECT_SURFACE_WAVELENGTH: u32 => u32, "REG_EFFECT_SURFACE_WAVELENGTH" = 21u32;
@@ -148,11 +139,13 @@ registry! {
     TRACE_TRAVERSAL_LIMIT: u32 => u32, "REG_TRACE_TRAVERSAL_LIMIT" = 65536;
     DROPPED_LIGHT_SAMPLES_WORD: u32 => u32, "REG_DROPPED_LIGHT_SAMPLES_WORD" = 8;
     DROPPED_PATH_SAMPLES_WORD: u32 => u32, "REG_DROPPED_PATH_SAMPLES_WORD" = 10;
+    // RGBA8, low byte first: the visible marker for missing images and invalid samples.
+    DIAGNOSTIC_MAGENTA_RGBA: u32 => u32, "REG_DIAGNOSTIC_MAGENTA_RGBA" = 0xffff00ff;
     TERMINATED_MEDIUM_PATHS_WORD: u32 => u32, "REG_TERMINATED_MEDIUM_PATHS_WORD" = 12;
     // Sum of absolute accumulated camera-path RGB radiance discarded by fog watchdogs.
     DISCARDED_MEDIUM_RADIANCE_WORD: u32 => u32, "REG_DISCARDED_MEDIUM_RADIANCE_WORD" = 14;
     // Linked dielectric interior: next, nine descriptor words, transaction tag, exit distance.
-    PATH_BOUNDARY_NODE_WORDS: u32 => u32, "REG_PATH_BOUNDARY_NODE_WORDS" = 12;
+    PATH_BOUNDARY_NODE_WORDS: u32 => u32, "REG_PATH_BOUNDARY_NODE_WORDS" = 14;
     SHADER_DIAGNOSTICS_WORDS: u32 => u32, "REG_SHADER_DIAGNOSTICS_WORDS" = 20;
     // Requested output stores in the frame projection's reserved mask component.
     OUTPUT_GPU_COLOR: u32 => u32, "REG_OUTPUT_GPU_COLOR" = 1;
@@ -205,6 +198,9 @@ registry! {
     RAY_SLOT_WORDS: usize => u32, "REG_RAY_SLOT_WORDS" = 4;
     // Fourth TLAS header word: optional absorbing-solid table, or NO_ALPHA.
     RAY_SHADOW_TABLE_WORD: usize => u32, "REG_RAY_SHADOW_TABLE_WORD" = 3;
+    // A nontransmitting material group owned by a possible dielectric solid.
+    // Real solid IDs fit the 24-bit instance budget; this is not a boundary ID.
+    RAY_OPAQUE_SOLID_OWNER: u32 => u32, "REG_RAY_OPAQUE_SOLID_OWNER" = 0xfffffffe;
     // Unbounded count, solid bounds, instance identities, index buffer slot/node count; then unbounded IDs.
     RAY_SHADOW_TABLE_HEADER_WORDS: usize => u32, "REG_RAY_SHADOW_TABLE_HEADER_WORDS" = 5;
     /// Threaded bounds node: min/escape, max/solid, local-record range.
@@ -240,13 +236,18 @@ registry! {
     // Slot diffusion: FP32 light/view position/coverage, FP16 radius/albedo and RGB9E5 ambient.
     VISIBILITY_DIFFUSION_WORDS: u32 => u32, "REG_VISIBILITY_DIFFUSION_WORDS" = 12;
     // Slot reflection receiver: full-precision eye-relative plane, shading normal and raster payload.
-    // Eleven float4s retain both GGX lobes, sheet response, composition weighting
-    // and prepared conductor compensation. Reflection
-    // records pack each vector into two half2 words; receiver planes stay FP32.
+    // Twelve float4s retain both GGX lobes, sheet response, composition weighting
+    // and prepared conductor compensation. Reflection records pack the live
+    // components into half2 words; receiver planes stay FP32.
     // Store each word as its own slot-indexed field binding, so full-resolution
     // records do not require their combined allocation in one storage binding.
-    REFLECTION_BSDF_VECTORS: u32 => u32, "REG_REFLECTION_BSDF_VECTORS" = 11;
-    VISIBILITY_REFLECTION_WORDS: u32 => u32, "REG_VISIBILITY_REFLECTION_WORDS" = 28;
+    REFLECTION_BSDF_VECTORS: u32 => u32, "REG_REFLECTION_BSDF_VECTORS" = 12;
+    // Evaluation storage uses spare FP32 components in the reflected/normal
+    // headers and BSDF vectors 9/10 to retain the last logical vector losslessly.
+    REFLECTION_EVALUATION_VECTORS: u32 => u32, "REG_REFLECTION_EVALUATION_VECTORS" = 11;
+    // The final vector occupies the two spare components in vectors 9/10
+    // and one final half2 word, preserving all 46 live half components.
+    VISIBILITY_REFLECTION_WORDS: u32 => u32, "REG_VISIBILITY_REFLECTION_WORDS" = 29;
     // Per-pixel reflection reconstruction guide: world/depth, oct normal, coverage and packed-lobe roughness as floats.
     VISIBILITY_REFLECTION_GUIDE_WORDS: u32 => u32, "REG_VISIBILITY_REFLECTION_GUIDE_WORDS" = 7;
     // World-specular receiving is a Boolean; each class reconstructs independently.
@@ -275,8 +276,12 @@ registry! {
     // incomplete reservation may be retried, so both output diagnostics must
     // rank below every independent failure that must refuse the attempt.
     /// Invalid scene-linear radiance refuses the exposure before publication.
-    RADIANCE_NONFINITE: u32 => u32, "REG_RADIANCE_NONFINITE" = u32::MAX - 14;
-    DISPLAY_NONFINITE: u32 => u32, "REG_DISPLAY_NONFINITE" = u32::MAX - 13;
+    RADIANCE_NONFINITE: u32 => u32, "REG_RADIANCE_NONFINITE" = u32::MAX - 16;
+    DISPLAY_NONFINITE: u32 => u32, "REG_DISPLAY_NONFINITE" = u32::MAX - 15;
+    /// A view returned code values for a display other than the stage's destination: an independent failure.
+    VIEW_DESTINATION: u32 => u32, "REG_VIEW_DESTINATION" = u32::MAX - 13;
+    /// Invalid environment source radiance is independent of provisional output.
+    ENVIRONMENT_INVALID: u32 => u32, "REG_ENVIRONMENT_INVALID" = u32::MAX - 14;
     /// Invalid authored segment or exhaustion of a free-flight work reservation.
     /// Invalid generated camera ray or visibility interval.
     TRACE_EXHAUSTED: u32 => u32, "REG_TRACE_EXHAUSTED" = u32::MAX - 11;
@@ -352,6 +357,9 @@ registry! {
     MATERIAL_SAMPLER_CAPACITY: u32 => u32, "REG_MATERIAL_SAMPLER_CAPACITY" = 16;
     // Imported textured materials retain covered-sample evaluation on the shared table path.
     FLAG_SAMPLE_MATERIAL: u32 => u32, "REG_FLAG_SAMPLE_MATERIAL" = 128;
+    // A covered point may pass a straight path connection (a thin sheet, or a
+    // solid whose relative IOR can be one): materials::PendingMaterial::null_connection.
+    FLAG_NULL_CONNECTION: u32 => u32, "REG_FLAG_NULL_CONNECTION" = 256;
     FLAG_GLTF_UNLIT: u32 => u32, "REG_FLAG_GLTF_UNLIT" = 64;
     FLAG_VERTEX_COLOR: u32 => u32, "REG_FLAG_VERTEX_COLOR" = 8;
     // One fractional crossing per tap, plus the two endpoints.
@@ -391,7 +399,7 @@ mod diagnostic_tests {
             PATH_MEDIUM_WORK, PATH_BOUNDARY_OVERFLOW, PATH_BOUNDARY_AMBIGUOUS,
             PATH_MEDIUM_MAJORANT, PATH_PROPAGATION_ERROR, CAMERA_RAY_INVALID,
             PATH_MEDIUM_DIVERGENT, CAMERA_COVERAGE_INVALID, IMPLICIT_INVALID,
-            GEOMETRY_NONFINITE];
+            GEOMETRY_NONFINITE, ENVIRONMENT_INVALID, VIEW_DESTINATION];
         for code in independent {
             assert!(code > RADIANCE_NONFINITE && code > DISPLAY_NONFINITE,
                 "independent diagnostic {code} must survive concurrent nonfinite output");
@@ -399,7 +407,7 @@ mod diagnostic_tests {
     }
     #[test]
     fn frame_diagnostics_are_distinct() {
-        let codes=[TRACE_EXHAUSTED,PATH_MEDIUM_DISTANCE,PATH_MEDIUM_INVALID,PATH_MEDIUM_WORK,PATH_BOUNDARY_OVERFLOW,PATH_BOUNDARY_AMBIGUOUS,PATH_MEDIUM_MAJORANT,DISPLAY_NONFINITE,RADIANCE_NONFINITE,PATH_PROPAGATION_ERROR,CAMERA_RAY_INVALID,PATH_MEDIUM_DIVERGENT,CAMERA_COVERAGE_INVALID,IMPLICIT_INVALID,GEOMETRY_NONFINITE];
+        let codes=[TRACE_EXHAUSTED,PATH_MEDIUM_DISTANCE,PATH_MEDIUM_INVALID,PATH_MEDIUM_WORK,PATH_BOUNDARY_OVERFLOW,PATH_BOUNDARY_AMBIGUOUS,PATH_MEDIUM_MAJORANT,DISPLAY_NONFINITE,RADIANCE_NONFINITE,PATH_PROPAGATION_ERROR,CAMERA_RAY_INVALID,PATH_MEDIUM_DIVERGENT,CAMERA_COVERAGE_INVALID,IMPLICIT_INVALID,GEOMETRY_NONFINITE, ENVIRONMENT_INVALID, VIEW_DESTINATION];
         assert_eq!(std::collections::BTreeSet::from(codes).len(),codes.len());
     }
 }

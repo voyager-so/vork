@@ -95,8 +95,9 @@ mod tests {
     /// The tabulated GPU blackbody matches an f64 evaluation of the same std.color
     /// formula (Planck's law over the analytic CIE 1931 fit, 380..780 nm in 5 nm steps).
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn table_is_std_color_blackbody() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()) };
+        let r = crate::test_renderer()?;
         let scene: vork_scene::v2::Scene = vork_scene::v2::from_test_value(serde_json::json!({
             "version": 2,
             "nodes": [{"type": "light", "shape": "point", "temperature": 2700}],

@@ -99,11 +99,15 @@ impl App {
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if self.error.is_some() { event_loop.exit(); return; }
         if self.window.is_none() {
             if let Err(error) = self.open(event_loop) { self.error = Some(error); event_loop.exit(); }
         }
     }
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _: WindowId, event: WindowEvent) {
+        // Native events already queued before failed initialization must not use
+        // the absent presentation or replace the original driver error.
+        if self.error.is_some() { event_loop.exit(); return; }
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
             WindowEvent::Resized(size) => self.presentation.as_mut().unwrap().resize([size.width,size.height]),
@@ -123,6 +127,7 @@ impl ApplicationHandler for App {
         }
     }
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if self.error.is_some() { event_loop.exit(); return; }
         // Bound retries even when occluded/acquire-timeout returns immediately.
         if self.started.elapsed() >= Duration::from_secs(120) { event_loop.exit(); return; }
         let now = Instant::now();

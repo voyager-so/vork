@@ -1,0 +1,193 @@
+{
+  "_comment": [
+    "The backdrop filter kinds (live-nodes design, stage 7b): the ONE definition of each kind's parameters, read by",
+    "moda-scene (Rust: defaults and clamps for the engine, moda_scene::backdrop_kinds) and by the editor",
+    "(packages/editor/src/core/scene/backdropKinds.ts: types, defaults, the markup shorthand, the agent docs).",
+    "MOVES TO the shared moda-code crate when it lands (live-nodes §18 point 9: each effect's parameter schema lives in",
+    "moda-code, where the generic inspector and lint read it); keep it data-only so that move is a file move.",
+    "Types: number (clamped to [min, max]), integer (rounded, clamped), enum (one of `values`), color (a CSS colour),",
+    "paint (a CSS colour, or a linear-gradient() / radial-gradient() stored as `gradient`), boolean, numbers (a fixed",
+    "`length` list, each clamped), points (a curve's [x, y] pairs, clamped), stops (gradient stops {at, color}).",
+    "The adjustment kinds (levels … channel-mixer; docs/design/adjustment-layers.md) take moda-paint's filter params",
+    "(`paint.adjust`) and render byte-identical to it through moda-color's shared tables. `fraction: true` numbers",
+    "also read `30%` as 0.3 in markup. `positional` is the markup order of the bare numbers after the kind name; any",
+    "param is also accepted as `name=value`. `workingSpace` is where the kernel computes: `linear` converts the 8-bit",
+    "gamma sRGB layer stack to linear light at its input and back at its output (motion-model §12.7); `gamma` works on",
+    "the stored values."
+  ],
+  "version": 1,
+  "blendModes": [
+    "normal",
+    "multiply",
+    "screen",
+    "overlay",
+    "darken",
+    "lighten",
+    "color-dodge",
+    "color-burn",
+    "hard-light",
+    "soft-light",
+    "difference",
+    "exclusion",
+    "hue",
+    "saturation",
+    "color",
+    "luminosity"
+  ],
+  "kinds": {
+    "grain": {
+      "about": "film grain over what is behind: a seeded cell noise (the noise effect's integer hash), ± exposure in linear light",
+      "workingSpace": "linear",
+      "positional": ["amount", "size", "seed"],
+      "params": [
+        { "name": "amount", "type": "number", "min": 0, "max": 1, "default": 0.25, "fraction": true, "about": "strength: each cell moves up to ±amount stops" },
+        { "name": "size", "type": "number", "min": 0.5, "max": 64, "default": 1, "unit": "px", "about": "cell size in canvas px" },
+        { "name": "mode", "type": "enum", "values": ["mono", "color"], "default": "mono", "about": "mono: one value per cell; color: one per channel" },
+        { "name": "seed", "type": "integer", "min": 0, "max": 65535, "default": 0, "about": "picks another pattern" }
+      ]
+    },
+    "vignette": {
+      "about": "darkens (or tints) toward the edges of the layer's own box, following its shape",
+      "workingSpace": "linear",
+      "positional": ["amount", "midpoint", "roundness", "feather"],
+      "params": [
+        { "name": "amount", "type": "number", "min": 0, "max": 1, "default": 0.5, "fraction": true, "about": "strength at the edge" },
+        { "name": "midpoint", "type": "number", "min": 0, "max": 1, "default": 0.5, "fraction": true, "about": "where the falloff starts, from the centre (0) to the edge (1)" },
+        { "name": "roundness", "type": "number", "min": -1, "max": 1, "default": 0, "about": "0 follows the box's aspect, 1 is a circle, -1 squarer" },
+        { "name": "feather", "type": "number", "min": 0, "max": 1, "default": 0.5, "fraction": true, "about": "width of the falloff" },
+        { "name": "color", "type": "color", "default": "#000000", "about": "the colour it fades to" }
+      ]
+    },
+    "glaze": {
+      "about": "a colour or gradient wash blended over what is behind (W3C blend modes, as mix-blend-mode)",
+      "workingSpace": "gamma",
+      "positional": ["amount"],
+      "params": [
+        { "name": "color", "type": "paint", "default": "#f4c27a", "about": "a colour, or a linear-gradient() / radial-gradient() across the layer's box" },
+        { "name": "mode", "type": "enum", "values": "blendModes", "default": "multiply", "about": "the blend mode" },
+        { "name": "amount", "type": "number", "min": 0, "max": 1, "default": 0.5, "fraction": true, "about": "opacity of the wash" }
+      ]
+    },
+    "displace": {
+      "about": "offsets what is behind by a seeded smooth noise map (ripple, heat haze, frosted texture)",
+      "workingSpace": "gamma",
+      "positional": ["amount", "scale", "seed"],
+      "params": [
+        { "name": "amount", "type": "number", "min": 0, "max": 200, "default": 8, "unit": "px", "about": "the largest offset, in canvas px" },
+        { "name": "scale", "type": "number", "min": 1, "max": 2000, "default": 32, "unit": "px", "about": "the noise's feature size, in canvas px" },
+        { "name": "seed", "type": "integer", "min": 0, "max": 65535, "default": 0, "about": "picks another map" }
+      ]
+    },
+    "grade": {
+      "about": "a colour grade of what is behind, in linear light: exposure and offset (Photoshop's Exposure), lift / gamma / gain, saturation, white balance",
+      "workingSpace": "linear",
+      "positional": ["exposure", "saturation"],
+      "params": [
+        { "name": "exposure", "type": "number", "min": -20, "max": 20, "default": 0, "unit": "stops", "about": "× 2^exposure" },
+        { "name": "offset", "type": "number", "min": -0.5, "max": 0.5, "default": 0, "about": "added to every channel after the gain (Photoshop's Exposure offset)" },
+        { "name": "lift", "type": "number", "min": -1, "max": 1, "default": 0, "about": "raises (or lowers) the blacks" },
+        { "name": "gamma", "type": "number", "min": 0.01, "max": 9.99, "default": 1, "about": "midtones: above 1 brightens" },
+        { "name": "gain", "type": "number", "min": 0, "max": 4, "default": 1, "about": "scales the whites" },
+        { "name": "saturation", "type": "number", "min": 0, "max": 2, "default": 1, "about": "0 grey, 1 unchanged, 2 double" },
+        { "name": "temperature", "type": "number", "min": -1, "max": 1, "default": 0, "about": "warmer (+) or cooler (-)" },
+        { "name": "tint", "type": "number", "min": -1, "max": 1, "default": 0, "about": "magenta (+) or green (-)" }
+      ]
+    },
+    "levels": {
+      "about": "an adjustment of what is behind: input black / white points and gamma, then output black / white (Photoshop's Levels)",
+      "workingSpace": "gamma",
+      "positional": ["inBlack", "inWhite", "gamma"],
+      "params": [
+        { "name": "inBlack", "type": "number", "min": 0, "max": 255, "default": 0, "about": "input black point" },
+        { "name": "inWhite", "type": "number", "min": 0, "max": 255, "default": 255, "about": "input white point" },
+        { "name": "gamma", "type": "number", "min": 0.01, "max": 9.99, "default": 1, "about": "over 1 lightens the midtones" },
+        { "name": "outBlack", "type": "number", "min": 0, "max": 255, "default": 0, "about": "output black" },
+        { "name": "outWhite", "type": "number", "min": 0, "max": 255, "default": 255, "about": "output white" },
+        { "name": "channel", "type": "enum", "values": ["rgb", "red", "green", "blue"], "default": "rgb", "about": "the channel it applies to" }
+      ]
+    },
+    "curves": {
+      "about": "an adjustment of what is behind: a tone curve through points, monotone cubic between them (Photoshop's Curves)",
+      "workingSpace": "gamma",
+      "positional": [],
+      "params": [
+        { "name": "points", "type": "points", "min": 0, "max": 255, "default": [[0, 0], [255, 255]], "about": "[[input, output], …], 0..255" },
+        { "name": "channel", "type": "enum", "values": ["rgb", "red", "green", "blue"], "default": "rgb", "about": "the channel it applies to" }
+      ]
+    },
+    "brightness-contrast": {
+      "about": "an adjustment of what is behind: brightness bends the tone curve (black and white stay), contrast is an S-curve (nothing clips)",
+      "workingSpace": "gamma",
+      "positional": ["brightness", "contrast"],
+      "params": [
+        { "name": "brightness", "type": "number", "min": -100, "max": 100, "default": 0, "about": "" },
+        { "name": "contrast", "type": "number", "min": -100, "max": 100, "default": 0, "about": "" }
+      ]
+    },
+    "hue-saturation": {
+      "about": "an adjustment of what is behind: hue shift, saturation and lightness; colorize tints it all one hue",
+      "workingSpace": "gamma",
+      "positional": ["hue", "saturation", "lightness"],
+      "params": [
+        { "name": "hue", "type": "number", "min": -180, "max": 360, "default": 0, "unit": "deg", "about": "degrees (colorize: the hue, 0..360)" },
+        { "name": "saturation", "type": "number", "min": -100, "max": 100, "default": 0, "about": "(colorize: 0..100)" },
+        { "name": "lightness", "type": "number", "min": -100, "max": 100, "default": 0, "about": "" },
+        { "name": "colorize", "type": "boolean", "default": false, "about": "tint every pixel one hue" }
+      ]
+    },
+    "color-balance": {
+      "about": "an adjustment of what is behind: shift shadows, midtones and highlights towards colours",
+      "workingSpace": "gamma",
+      "positional": [],
+      "params": [
+        { "name": "shadows", "type": "numbers", "length": 3, "min": -100, "max": 100, "default": [0, 0, 0], "about": "[cyan–red, magenta–green, yellow–blue]" },
+        { "name": "midtones", "type": "numbers", "length": 3, "min": -100, "max": 100, "default": [0, 0, 0], "about": "[cyan–red, magenta–green, yellow–blue]" },
+        { "name": "highlights", "type": "numbers", "length": 3, "min": -100, "max": 100, "default": [0, 0, 0], "about": "[cyan–red, magenta–green, yellow–blue]" },
+        { "name": "preserveLuminosity", "type": "boolean", "default": true, "about": "keep each pixel's lightness" }
+      ]
+    },
+    "vibrance": {
+      "about": "an adjustment of what is behind: vibrance saturates muted colours more than saturated ones",
+      "workingSpace": "gamma",
+      "positional": ["vibrance", "saturation"],
+      "params": [
+        { "name": "vibrance", "type": "number", "min": -100, "max": 100, "default": 0, "about": "" },
+        { "name": "saturation", "type": "number", "min": -100, "max": 100, "default": 0, "about": "" }
+      ]
+    },
+    "invert": {
+      "about": "an adjustment of what is behind: inverts the colour (alpha kept)",
+      "workingSpace": "gamma",
+      "positional": [],
+      "params": []
+    },
+    "desaturate": {
+      "about": "an adjustment of what is behind: grey from colour",
+      "workingSpace": "gamma",
+      "positional": [],
+      "params": [
+        { "name": "method", "type": "enum", "values": ["luminosity", "average", "lightness"], "default": "luminosity", "about": "Rec. 709 luminosity, the channels' average, or (max + min) / 2" }
+      ]
+    },
+    "gradient-map": {
+      "about": "an adjustment of what is behind: maps its luminance through a gradient (dark → the first stop)",
+      "workingSpace": "gamma",
+      "positional": [],
+      "params": [
+        { "name": "stops", "type": "stops", "default": [{ "at": 0, "color": "#000000" }, { "at": 1, "color": "#ffffff" }], "about": "[{ at: 0..1, color }, …]" },
+        { "name": "reverse", "type": "boolean", "default": false, "about": "light → the first stop" }
+      ]
+    },
+    "channel-mixer": {
+      "about": "an adjustment of what is behind: each output channel as a mix of the inputs",
+      "workingSpace": "gamma",
+      "positional": [],
+      "params": [
+        { "name": "red", "type": "numbers", "length": 4, "min": -2, "max": 2, "default": [1, 0, 0, 0], "about": "[r, g, b, constant] (1 = 100 %; the constant is −1..1)" },
+        { "name": "green", "type": "numbers", "length": 4, "min": -2, "max": 2, "default": [0, 1, 0, 0], "about": "[r, g, b, constant]" },
+        { "name": "blue", "type": "numbers", "length": 4, "min": -2, "max": 2, "default": [0, 0, 1, 0], "about": "[r, g, b, constant]" },
+        { "name": "monochrome", "type": "boolean", "default": false, "about": "grey from the red row" }
+      ]
+    }
+  }
+}

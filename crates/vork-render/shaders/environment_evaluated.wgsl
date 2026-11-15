@@ -4,22 +4,24 @@ struct Row { sh:array<vec4<f32>,4>, summary:vec4<f32> }
 @group(0) @binding(1) var proposal:texture_2d<f32>;
 @group(0) @binding(2) var<storage,read_write> rows:array<Row>;
 @group(0) @binding(3) var<storage,read_write> distribution:array<vec2<f32>>;
-@group(0) @binding(4) var<storage,read_write> statistics:array<vec4<f32>,6>;
+@group(0) @binding(4) var<storage,read_write> statistics:array<vec4<f32>,$STATISTICS_VECTORS>;
 const PI:f32=$PI;
 @compute @workgroup_size(64) fn peaks(@builtin(global_invocation_id) id:vec3<u32>) {
     let size=textureDimensions(source);let y=id.x;if y>=size.y {return;}
-    var peak=0.;var invalid=0.;
+    var peak=0.;var invalid=0.;var same=true;
+    let reference=textureLoad(source,vec2<i32>(0),1,0).rgb;
     for(var x=0u;x<size.x;x++) {for(var layer=0;layer<2;layer++) {
         let bits=textureLoad(source,vec2<i32>(i32(x),i32(y)),layer,0).rgb;
         let value=bitcast<vec3<f32>>(bits);
         if any((bits & vec3<u32>(0x7f800000u))==vec3<u32>(0x7f800000u)) || any(value<vec3<f32>(0.)) {invalid=1.;}
-        if layer==1 {peak=max(peak,max(value.r,max(value.g,value.b)));}
+        if layer==1 {peak=max(peak,max(value.r,max(value.g,value.b)));same=same && all(bits==reference);}
     }}
-    rows[y].summary=vec4(peak,0.,invalid,0.);
+    rows[y].summary=vec4(peak,0.,invalid,select(0.,1.,same));
 }
 @compute @workgroup_size(1) fn peak_summary() {
-    var peak=0.;var invalid=0.;
-    for(var y=0u;y<textureDimensions(source).y;y++) {peak=max(peak,rows[y].summary.x);invalid=max(invalid,rows[y].summary.z);}
+    var peak=0.;var invalid=0.;var same=true;
+    for(var y=0u;y<textureDimensions(source).y;y++) {peak=max(peak,rows[y].summary.x);invalid=max(invalid,rows[y].summary.z);same=same && rows[y].summary.w!=0.;}
+    statistics[6]=vec4(bitcast<vec3<f32>>(textureLoad(source,vec2<i32>(0),1,0).rgb),select(0.,1.,same));
     let scale=max(1.,peak/$HALF_SCALE);
     statistics[4]=vec4(scale,0.,invalid,1./scale);
 }

@@ -1,0 +1,11 @@
+[package]
+name = "vork-splat"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+flate2 = "1"
+glam = "0.30"
+

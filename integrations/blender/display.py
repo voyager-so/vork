@@ -16,12 +16,11 @@ def translate(scene, *, on_substitution=None, emit_display=None):
         view.view_transform == 'AgX' and view.look in agx)
     if not valid:
         raise ValueError('Unsupported display look: ' + view.view_transform + '/' + view.look)
-    inputs = dict(exposure=view.exposure, gamma=view.gamma,
-                  dither_intensity=scene.render.dither_intensity)
+    inputs = dict(exposure=view.exposure, gamma=view.gamma)
     if view.view_transform != 'Standard':
         inputs['look'] = view.look.removeprefix('AgX - ').lower().replace(' ', '_')
     program = {'AgX': 'std/agx', 'Standard': 'std/standard', 'Filmic': 'blender/filmic'}[view.view_transform]
-    result = {'display': {'program': program, 'inputs': inputs}}
+    result = {'view': {'program': program, 'inputs': inputs}}
 
     if view.use_curve_mapping or view.use_white_balance:
         if emit_display is None:
@@ -40,5 +39,5 @@ def translate(scene, *, on_substitution=None, emit_display=None):
             replacement = 'apply curves to unassociated display RGB; preserve alpha and all scene-linear outputs'
             if on_substitution is None: raise ValueError(reason)
             on_substitution('transparent display curves', reason, replacement)
-        result['display'] = emit_display(source, program, inputs)
+        result['view'] = emit_display(source, program, inputs)
     return result

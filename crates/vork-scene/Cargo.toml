@@ -9,9 +9,14 @@ links = "vork_openpbr"
 vork-time = { path = "../vork-time" }
 anyhow = "1"
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde_json = { package = "vork-json", path = "../vork-json" }
 glam = { version = "0.30", features = ["serde"] }
 schemars = "1"
+# Glyphs and words of a text node (UAX #29), for track indices.
+unicode-segmentation = "1"
+# CSS Color 4 parsing for SVG text paints; shares cssparser with the text stack.
+cssparser = "0.37"
+cssparser-color = "0.5"
 
 [features]
 test-support = []

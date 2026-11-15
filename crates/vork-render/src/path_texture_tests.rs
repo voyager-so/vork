@@ -29,7 +29,7 @@ fn directory(name: &str) -> Result<PathBuf> {
 
 fn slab() -> Value {
     json!({"version":2,
-        "render":{"resolution":[16,16],"background":[0,0,0],"settings":{"integrator":"path","denoiser":null,"samples":256},"display":{"program":"std/standard","inputs":{"dither_intensity":0}}},
+        "composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[16,16],"background":[0,0,0],"settings":{"integrator":"path","denoiser":null,"samples":256}},
         "images":{"normal":{"file":"normal.png","color_space":"Non-Color",
             "mag_filter":"linear","min_filter":"linear"},"white":{"file":"white.png"}},
         "programs":{"mapped":{"source":NORMAL_PROGRAM}},
@@ -60,7 +60,7 @@ fn tilted_map(root: &Path) -> Result<()> {
 #[test]
 #[ignore = "requires pinned Slang and Vulkan ray queries"]
 fn minified_normals_converge_to_texel_response() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let root=directory("minification")?;
     image::ImageBuffer::<image::Rgb<u16>,_>::from_fn(128,128,|x,_| {
         image::Rgb([if x%2==0 {204*257} else {51*257},128*257,230*257])
@@ -81,7 +81,7 @@ fn minified_normals_converge_to_texel_response() -> Result<()> {
 #[test]
 #[ignore = "requires pinned Slang and Vulkan ray queries"]
 fn small_uv_frames_retain_constant_normal_maps() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let root=directory("small-uv")?;tilted_map(&root)?;
     let reference=mean(&render(&r,slab(),&root)?);
     assert!(reference>0.45 && reference<0.55,"tilted map must be active: {reference}");
@@ -102,7 +102,7 @@ fn small_uv_frames_retain_constant_normal_maps() -> Result<()> {
 #[test]
 #[ignore = "requires pinned Slang and Vulkan ray queries"]
 fn translated_hits_retain_normal_and_bump_differentials() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let root=directory("translated")?;tilted_map(&root)?;
     let interior_mean=|pixels: &[[f32;4]]| {
         (4..12).flat_map(|y|(4..12).map(move |x|pixels[y*16+x][0])).sum::<f32>()/64.
@@ -133,7 +133,7 @@ fn translated_hits_retain_normal_and_bump_differentials() -> Result<()> {
 #[test]
 #[ignore = "requires pinned Slang and Vulkan"]
 fn coat_normal_is_independent_of_base_normal() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let root=directory("coat-normal")?;tilted_map(&root)?;
     for integrator in ["raster","path"] {
         let mut input=slab();

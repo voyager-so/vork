@@ -30,8 +30,8 @@ impl Dense {
     pub(crate) fn install(r:&Renderer,scene:&Scene,buffers:Option<&ProgramBuffers>,destinations:Vec<(String,u32)>,certificates:Vec<Certificate>)->Result<Option<Self>> {
         if destinations.is_empty() {return Ok(None);}
         let buffers=buffers.context("dense fields require retained buffers")?;
-        let shader=r.device.create_shader_module(wgpu::ShaderModuleDescriptor {label:Some("dense field range"),source:wgpu::ShaderSource::Wgsl(REDUCE.replace("DENSE_GROUP", &constants::DENSE_REDUCTION_GROUP.to_string()).into())});
-        let pipeline=r.device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {label:Some("dense field range"),layout:None,module:&shader,entry_point:Some("reduce"),compilation_options:Default::default(),cache:None});
+        let shader=crate::timing::shader_module(&r.device,wgpu::ShaderModuleDescriptor {label:Some("dense field range"),source:wgpu::ShaderSource::Wgsl(REDUCE.replace("DENSE_GROUP", &constants::DENSE_REDUCTION_GROUP.to_string()).into())});
+        let pipeline=r.compiler.compute(&wgpu::ComputePipelineDescriptor {label:Some("dense field range"),layout:None,module:&shader,entry_point:Some("reduce"),compilation_options:Default::default(),cache:None});
         let layout=pipeline.get_bind_group_layout(0);
         let initial=init(&r.device,"dense range identity",bytemuck::cast_slice(&[u32::MAX,0u32,0u32]),wgpu::BufferUsages::COPY_SRC);
         let mut fields=Vec::new();
@@ -137,7 +137,7 @@ mod tests {
                 "materials":{"m":{"program":"surface","inputs":{"field":{"grid":"field"}}}},
                 "geometry":{"quad":{"attributes":{"POSITION":{"type":"vec3","data":[[-1,-1,0],[1,-1,0],[1,1,0],[-1,1,0]]}},"indices":{"type":"u32","data":[0,1,2,0,2,3]}}},
                 "nodes":[{"type":"mesh","name":"screen","geometry":"quad","materials":["m"]},{"type":"camera","name":"camera","translation":[0,0,3],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":2.2}}}],
-                "render":{"resolution":[32,32],"duration":2,"display":{"program":"std/standard"}},
+                "composition":{"space":"3d","view":{"program":"std/standard"}},"render":{"resolution":[32,32],"duration":2},
                 "animation":[{"tracks":[{"path":["materials","m","inputs","gain"],"keys":[[0,1],[1,0.5]]}]}],
                 "simulation":{"t0":0,"dt":0.125,"seed":155,"state":["field","other"],"init":["write"],"steps":["write"]}});
             // Initial range [0,1]: .75 detects stale cells, 2 detects stale range.
@@ -180,7 +180,7 @@ mod tests {
     #[ignore="requires pinned Slang and a real GPU"]
     fn dense_scalar_vector_publication_and_seek_replay()->Result<()> {
         let r=Renderer::new()?;
-        let value=serde_json::json!({"version":2,"render":{"resolution":[32,32],"duration":2,"display":{"program":"std/standard"}},
+        let value=serde_json::json!({"version":2,"composition":{"space":"3d","view":{"program":"std/standard"}},"render":{"resolution":[32,32],"duration":2},
             "buffers":{"d":{"type":"f32","dims":[2,2,2]},"v":{"type":"vec3","dims":[2,2,2]}},
             "geometry":{"box":{"topology":"volume","attributes":{"density":"d","colour":"v"}}},
             "programs":{
@@ -190,31 +190,35 @@ mod tests {
             "materials":{"m":{"program":"medium","inputs":{"d":{"grid":"d"},"v":{"grid":"v"}}}},
             "simulation":{"t0":0,"dt":0.125,"seed":7,"state":["d","v"],"init":["init"],"steps":["step"]},
             "nodes":[{"type":"camera","name":"camera","translation":[0,0,4],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":2.5,"clip_end":10}}},{"type":"mesh","name":"volume","geometry":"box","materials":["m"],"scale":[1.2,0.8,0.5]}]});
-        // Reference sampling must reserve numeric uploads, not 4096 copies
-        // of the voxel payload. Large dense grids otherwise exhaust GPU RAM.
-        let mut reference=value.clone();
-        reference["buffers"]["d"]["dims"]=serde_json::json!([64,64,64]);
-        reference["buffers"]["v"]["dims"]=serde_json::json!([64,64,64]);
-        let mut reference:Scene=vork_scene::v2::from_test_value(reference)?;
-        reference.render.settings=v2::Settings::with_integrator(v2::Integrator::Path(Default::default()));
-        let reference=r.install(reference,Path::new("."))?;
-        assert!(reference.dense.as_ref().unwrap().certificates[0].words.len()<32,"certificate retained voxel payloads");
-        let reference_slot=reference.create_frame_slot(&r,crate::ReadbackPrecision::Float)?;
-        assert!(reference_slot.sample_upload.size()<64*1024*1024,"voxel payload entered per-sample uploads");
-        drop(reference_slot);drop(reference);
+        // Stage-1 medium admission has no bounded work proof for resource
+        // inputs, so a dense-grid medium is refused before publication under
+        // either camera owner.
         for path in [false,true] {
             let mut scene:Scene=vork_scene::v2::from_test_value(value.clone())?;
             if path {scene.render.settings=v2::Settings::with_integrator(v2::Integrator::Path(Default::default()));}
-            scene.render.settings.samples=4;
-            let installed=r.install(scene.clone(),Path::new("."))?;
-            let mut slot=installed.create_frame_slot(&r,crate::ReadbackPrecision::Float)?;
-            slot.submit(&installed ,&r,0.5)?;let first=slot.collect(&r)?.linear_rgba.unwrap();
-            slot.submit(&installed,&r,1.)?;let later=slot.collect(&r)?.linear_rgba.unwrap();
-            assert_ne!(first,later,"published cells must change transport");
-            slot.submit(&installed ,&r,0.5)?;crate::test_linear::assert_linear_eq(&first,&slot.collect(&r)?.linear_rgba.unwrap());
-            let fresh=r.install(scene,Path::new("."))?;let mut other=fresh.create_frame_slot(&r,crate::ReadbackPrecision::Float)?;
-            other.submit(&fresh ,&r,0.5)?;crate::test_linear::assert_linear_eq(&first,&other.collect(&r)?.linear_rgba.unwrap());
+            let error=r.install(scene,Path::new(".")).err().context("dense-grid medium installed")?;
+            let error=format!("{error:#}");
+            assert!(error.contains("has no bounded callback work proof") && error.contains("medium work proof does not yet admit resource inputs"),"{error}");
         }
+        // The same compute-written scalar and vector grids publish to a surface
+        // consumer, the supported owner of dense snapshots.
+        let mut surface=value;
+        surface["programs"].as_object_mut().unwrap().remove("medium");
+        surface["programs"]["surface"]=serde_json::json!({"source":"import vork;import std.grid;struct Inputs {FloatGrid d;VectorGrid v;};Closure surface(ShadingContext c,Inputs i) {return unlit(float3(sample_grid(i.d,float3(0)))+abs(sample_grid(i.v,float3(0))));}"});
+        surface["materials"]["m"]["program"]=serde_json::json!("surface");
+        surface["geometry"]=serde_json::json!({"quad":{"attributes":{"POSITION":{"type":"vec3","data":[[-1,-1,0],[1,-1,0],[1,1,0],[-1,1,0]]}},"indices":{"type":"u32","data":[0,1,2,0,2,3]}}});
+        surface["nodes"][1]=serde_json::json!({"type":"mesh","name":"screen","geometry":"quad","materials":["m"]});
+        let mut scene:Scene=vork_scene::v2::from_test_value(surface)?;
+        scene.render.settings.samples=4;
+        let installed=r.install(scene.clone(),Path::new("."))?;
+        assert!(installed.dense.is_some(),"surface-only grids need publication");
+        let mut slot=installed.create_frame_slot(&r,crate::ReadbackPrecision::Float)?;
+        slot.submit(&installed ,&r,0.5)?;let first=slot.collect(&r)?.linear_rgba.unwrap();
+        slot.submit(&installed,&r,1.)?;let later=slot.collect(&r)?.linear_rgba.unwrap();
+        assert_ne!(first,later,"published cells must change the picture");
+        slot.submit(&installed ,&r,0.5)?;crate::test_linear::assert_linear_eq(&first,&slot.collect(&r)?.linear_rgba.unwrap());
+        let fresh=r.install(scene,Path::new("."))?;let mut other=fresh.create_frame_slot(&r,crate::ReadbackPrecision::Float)?;
+        other.submit(&fresh ,&r,0.5)?;crate::test_linear::assert_linear_eq(&first,&other.collect(&r)?.linear_rgba.unwrap());
         Ok(())
     }
 }

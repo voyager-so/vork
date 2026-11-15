@@ -39,6 +39,7 @@ def render_selection(scene):
 def gltf_render_settings(scene):
     import bpy
     restored = []
+    hidden = []
 
     def set_value(owner, name, value):
         before = getattr(owner, name)
@@ -47,6 +48,15 @@ def gltf_render_settings(scene):
             setattr(owner, name, value)
 
     try:
+        for obj in bpy.context.view_layer.objects:
+            if obj.hide_get():
+                hidden.append(obj)
+                obj.hide_set(False)
+        def show_layer(layer):
+            set_value(layer, 'hide_viewport', False)
+            for child in layer.children:
+                show_layer(child)
+        show_layer(bpy.context.view_layer.layer_collection)
         # Include off-scene collection templates: visible instancers still need their data.
         for obj in bpy.data.objects:
             set_value(obj, 'hide_viewport', False)
@@ -54,6 +64,9 @@ def gltf_render_settings(scene):
                 set_value(modifier, 'show_viewport', modifier.show_render)
                 if modifier.type in {'SUBSURF', 'MULTIRES'}:
                     set_value(modifier, 'levels', modifier.render_levels)
+        for particles in bpy.data.particles:
+            set_value(particles, 'display_percentage', 100)
+            set_value(particles, 'child_percent', particles.rendered_child_count)
         # glTF already converts evaluated curves to meshes; its depsgraph is viewport mode.
         for curve in bpy.data.curves:
             if curve.render_resolution_u:
@@ -66,9 +79,12 @@ def gltf_render_settings(scene):
             set_value(collection, 'hide_viewport', False)
         if scene.render.use_simplify:
             set_value(scene.render, 'simplify_subdivision', scene.render.simplify_subdivision_render)
+            set_value(scene.render, 'simplify_child_particles', scene.render.simplify_child_particles_render)
         bpy.context.view_layer.update()
         yield
     finally:
         for owner, name, value in reversed(restored):
             setattr(owner, name, value)
+        for obj in hidden:
+            obj.hide_set(True)
         bpy.context.view_layer.update()

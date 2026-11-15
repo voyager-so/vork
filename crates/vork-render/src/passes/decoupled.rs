@@ -32,6 +32,7 @@ pub(crate) struct ViewShape {
 /// Speculative overflow is optional; measured reservation demand is mandatory.
 /// Bound the film-footprint estimate by every dependent binding.
 fn visibility_pool(limits: &wgpu::Limits, shape: ViewShape, extent: [u32; 2], samples: u32) -> u64 {
+    if direct_visibility(samples,shape.transparent,shape.diffusion) {return 0;}
     let pixels = u64::from(extent[0]) * u64::from(extent[1]);
     let limit = limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
     let mut radius = [0.5_f32; 2];
@@ -45,6 +46,9 @@ fn visibility_pool(limits: &wgpu::Limits, shape: ViewShape, extent: [u32; 2], sa
     while lo < hi {
         let mid = lo + (hi - lo).div_ceil(2);
         let bindings=view_bindings_with_pool(shape, extent, samples, mid);
+        // Splitting fields must not enlarge the speculative overflow reservation.
+        // Keep its existing one-allocation target; measured demand below can grow
+        // past that target and is checked against the individual field limits.
         if bindings.iter().all(|(_, bytes)| *bytes <= limit)
             && bindings[3].1*u64::from(VISIBILITY_REFLECTION_WORDS)<=limits.max_buffer_size {
             lo = mid;
@@ -65,7 +69,7 @@ fn view_bindings_with_pool(shape: ViewShape, [w, h]: [u32; 2], samples: u32, poo
     // decoupled_slots.slang SlotLayout: dense slots and a list head per pixel, then the pool.
     let stride = u64::from(VISIBILITY_KEY_WORDS + samples.div_ceil(32));
     let slots = if direct_keys {4} else {pixels * (u64::from(VISIBILITY_SLOTS) * stride + 1) * 4 + pool * (1 + stride) * 4};
-    let records = pixels * u64::from(VISIBILITY_SLOTS) + pool;
+    let records = if direct_keys {pixels} else {pixels * u64::from(VISIBILITY_SLOTS) + pool};
     // Slot records, then (transparent scenes) per-sample transmittance (CameraTransmittance);
     // one table evaluation per pixel needs neither (decoupled.slang direct_evaluations).
     let metadata = if direct_keys && shape.table_only {4} else {
@@ -78,8 +82,9 @@ fn view_bindings_with_pool(shape: ViewShape, [w, h]: [u32; 2], samples: u32, poo
         // Each half is a storage-buffer slice (WebGPU guarantees <=256-byte alignment).
         if shape.screen_refraction {bytes.div_ceil(256)*256*2} else {bytes}
     } else {4};
-    // Each field is a separate binding, with no change to the packed record.
-    let reflections = if shape.reflections { ((pixels * u64::from(VISIBILITY_SLOTS) + if direct_keys {0} else {pool}) * 4).div_ceil(256)*256 } else {256};
+    // Direct visibility has one receiver per pixel; merged visibility keeps one
+    // per dense/pool slot. Each packed field is a separate binding.
+    let reflections = if shape.reflections { (records * 4).div_ceil(256)*256 } else {256};
     let guides = if shape.reflections {pixels * u64::from(REFLECTION_CLASSES * VISIBILITY_REFLECTION_GUIDE_WORDS) * 4} else {4};
     // Leave room for at least one tile row of containment beside the whole-frame
     // metadata, including when the speculative visibility pool fills a binding.
@@ -87,12 +92,18 @@ fn view_bindings_with_pool(shape: ViewShape, [w, h]: [u32; 2], samples: u32, poo
     [("visibility slots", slots), ("camera evaluation metadata", metadata), ("subsurface records", subsurface),
         ("reflection record field", reflections), ("reflection guides", guides)]
 }
+/// Fields packed into each reflection-record allocation. The complete array may
+/// exceed the device's single-buffer limit, so it is split into several buffers.
+fn reflection_fields_per_buffer(field_bytes:u64,max_buffer_size:u64)->u32 {
+    (max_buffer_size/field_bytes.max(1)).clamp(1,u64::from(VISIBILITY_REFLECTION_WORDS)) as u32
+}
+
 /// Check the camera view's whole-frame bindings against the device, at install
 /// before any per-frame resource exists and again when the view is created.
 pub(crate) fn check_view(limits: &wgpu::Limits, extent: [u32; 2], samples: u32, shape: ViewShape) -> Result<[u64; 5]> {
     let sizes=gpu_memory::frame_bindings(limits, extent, samples, |extent, samples| view_bindings(limits, shape, extent, samples))?;
-    let allocation=sizes[3]*u64::from(VISIBILITY_REFLECTION_WORDS);
-    ensure!(allocation<=limits.max_buffer_size,"{}", crate::gpu_memory::limit_message("reflection record fields", format_args!("{allocation} bytes at {}x{}",extent[0],extent[1]), format_args!("max_buffer_size={} bytes",limits.max_buffer_size), "lower the resolution, or use --profile std/path"));
+    // Record fields are separate bindings packed across allocations
+    // (reflection_fields_per_buffer), so the complete array need not fit one buffer.
     Ok(sizes)
 }
 
@@ -109,7 +120,6 @@ pub(crate) fn check_packet_minimum(limits:&wgpu::Limits,extent:[u32;2],samples:u
     for (label,bytes) in fields {gpu_memory::storage_binding(limits,label,bytes, "reduce resolution or choose --profile std/draft for a lower sample and reflection budget")?;}
     let (label,bytes)=view_bindings_with_pool(shape,extent,samples,0)[4];
     gpu_memory::storage_binding(limits,label,bytes, "reduce resolution or choose --profile std/draft for a lower sample and reflection budget")?;
-    ensure!(fields[3].1*u64::from(VISIBILITY_REFLECTION_WORDS)<=limits.max_buffer_size,"{}", crate::gpu_memory::limit_message("camera packet reflection allocation", format_args!("{} bytes",fields[3].1*u64::from(VISIBILITY_REFLECTION_WORDS)), format_args!("max_buffer_size={} bytes",limits.max_buffer_size), "reduce resolution or choose --profile std/draft for a lower sample and reflection budget"));
     Ok(())
 }
 
@@ -127,8 +137,7 @@ fn camera_packet_rows(limits:&wgpu::Limits,shape:ViewShape,[w,h]:[u32;2],samples
             +u64::from(materials)*24+header
             +evaluations*(u64::from(words)*16+16+u64::from(indirect_words)*4)
     };
-    let fits_bindings=|sizes:[(&str,u64);5]|sizes.iter().all(|(_,b)|*b<=limits.max_storage_buffer_binding_size.min(limits.max_buffer_size))
-        && sizes[3].1*u64::from(VISIBILITY_REFLECTION_WORDS)<=limits.max_buffer_size;
+    let fits_bindings=|sizes:[(&str,u64);5]|sizes.iter().all(|(_,b)|*b<=limits.max_storage_buffer_binding_size.min(limits.max_buffer_size));
     let records=if shape.table_only {u64::from(w)*u64::from(h)*u64::from(VISIBILITY_SLOTS)+visibility_pool(limits,shape,[w,h],samples)}
         else {u64::from(w)*u64::from(h)*u64::from(samples)};
     let evaluations=records.min(evaluation_budget(limits,memory,words)).min(work_limit);
@@ -164,7 +173,7 @@ const TILE: u32 = 8;
 /// These are the same runtime gates as camera_native::evaluation_source.
 fn evaluation_words(features:crate::forward_variant::FeatureMask,transparent:bool,diffusion:bool,thickness:bool,aovs:u32)->u32 {
     use crate::forward_variant::{FEATURE_CAMERA_RECEIVERS,FEATURE_REFLECTIONS,FEATURE_INDIRECT_CONTROLS};
-    if features&FEATURE_REFLECTIONS!=0 {return 8+u32::from(diffusion)*6+aovs+crate::constants::REFLECTION_BSDF_VECTORS;}
+    if features&FEATURE_REFLECTIONS!=0 {return 8+u32::from(diffusion)*6+aovs+vork_slang::registry::REFLECTION_EVALUATION_VECTORS;}
     if diffusion || aovs!=0 {return 8+u32::from(diffusion)*6+aovs;}
     if transparent {return 8;}
     if thickness || features&FEATURE_CAMERA_RECEIVERS!=0 {return 7;}
@@ -177,7 +186,7 @@ fn evaluation_page_capacity(limits: &wgpu::Limits,words:u32) -> u32 {
 /// The bin binding can retain at most binding/16 records. Size the descriptor
 /// table for the largest record this scene can produce, including its AOVs.
 pub(crate) fn evaluation_pages(limits:&wgpu::Limits,aovs:usize)->u32 {
-    let words=8+6+crate::constants::REFLECTION_BSDF_VECTORS as u32+aovs as u32;
+    let words=8+6+vork_slang::registry::REFLECTION_EVALUATION_VECTORS+aovs as u32;
     let binding=limits.max_storage_buffer_binding_size.min(limits.max_buffer_size);
     (binding/16).div_ceil(u64::from(evaluation_page_capacity(limits,words).max(1))).max(1) as u32
 }
@@ -203,7 +212,10 @@ fn shading_bands(records:u64, budget:u64, height:u32) -> (u32,u32) {
     (height.div_ceil(rows),rows.min(height))
 }
 fn occupancy_row_bytes(width:u32,samples:u32,boundaries:u32)->u64 {
-    if boundaries==0 {0} else {u64::from(width)*u64::from(samples)*(1+7*u64::from(boundaries))*4}
+    // The producer retains only the kernel's inline descriptors; deeper active
+    // sets already use containment reconstruction, never a scene-sized cache.
+    let boundaries=crate::passes::path::kernel_boundaries(boundaries);
+    if boundaries==0 {0} else {u64::from(width)*u64::from(samples)*(1+9*u64::from(boundaries))*4}
 }
 /// Containment shares a binding with whole-frame metadata, but is regenerated
 /// for each band. Refine the evaluation bands against the remaining binding
@@ -403,7 +415,7 @@ fn evaluation_pipeline(r:&Renderer,p:&std::sync::Arc<crate::pipelines::CachedPip
     let layout=shade_layout(&r.device,p);
     let slot=p.camera_slot(kernel);
     let generic=p.shader.camera_generic(kernel);
-    let defer=generic.is_some_and(|shader|mode.defer(slot.get().is_some() || c.is_known(&p.kernel_content_key(kernel)),c.is_known(&generic_key(shader,p.raster_samples))));
+    let defer=generic.is_some_and(|shader|mode.defer(slot.get().is_some() || c.is_known_input(p.kernel_content_key(kernel)),c.is_known(&generic_key(shader,p.raster_samples))));
     let fallback=defer.then(|| {let shader=generic.expect("eligible camera generic");compute_pipeline(r,shader.name,&layout,shader)});
     let p=p.clone();
     c.install_variant(mode,slot,fallback,move |worker|build_evaluation(worker,&p,&layout,kernel))
@@ -561,18 +573,14 @@ impl Sampling {
         self.passes.slice(offset..offset + VISIBILITY_PARAMETERS)
     }
 }
-impl Install {
-    pub(crate) fn variants_ready(&self)->bool {self.shades.evaluate.iter().all(|(_,p)|p.ready())}
-    pub(crate) fn deferred_variants(&self)->usize {self.shades.evaluate.iter().map(|(_,p)|p).chain(self.shades.fused.iter()).filter(|p|p.deferred()).count()}
-
-    pub(crate) fn new(r: &Renderer, pipelines: &std::sync::Arc<crate::pipelines::CachedPipelines>, draws: &[install::Draw], features: crate::forward_variant::FeatureMask, plan: &crate::plan::ScenePlan, render: &vork_scene::Render, visibility: &[u32], records: &[crate::materials::MaterialRecord], program_features: &[crate::forward_variant::FeatureMask], ray_refraction: bool, boundary_capacity:u32, emitter_profiles:bool, variants:&pipelines::VariantCompile) -> Result<Self> {
-        use crate::forward_variant::{FEATURE_CAMERA_RECEIVERS,FEATURE_REFLECTIONS,FEATURE_INDIRECT_CONTROLS};
-        if plan.effects.probes && r.adapter_info.backend!=wgpu::Backend::Metal {indirect_arguments_pipeline(r);}
-        let features=features
-            | if plan.effects.indirect || plan.effects.reflections || plan.screen_refraction || plan.effects.probes {FEATURE_CAMERA_RECEIVERS} else {0}
-            | if plan.effects.reflections {FEATURE_REFLECTIONS} else {0}
-            | if plan.effects.indirect || plan.effects.probes {FEATURE_INDIRECT_CONTROLS} else {0};
-        let d = &r.device;
+pub(crate) struct RasterGeometry {
+    draw_table: wgpu::Buffer,
+    buffers: Vec<crate::rt::HitBuffer>,
+    object_draws: wgpu::Buffer,
+}
+impl RasterGeometry {
+    pub(crate) fn new(r:&Renderer,draws:&[install::Draw],plan:&crate::plan::ScenePlan)->Result<Self> {
+        let d=&r.device;
         let (draw_table, buffers) = crate::rt::draw_table(r, draws)?;
         // Install gives every draw its own objects; a transparent draw's word has the top bit.
         let mut object_draws = vec![0u32; draws.iter().map(|draw| draw.instances.end as usize).max().unwrap_or(0).max(1)];
@@ -582,6 +590,43 @@ impl Install {
             }
         }
         let object_draws = gpu_memory::buffer_init(d, "decoupled object draws", bytemuck::cast_slice(&object_draws), wgpu::BufferUsages::STORAGE);
+        Ok(Self {draw_table,buffers,object_draws})
+    }
+}
+/// Camera compilation decisions, made before pipeline-registry lookup and
+/// consumed unchanged by installation.
+#[derive(Clone)]
+pub(crate) struct KernelPlan {
+    pub(crate) kernels:Vec<pipelines::ProgramKernel>,
+    features:crate::forward_variant::FeatureMask,
+    material_count:u32,
+    per_sample:bool,
+    evaluation_words:u32,
+    implicit_slots:bool,
+    fuse_table:bool,
+    needs_classification:bool,
+    used:Vec<u32>,
+}
+/// Refraction can reach materials outside the primary evaluation bin. Only
+/// non-transport program evaluation may replace the installed scene union.
+fn camera_stage_features(stage:ShadeStage,features:crate::forward_variant::FeatureMask,program_features:&[crate::forward_variant::FeatureMask],ray_refraction:bool)->crate::forward_variant::FeatureMask {
+    use crate::forward_variant::{FEATURE_CAMERA_RECEIVERS,FEATURE_REFLECTIONS,FEATURE_INDIRECT_CONTROLS,FEATURE_TRANSMISSION,FEATURE_SOLID_TRANSMISSION};
+    match stage {
+        ShadeStage::EvaluateProgram(id) if !ray_refraction=>program_features[id as usize]
+            | (features & (FEATURE_CAMERA_RECEIVERS|FEATURE_REFLECTIONS|FEATURE_INDIRECT_CONTROLS)),
+        ShadeStage::EvaluateOpaque=>features & !(FEATURE_TRANSMISSION|FEATURE_SOLID_TRANSMISSION),
+        _=>features,
+    }
+}
+
+impl KernelPlan {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new(draws:&[install::Draw],features:crate::forward_variant::FeatureMask,plan:&crate::plan::ScenePlan,render:&vork_scene::Render,visibility:&[u32],records:&[crate::materials::MaterialRecord],program_features:&[crate::forward_variant::FeatureMask],ray_refraction:bool,boundary_capacity:u32,emitter_profiles:bool,variants:&pipelines::VariantCompile,generic_shipped:bool)->Self {
+        use crate::forward_variant::{FEATURE_CAMERA_RECEIVERS,FEATURE_REFLECTIONS,FEATURE_INDIRECT_CONTROLS};
+        let features=features
+            | if plan.effects.indirect || plan.effects.reflections || plan.screen_refraction || plan.effects.probes {FEATURE_CAMERA_RECEIVERS} else {0}
+            | if plan.effects.reflections {FEATURE_REFLECTIONS} else {0}
+            | if plan.effects.indirect || plan.effects.probes {FEATURE_INDIRECT_CONTROLS} else {0};
         let material_count=records.iter().map(|r|r.tag[0]).max().unwrap_or(0)+2;
         let opacity=vork_scene::v2::OPENPBR.iter().position(|p|p.name=="geometry_opacity").expect("OpenPBR opacity");
         // ClassifyEvaluation also expands ordinary table transparency: a solid
@@ -593,23 +638,15 @@ impl Install {
         let per_sample=draws.iter().any(|d|d.implicit.is_some()) || material_count!=2 || plan.transparent || plan.screen_refraction || records.iter().any(|r|
             r.tag[2]&(constants::FLAG_VERTEX_ALPHA|vork_slang::registry::FLAG_SAMPLE_MATERIAL)!=0 || (r.inputs[opacity]&constants::MATERIAL_TAP_INDEX_MASK)!=0);
         let evaluation_words=evaluation_words(features,plan.transparent,plan.effects.subsurface,render.settings.integrator.subsurface_method()==Some(vork_scene::v2::SubsurfaceMethod::Thickness),render.aovs.len() as u32);
-        let program_features=|id:u32| program_features[id as usize]
-            | (features & (FEATURE_CAMERA_RECEIVERS|FEATURE_REFLECTIONS|FEATURE_INDIRECT_CONTROLS));
         let kernel = |stage| {
-            // Ray refraction shades arbitrary receivers and retains their union.
-            let features=match stage {
-                ShadeStage::EvaluateProgram(id) if !ray_refraction=>program_features(id),
-                ShadeStage::EvaluateOpaque=>features & !(crate::forward_variant::FEATURE_TRANSMISSION|crate::forward_variant::FEATURE_SOLID_TRANSMISSION),
-                _=>features,
-            };
+            let features=camera_stage_features(stage,features,program_features,ray_refraction);
             let features=features | if stage==ShadeStage::Compose && plan.screen_refraction && plan.effects.subsurface {crate::forward_variant::FEATURE_RECEIVER_DIFFUSION} else {0};
             // Only transport evaluators and the containment prepass need the
             // installed active-set capacity. Opaque/classify/compose stages keep
             // their existing zero-transport kernels and generic fallbacks.
             let boundaries=if matches!(stage,ShadeStage::Evaluate|ShadeStage::EvaluateProgram(_)|ShadeStage::Occupancy) {boundary_capacity} else {0};
-            pipelines.drawn_kernel(crate::pipelines::ProgramKernel::Decoupled {stage,features,subsurface:render.settings.integrator.subsurface_method()==Some(vork_scene::v2::SubsurfaceMethod::Thickness),emitter_profiles,boundaries},variants,&r.compiler)
+            crate::pipelines::ProgramKernel::Decoupled {stage,features,subsurface:render.settings.integrator.subsurface_method()==Some(vork_scene::v2::SubsurfaceMethod::Thickness),emitter_profiles,boundaries}
         };
-        let compile=|stage|shade_pipeline(r,pipelines,kernel(stage));
         let implicit_slots=!per_sample && !plan.transparent;
         // Table-only camera and secondary transport, with no extra composition stages.
         // Solid scene transport requires the occupancy-backed evaluator; the fused
@@ -617,7 +654,7 @@ impl Install {
         // in staged evaluation: fusing its nested ordering/transport walks makes
         // the NVIDIA driver compiler expand the same solver many times.
         let fuse_table=boundary_capacity==0 && !variants.fallback() && !draws.iter().any(|d|d.implicit.is_some())
-            && visibility.iter().all(|&n|n==1) && material_count==2 && pipelines.shader.generic_shipped()
+            && visibility.iter().all(|&n|n==1) && material_count==2 && generic_shipped
             && !plan.effects.probes && !plan.screen_refraction && !plan.effects.subsurface
             && render.aovs.is_empty();
         let needs_classification=material_count!=2 || visibility.iter().any(|&samples|!direct_visibility(samples,plan.transparent,plan.effects.subsurface));
@@ -626,6 +663,35 @@ impl Install {
             if records[draw.material].tag[0]!=0 {records[draw.material].tag[0]} else if flags.transparent {0} else {material_count-1}
         }).collect();
         let used:Vec<_>=used.into_iter().collect();
+        let mut stages=vec![ShadeStage::Compose];
+        if needs_classification {
+            stages.extend([if implicit_slots {ShadeStage::Index} else {ShadeStage::Classify},ShadeStage::Prefix]);
+            if !implicit_slots {stages.push(ShadeStage::Scatter);}
+        }
+        stages.extend(used.iter().map(|&tag|if tag==material_count-1 {ShadeStage::EvaluateOpaque} else if tag==0 {ShadeStage::Evaluate} else {ShadeStage::EvaluateProgram(tag)}));
+        if fuse_table {stages.push(ShadeStage::Fused);}
+        if boundary_capacity>0 {stages.push(ShadeStage::Occupancy);}
+        if plan.effects.probes {stages.push(ShadeStage::Indirect);}
+        let kernels=stages.into_iter().map(kernel).collect();
+        Self {kernels,features,material_count,per_sample,evaluation_words,implicit_slots,fuse_table,needs_classification,used}
+    }
+}
+
+impl Install {
+    pub(crate) fn variants_ready(&self)->bool {self.shades.evaluate.iter().all(|(_,p)|p.ready())}
+    pub(crate) fn deferred_variants(&self)->usize {self.shades.evaluate.iter().map(|(_,p)|p).chain(self.shades.fused.iter()).filter(|p|p.deferred()).count()}
+
+    pub(crate) fn new(r: &Renderer, pipelines: &std::sync::Arc<crate::pipelines::CachedPipelines>, draws: &[install::Draw], plan: &crate::plan::ScenePlan, render: &vork_scene::Render, ray_refraction: bool, boundary_capacity:u32, variants:&pipelines::VariantCompile, kernel_plan:&KernelPlan) -> Result<Self> {
+        use crate::forward_variant::{FEATURE_CAMERA_RECEIVERS,FEATURE_REFLECTIONS,FEATURE_INDIRECT_CONTROLS};
+        if plan.effects.probes && r.adapter_info.backend!=wgpu::Backend::Metal {indirect_arguments_pipeline(r);}
+        let d = &r.device;
+        let RasterGeometry {draw_table,buffers,object_draws}=RasterGeometry::new(r,draws,plan)?;
+        let KernelPlan {kernels,features,material_count,per_sample,evaluation_words,implicit_slots,fuse_table,needs_classification,used}=kernel_plan.clone();
+        let kernel=|stage| {
+            let key=*kernels.iter().find(|key|matches!(key,pipelines::ProgramKernel::Decoupled {stage:s,..} if *s==stage)).expect("planned camera stage");
+            pipelines.drawn_kernel(key,variants,&r.compiler)
+        };
+        let compile=|stage|shade_pipeline(r,pipelines,kernel(stage));
         let cursor=std::sync::atomic::AtomicUsize::new(0);
         let shades=std::thread::scope(|scope| {
             let compose=scope.spawn(||compile(ShadeStage::Compose));
@@ -650,7 +716,7 @@ impl Install {
             let fused=fuse_table.then(|| {
                 let key=kernel(ShadeStage::Fused);let slot=pipelines.camera_slot(key);
                 let layout=shade_layout(&r.device,pipelines);let p=pipelines.clone();
-                let warm=r.compiler.is_known(&p.kernel_content_key(key));
+                let warm=r.compiler.is_known_input(p.kernel_content_key(key));
                 r.compiler.install_optional(variants,slot,warm,move |worker|build_evaluation(worker,&p,&layout,key))
             }).transpose()?;
             let occupancy=(boundary_capacity>0).then(||compile(ShadeStage::Occupancy).map(|p|p.0)).transpose()?;
@@ -690,11 +756,11 @@ impl Fragments {
         let d = &r.device;
         let pixels = u64::from(w) * u64::from(h);
         let (header, record) = (u64::from(vork_slang::registry::FRAGMENT_HEADER_WORDS) * 4, u64::from(vork_slang::registry::FRAGMENT_RECORD_WORDS) * 4);
-        let explicit_depth = s.plan.transparent && s.pipelines.field_controls;
+        let explicit_depth = s.plan.transparent && (s.pipelines.field_controls || s.pipelines.software_raster);
         let lists = fragment_list_bytes(pixels,samples,s.plan.transparent,explicit_depth);
         let limits = d.limits();
         let limit = u64::from(limits.max_storage_buffer_binding_size).min(limits.max_buffer_size);
-        ensure!(header + lists <= limit, "{}", crate::gpu_memory::limit_message("transparent fragment lists", format_args!("{} bytes",header+lists), format_args!("{limit} bytes"), "reduce resolution or samples with --set samples=N"));
+        ensure!(header + lists <= limit, crate::gpu_memory::device_limit("transparent fragment lists", format_args!("{} bytes",header+lists), format_args!("{limit} bytes"), "reduce resolution or samples with --set samples=N"));
         // A closed transparent solid lists its front and rear face at a pixel;
         // a larger reservation grows to the binding limit.
         let most = ((limit - header - lists) / record).min(u64::from(u32::MAX));
@@ -714,12 +780,14 @@ impl Fragments {
             entries: &[entry(0,buffer.as_entire_binding())],
         }));
         let geometry = bind.as_ref().map(|_| {
-            let installed=s.decoupled.as_ref().expect("installed decoupled geometry");
-            let buffers=crate::rt::resolve_hit_buffers(&installed.buffers,deforms);
+            let (table,objects,source)=if let Some(g)=&s.software_geometry {(&g.draw_table,&g.object_draws,&g.buffers)} else {
+                let g=s.decoupled.as_ref().expect("installed decoupled geometry");(&g.draw_table,&g.object_draws,&g.buffers)
+            };
+            let buffers=crate::rt::resolve_hit_buffers(source,deforms);
             let bindings=crate::rt::hit_bindings(&buffers);
             d.create_bind_group(&wgpu::BindGroupDescriptor {label:Some("transparent opacity geometry"),layout:&s.pipelines.fragments_geometry_layout,entries:&[
                 entry(0,wgpu::BindingResource::BufferArray(&bindings)),
-                entry(1,installed.draw_table.as_entire_binding()),entry(2,installed.object_draws.as_entire_binding()),
+                entry(1,table.as_entire_binding()),entry(2,objects.as_entire_binding()),
                 entry(3,sampling.passes.as_entire_binding()),
             ]})
         });
@@ -764,8 +832,9 @@ pub(crate) struct View {
     pub(crate) refraction_source: Option<wgpu::TextureView>,
     /// Each slot's reflection record and each pixel's reflection reconstruction
     /// guides, for the reflection passes (passes/reflections.rs).
-    pub(crate) reflection_records: wgpu::Buffer,
+    pub(crate) reflection_records: Vec<wgpu::Buffer>,
     pub(crate) reflection_field_bytes: u64,
+    pub(crate) reflection_fields_per_buffer: u32,
     pub(crate) reflection_guides: wgpu::Buffer,
     /// Bytes of dense slots and list heads; merged views clear these per exposure.
     listed: u64,
@@ -881,7 +950,6 @@ impl View {
             guide_bytes=view_bindings_with_pool(shape,extent,samples,0)[4].1;
             for (label,bytes) in view_bindings_with_pool(shape,storage_extent,samples,pool) {gpu_memory::storage_binding(&limits,label,bytes, "reduce resolution or choose --profile std/draft for a lower sample and reflection budget")?;}
             gpu_memory::storage_binding(&limits,"reflection guides",guide_bytes, "reduce resolution or choose --profile std/draft for a lower sample and reflection budget")?;
-            ensure!(record_bytes*u64::from(VISIBILITY_REFLECTION_WORDS)<=limits.max_buffer_size,"{}", crate::gpu_memory::limit_message("camera packet reflection allocation", format_args!("{} bytes",record_bytes*u64::from(VISIBILITY_REFLECTION_WORDS)), format_args!("max_buffer_size={} bytes",limits.max_buffer_size), "reduce resolution or choose --profile std/draft for a lower sample and reflection budget"));
         }
         let occupancy_row=occupancy_row_bytes(w,samples,shape.boundaries);
         let metadata_size=metadata_size-occupancy_row*u64::from(packet_rows.min(TILE));
@@ -923,13 +991,17 @@ impl View {
             min_filter: wgpu::FilterMode::Linear, mipmap_filter: wgpu::MipmapFilterMode::Linear,
             ..Default::default()
         });
-        let slot_records=storage_pixels * u64::from(VISIBILITY_SLOTS) + pool;
+        let slot_records=if direct_keys {storage_pixels} else {storage_pixels * u64::from(VISIBILITY_SLOTS) + pool};
         let subsurface_records = s.transients.buffer(d, "subsurface records", capture_bytes, wgpu::BufferUsages::STORAGE|wgpu::BufferUsages::COPY_SRC);
-        // Keep each packed word in its own aligned slice of one allocation. Bind
-        // slices separately: the complete record array need not fit one binding.
+        // Keep each packed word in its own aligned slice. Bind fields separately
+        // and split allocations at the native limit without changing record indices.
         // SlotLayout.reflection is the common record index in all fields.
         let reflection_field_bytes=record_bytes.div_ceil(u64::from(limits.min_storage_buffer_offset_alignment))*u64::from(limits.min_storage_buffer_offset_alignment);
-        let reflection_records = s.transients.buffer(d, "reflection records", reflection_field_bytes*u64::from(VISIBILITY_REFLECTION_WORDS), wgpu::BufferUsages::STORAGE);
+        // Each packed field is its own binding; pack as many fields per allocation
+        // as the device allows so the complete record array can exceed one buffer.
+        let reflection_fields_per_buffer=reflection_fields_per_buffer(reflection_field_bytes,limits.max_buffer_size);
+        let reflection_records:Vec<_>=(0..VISIBILITY_REFLECTION_WORDS).step_by(reflection_fields_per_buffer as usize).enumerate().map(|(chunk,first)|
+            s.transients.buffer(d,&format!("reflection records {chunk}"),reflection_field_bytes*u64::from((VISIBILITY_REFLECTION_WORDS-first).min(reflection_fields_per_buffer)),wgpu::BufferUsages::STORAGE)).collect();
         let reflection_guides = s.transients.buffer(d, "reflection guides", guide_bytes, wgpu::BufferUsages::STORAGE);
         let screen = s.plan.screen_refraction;
         let refraction_receivers = s.transients.buffer(d, "refraction receivers", if screen { pixels * 16 } else { 16 }, wgpu::BufferUsages::STORAGE);
@@ -1122,9 +1194,12 @@ impl View {
         let page_bindings:Vec<_>=evaluation_pages.iter().map(|buffer|wgpu::BufferBinding {buffer,offset:0,size:None}).collect();
         let geometry=crate::rt::resolve_hit_buffers(&installed.buffers,deforms);
         let geometry_bindings=crate::rt::hit_bindings(&geometry);
-        let read_words=[&slots,&installed.draw_table,&installed.object_draws].map(|buffer|wgpu::BufferBinding {buffer,offset:0,size:None});
+        // Keep scene image data in the existing argument table: a scalar
+        // binding would consume Metal's last slot reserved for buffer sizes.
+        let environment_images=s.environment.primary.as_ref().and_then(|p|p.image_data.as_ref()).unwrap_or(&installed.draw_table);
+        let read_words=[&slots,&installed.draw_table,&installed.object_draws,environment_images].map(|buffer|wgpu::BufferBinding {buffer,offset:0,size:None});
         let write_words=[&reflection_guides,&subsurface_records,&evaluation_metadata,&evaluation_bins,&evaluation_allocator].map(|buffer|wgpu::BufferBinding {buffer,offset:0,size:None});
-        let reflection_fields=crate::passes::reflections::record_fields(&reflection_records,reflection_field_bytes);
+        let reflection_fields=crate::passes::reflections::record_fields(&reflection_records,reflection_field_bytes,reflection_fields_per_buffer);
         let write_vectors=[&targets.aov_values,&refraction_receivers].map(|buffer|wgpu::BufferBinding {buffer,offset:0,size:None});
         let hits=d.create_bind_group(&wgpu::BindGroupDescriptor {label:Some("camera geometry and evaluations"),layout:&camera_geometry_layout(d,s.pipelines.camera_pages),entries:&[
             entry(0,wgpu::BindingResource::BufferArray(&geometry_bindings)),entry(1,wgpu::BindingResource::BufferArray(&page_bindings)),
@@ -1168,7 +1243,7 @@ impl View {
             capacity_feedback: shader_errors.context("camera capacity diagnostics")?.clone(),
             evaluation, evaluation_bins, evaluation_args, evaluation_allocator, indirect_dispatch, indirect_offsets, material_count:installed.materials, config_stride, transport_parts, bands, band_rows,
             evaluation_groups:if direct {w.div_ceil(TILE)*h.div_ceil(TILE)} else {evaluation_capacity.div_ceil(64)},
-            subsurface_records, refraction_source: (screen && s.plan.effects.subsurface).then(||level_zero.clone()), direct_keys, receivers, normals, stride: sampling.stride, keys, depth, slots, reflection_records, reflection_field_bytes, reflection_guides, listed, overflow, fragments, passes, transparent_passes, merge_pipeline, shade_pipeline, merge,
+            subsurface_records, refraction_source: (screen && s.plan.effects.subsurface).then(||level_zero.clone()), direct_keys, receivers, normals, stride: sampling.stride, keys, depth, slots, reflection_records, reflection_field_bytes, reflection_fields_per_buffer, reflection_guides, listed, overflow, fragments, passes, transparent_passes, merge_pipeline, shade_pipeline, merge,
             shade: [global, material, shadow, hits, own],
             refraction,
             extent,
@@ -1191,6 +1266,11 @@ fn visibility_packet(encoder:&mut wgpu::CommandEncoder,f:&crate::view::ViewState
         // The pool restarts each exposure; the frame's demand at its first.
         encoder.clear_buffer(&v.overflow, 0, Some(if f.sample_index == 0 { 8 } else { 4 }));
     }
+    // Metal's render-pass end samples the fragment stage, which may not run
+    // for empty or fully culled visibility. Measure the whole interval with
+    // real work, as for depth; packet visibility belongs to the shade span.
+    let metal_timing = !v.packets && r.adapter_info.backend == wgpu::Backend::Metal;
+    if metal_timing { timing::boundary(r, encoder, &f.queries, timing::query("visibility")); }
     let passes = v.passes.len() as u32;
     for (index, (first, count)) in merge_batches(passes, v.keys.len() as u32).enumerate() {
         // A batch's fragments start a fresh list; the frame's demand at its first.
@@ -1202,7 +1282,7 @@ fn visibility_packet(encoder:&mut wgpu::CommandEncoder,f:&crate::view::ViewState
                 label: Some("decoupled visibility"),
                 color_attachments: &[Some(color_attachment(&v.keys[layer as usize], wgpu::Color::TRANSPARENT))],
                 depth_stencil_attachment: Some(depth_attachment(&v.depth, false, true)),
-                timestamp_writes: (!v.packets && sample == 0).then(|| wgpu::RenderPassTimestampWrites {
+                timestamp_writes: (!v.packets && !metal_timing && sample == 0).then(|| wgpu::RenderPassTimestampWrites {
                     query_set: &f.queries,
                     beginning_of_pass_write_index: Some(timing::query("visibility")),
                     end_of_pass_write_index: v.direct_keys.then(|| timing::query("visibility")+1),
@@ -1229,7 +1309,7 @@ fn visibility_packet(encoder:&mut wgpu::CommandEncoder,f:&crate::view::ViewState
         if v.direct_keys {continue;}
         let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
             label: Some("decoupled merge"),
-            timestamp_writes: (!v.packets && first + count == passes).then(|| wgpu::ComputePassTimestampWrites {
+            timestamp_writes: (!v.packets && !metal_timing && first + count == passes).then(|| wgpu::ComputePassTimestampWrites {
 
                 query_set: &f.queries,
                 beginning_of_pass_write_index: None,
@@ -1245,6 +1325,7 @@ fn visibility_packet(encoder:&mut wgpu::CommandEncoder,f:&crate::view::ViewState
         }
     }
 
+    if metal_timing { timing::boundary(r, encoder, &f.queries, timing::query("visibility") + 1); }
     Ok(())
 }
 
@@ -1349,7 +1430,7 @@ fn evaluate(encoder:&mut wgpu::CommandEncoder,v:&View,own:&wgpu::BindGroup,queri
     // only (opaque) bin. Do not ask an empty Metal encoder to sample counters.
     if evaluations.peek().is_none() {
         if let Some(timestamps)=timestamps {
-            r.timestamp_marker.get_or_init(||timing::Marker::new(&r.device)).encode_timestamps(encoder,timestamps);
+            r.timestamp_marker.get_or_init(||timing::Marker::new(r)).encode_timestamps(encoder,timestamps);
         }
     } else {
         let mut pass=encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {label:Some("evaluate camera material bins"),timestamp_writes:timestamps});
@@ -1424,7 +1505,7 @@ pub(crate) fn shade(encoder: &mut wgpu::CommandEncoder, f: &crate::view::ViewSta
         return Ok(());
     }
     if v.packets {
-        r.timestamp_marker.get_or_init(||timing::Marker::new(&r.device)).encode_timestamps(encoder,span(Some(&f.queries),"shade",true,false).unwrap());
+        r.timestamp_marker.get_or_init(||timing::Marker::new(r)).encode_timestamps(encoder,span(Some(&f.queries),"shade",true,false).unwrap());
     } else {preflight_evaluations(encoder,v,&v.shade[4],Some(&f.queries));}
     for index in 0..v.bands {
         if v.packets {visibility_packet(encoder,f,r,segments,index)?;}
@@ -1444,7 +1525,7 @@ pub(crate) fn shade(encoder: &mut wgpu::CommandEncoder, f: &crate::view::ViewSta
         }
     }
     if v.packets {
-        r.timestamp_marker.get_or_init(||timing::Marker::new(&r.device)).encode_timestamps(encoder,span(Some(&f.queries),"shade",false,true).unwrap());
+        r.timestamp_marker.get_or_init(||timing::Marker::new(r)).encode_timestamps(encoder,span(Some(&f.queries),"shade",false,true).unwrap());
     }
     Ok(())
 }
@@ -1467,6 +1548,67 @@ pub(crate) fn refraction(encoder: &mut wgpu::CommandEncoder, f: &crate::view::Vi
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+    fn visibility_timestamps_cover_empty_and_culled_geometry() -> Result<()> {
+        let r = crate::test_renderer()?;
+        let base: serde_json::Value = serde_json::from_str(include_str!("../../tests/fixtures/closed-glass-slab.json"))?;
+        for kind in ["empty", "culled", "visible"] {
+            for samples in [1, 4] {
+                let mut doc = base.clone();
+                doc["nodes"].as_array_mut().unwrap().remove(1);
+                doc["materials"].as_object_mut().unwrap().remove("emitter");
+                doc["materials"]["glass"]["inputs"]["transmission_weight"] = serde_json::json!(0);
+                doc["render"]["resolution"] = serde_json::json!([32,32]);
+                doc["render"]["settings"] = serde_json::json!({"integrator":"raster","samples":samples,"fast_gi":null});
+                // Keep empty scenes on staged evaluation, exercising visibility
+                // with both direct keys (one sample) and merged keys (four).
+                doc["render"]["aovs"] = serde_json::json!([{"name":"unwritten","type":"value"}]);
+                if kind == "empty" { doc["nodes"].as_array_mut().unwrap().pop(); }
+                if kind == "culled" { doc["nodes"][1]["translation"] = serde_json::json!([1000,0,0]); }
+                let mut installed = r.install(crate::test_scene(doc, std::path::Path::new("."))?, std::path::Path::new("."))?;
+                let mut frame = installed.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
+                let visibility = frame.view.decoupled.as_ref().expect("staged visibility");
+                assert!(!visibility.packets, "fixture must use its own visibility span");
+                assert_eq!(visibility.direct_keys, samples == 1);
+                let plain = installed.render_frame(&r, &mut frame, 0.)?;
+                frame.profile = true;
+                for _ in 0..2 {
+                    let measured = installed.render_frame(&r, &mut frame, 0.)?;
+                    crate::test_linear::assert_linear_eq(plain.linear_rgba.as_ref().unwrap(), measured.linear_rgba.as_ref().unwrap());
+                    let visibility = measured.timing.gpu_spans_ms.iter().find(|(name,_)| *name == "visibility").unwrap().1;
+                    assert!(visibility.is_finite() && visibility >= 0., "{kind}, samples={samples}: {visibility}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn direct_authored_metadata_has_one_record_per_pixel() {
+        let shape=ViewShape {transparent:false,diffusion:false,reflections:true,screen_refraction:false,boundaries:0,table_only:false,reserved:0};
+        let extent=[3840,2160];
+        let pixels=u64::from(extent[0])*u64::from(extent[1]);
+        for pool in [0,pixels,pixels*8] {
+            let fields=view_bindings_with_pool(shape,extent,1,pool);
+            assert_eq!(fields[1].1,pixels*u64::from(vork_slang::registry::CAMERA_EVALUATION_METADATA_WORDS)*4);
+            assert_eq!(fields[3].1,(pixels*4).div_ceil(256)*256);
+        }
+    }
+
+    #[test]
+    fn direct_reflection_storage_has_one_record_per_pixel() {
+        let shape=ViewShape {transparent:false,diffusion:false,reflections:true,screen_refraction:false,boundaries:0,table_only:true,reserved:0};
+        for extent in [[1920,1080],[1080,1920],[3840,2160]] {
+            let pixels=u64::from(extent[0])*u64::from(extent[1]);
+            let fields=view_bindings_with_pool(shape,extent,1,0);
+            assert_eq!(fields[3].1,(pixels*4).div_ceil(256)*256);
+            let limits=wgpu::Limits {max_storage_buffer_binding_size:1<<30,max_buffer_size:2_147_483_647,..Default::default()};
+            check_view(&limits,extent,1,shape).unwrap();
+            assert_eq!(visibility_pool(&limits,ViewShape {reserved:u32::MAX,..shape},extent,1),0);
+        }
+    }
+
     #[test]
     fn camera_packets_follow_memory_and_native_limits() -> Result<()> {
         let limits=wgpu::Limits {max_storage_buffer_binding_size:2<<30,max_buffer_size:16<<30,..Default::default()};
@@ -1501,10 +1643,11 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn opaque_program_packets_preserve_absolute_samples_and_last_partial_row() -> Result<()> {
-        let Some(mut r)=crate::test_renderer()? else {return Ok(());};
+        let mut r = crate::test_renderer()?;
         let scene:Scene=vork_scene::v2::from_test_value(serde_json::json!({"version":2,
-            "render":{"resolution":[96,73],"settings":{"integrator":"raster","samples":8,"reflections":"ray","denoiser":null,"fast_gi":null},"display":{"program":"std/standard","inputs":{"dither_intensity":0.}}},
+            "composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[96,73],"settings":{"integrator":"raster","samples":8,"reflections":"ray","denoiser":null,"fast_gi":null}},
             "buffers":{"p":{"type":"vec3","data":[[-1,-1,0],[1,-1,0],[1,1,0],[-1,1,0]]},"i":{"type":"u32","data":[0,1,2,0,2,3]}},
             "geometry":{"quad":{"attributes":{"POSITION":"p"},"indices":"i"}},
             "programs":{"rings":{"source":"struct Inputs {}; Closure surface(ShadingContext ctx,Inputs inputs) { Closure c={}; c.base_color=float3(frac(length(ctx.POSITION.xy)*8.),0.3,0.7); c.specular_roughness=0.3; return c; }"}},
@@ -1534,15 +1677,16 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn one_full_height_packet_consumes_records_and_completes_queries() -> Result<()> {
-        let Some(mut r)=crate::test_renderer()? else {return Ok(());};
+        let mut r = crate::test_renderer()?;
         r.camera_memory=128<<20;
         let scene:Scene=vork_scene::v2::from_test_value(serde_json::json!({"version":2,
             "buffers":{"p":{"type":"vec3","data":[[-1,-1,0],[1,-1,0],[1,1,0],[-1,1,0]]},"i":{"type":"u32","data":[0,1,2,0,2,3]}},
             "geometry":{"quad":{"topology":"triangles","attributes":{"POSITION":"p"},"indices":"i"}},
             "materials":{"glow":{"inputs":{"base_weight":0.,"specular_weight":0.2,"emission_luminance":1.,"emission_color":[0.25,0.5,0.75]}}},
             "nodes":[{"type":"camera","translation":[0,0,5],"material":{"program":"std/camera","inputs":{"projection":"ortho","fit":"horizontal","ortho_scale":2.}}},{"type":"mesh","geometry":"quad","materials":["glow"]}],
-            "render":{"resolution":[96,64],"settings":{"integrator":"raster","samples":8,"reflections":"ray","denoiser":null,"fast_gi":null},"display":{"program":"std/standard","inputs":{"dither_intensity":0.}}}
+            "composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[96,64],"settings":{"integrator":"raster","samples":8,"reflections":"ray","denoiser":null,"fast_gi":null}}
         }))?;
         let render=|reserved:u32|->Result<Vec<[f32;4]>> {
             let options=crate::InstallOptions {reservations:crate::Reservations {visibility_pool:reserved,..Default::default()},..Default::default()};
@@ -1555,6 +1699,37 @@ mod tests {
             Ok(first)
         };
         crate::test_linear::assert_linear_eq(&render(0)?,&render(u32::MAX)?);
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+    fn compact_direct_records_preserve_fused_camera_shading() -> Result<()> {
+        let r = crate::test_renderer()?;
+        let scene:Scene=vork_scene::v2::from_test_value(serde_json::json!({"version":2,
+            "buffers":{"p":{"type":"vec3","data":[[-1,-1,0],[1,-1,0],[1,1,0],[-1,1,0]]},"i":{"type":"u32","data":[0,1,2,0,2,3]}},
+            "geometry":{"quad":{"attributes":{"POSITION":"p"},"indices":"i"}},
+            "materials":{"blue":{"inputs":{"base_color":[0.12,0.35,0.65],"specular_roughness":0.3}}},
+            "nodes":[{"type":"camera","translation":[0,0,4],"material":{"program":"std/camera","inputs":{"projection":"ortho","ortho_scale":2.5}}},
+                {"type":"mesh","geometry":"quad","materials":["blue"]},
+                {"type":"light","shape":"sun","energy":3},
+                {"type":"light","shape":"environment","color":[0.2,0.3,0.4],"energy":1}],
+            "composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[96,73],"settings":{"integrator":"raster","samples":1,"reflections":"ray","denoiser":null,"fast_gi":null}}
+        }))?;
+        let render=|variants,fused|->Result<Vec<[f32;4]>> {
+            let options=crate::InstallOptions {variants,..Default::default()};
+            let mut installed=r.install_with_options(scene.clone(),std::path::Path::new("."),options)?;
+            let mut frame=installed.create_frame_slot(&r,crate::ReadbackPrecision::Float)?;
+            let view=frame.view.decoupled.as_ref().unwrap();
+            assert!(view.direct_keys);
+            assert_eq!(fused_ready(view),fused);
+            let first=installed.render_frame(&r,&mut frame,0.)?.linear_rgba.unwrap();
+            assert_eq!(fused_active(&frame.view),fused);
+            crate::test_linear::assert_linear_eq(&first,&installed.render_frame(&r,&mut frame,0.)?.linear_rgba.unwrap());
+            Ok(first)
+        };
+        crate::test_linear::assert_linear_eq(&render(crate::pipelines::VariantCompile::Fallback,false)?,
+            &render(crate::pipelines::VariantCompile::Inline,true)?);
         Ok(())
     }
 
@@ -1578,8 +1753,9 @@ mod tests {
 
     use super::*;
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn indirect_arguments_follow_live_requests_and_bound_each_dispatch()->Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let d=&r.device;let pipeline=indirect_arguments_pipeline(&r);
         let block=vork_slang::registry::CAMERA_INDIRECT_BLOCK;
         let group=vork_slang::registry::CAMERA_INDIRECT_GROUP;
@@ -1644,8 +1820,9 @@ mod tests {
         assert_eq!(both[2].1,sss[2].1.div_ceil(256)*256*2);
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn invisible_textured_front_preserves_rear_sample_evaluation() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let temp=std::env::temp_dir().join(format!("vork-zero-front-{}",std::process::id()));
         std::fs::create_dir_all(&temp)?;
         image::RgbaImage::from_fn(64,64,|x,y| {
@@ -1709,17 +1886,32 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn reflection_fields_split_at_the_allocation_limit() {
+        let field=132_710_400;
+        let per=reflection_fields_per_buffer(field,2_147_483_647);
+        assert_eq!(per,16);
+        assert!(field*u64::from(per)<=2_147_483_647);
+        assert_eq!(VISIBILITY_REFLECTION_WORDS.div_ceil(per),2);
+        assert_eq!(reflection_fields_per_buffer(field,200<<20),1);
+    }
+
+    #[test]
     fn reflection_allocation_limit_explains_recovery() {
-        let limits = wgpu::Limits {max_storage_buffer_binding_size:1<<30,max_buffer_size:1<<30,..Default::default()};
-        // A glass scene retains whole-frame reflection records. Geometry count
-        // does not enter this allocation: four dense records per pixel suffice.
-        let shape = ViewShape {transparent:true,diffusion:false,reflections:true,screen_refraction:true,boundaries:0,table_only:true,reserved:0};
+        let limits=wgpu::Limits {max_storage_buffer_binding_size:1<<30,max_buffer_size:1<<30,..Default::default()};
+        let shape=ViewShape {transparent:true,diffusion:false,reflections:true,screen_refraction:true,boundaries:0,table_only:true,reserved:0};
         assert!(!packet_eligible(shape,32));
-        let error=check_view(&limits,[2000,1333],32,shape).unwrap_err().to_string();
-        for text in ["1194368000 bytes", "1073741824 bytes", "lower the resolution", "--profile std/path"] {
-            assert!(error.contains(text), "missing {text:?}: {error}");
+        let fields=check_view(&limits,[2000,1333],32,shape).unwrap();
+        assert!(fields[3]*u64::from(VISIBILITY_REFLECTION_WORDS)>limits.max_buffer_size);
+        let per=reflection_fields_per_buffer(fields[3],limits.max_buffer_size);
+        assert!(fields[3]*u64::from(per)<=limits.max_buffer_size);
+        // Separate allocations cannot rescue an individual oversized field.
+        let direct=ViewShape {transparent:false,screen_refraction:false,..shape};
+        let small=wgpu::Limits {max_buffer_size:16<<20,..limits};
+        let error=check_view(&small,[3840,2160],1,direct).unwrap_err().to_string();
+        for text in ["reflection record field","33177600 bytes","16777216 bytes","reduce the rendered resolution"] {
+            assert!(error.contains(text),"missing {text:?}: {error}");
         }
-        check_view(&limits,[1000,667],32,shape).unwrap();
+        check_view(&small,[320,240],1,direct).unwrap();
     }
 
     #[test]
@@ -1793,9 +1985,10 @@ mod tests {
         let [w,h]:[u32;2]=error.split("resolution to ").nth(1).unwrap().split(' ').next().unwrap()
             .split('x').map(|n|n.parse().unwrap()).collect::<Vec<_>>().try_into().unwrap();
         check_view(&small,[w,h],64,shape).unwrap();
-        // One-sample program shading still allocates whole-frame metadata.
+        // Compact one-sample program metadata fits 4K, but remains bounded by the binding limit.
         let programs=ViewShape {transparent:false,diffusion:false,reflections:false,screen_refraction:false,boundaries:0,table_only:false,reserved:0};
-        assert!(check_view(&small,[3840,2160],1,programs).unwrap_err().to_string().contains("camera evaluation metadata"));
+        check_view(&small,[3840,2160],1,programs).unwrap();
+        assert!(check_view(&small,[7680,4320],1,programs).unwrap_err().to_string().contains("camera evaluation metadata"));
         check_view(&small,[3840,2160],1,ViewShape {table_only:true,..programs}).unwrap();
     }
     #[test]
@@ -1876,6 +2069,13 @@ mod tests {
         Ok(())
     }
     #[test]
+    fn dielectric_occupancy_allocation_matches_the_retained_kernel_capacity() {
+        let inline=crate::passes::path::INLINE_BOUNDARIES;
+        for boundaries in [0,1,inline,inline+1,32,u32::MAX] {
+            assert_eq!(occupancy_row_bytes(640,16,boundaries),occupancy_row_bytes(640,16,crate::passes::path::kernel_boundaries(boundaries)));
+        }
+    }
+    #[test]
     fn dielectric_occupancy_keeps_room_beside_the_visibility_pool()->Result<()> {
         let limits=wgpu::Limits {max_storage_buffer_binding_size:128<<20,max_buffer_size:128<<20,..Default::default()};
         let shape=ViewShape {transparent:true,diffusion:false,reflections:false,screen_refraction:false,table_only:true,boundaries:32,reserved:0};
@@ -1886,15 +2086,27 @@ mod tests {
         let metadata=sizes[1]-row*u64::from(TILE);
         let (_,rows)=occupancy_bands(&limits,u64::MAX,metadata,row,extent[1],extent[1])?;
         assert!(metadata+row*u64::from(rows)<=limits.max_storage_buffer_binding_size);
-        // Spare speculative pool space must yield to the minimum band.
-        assert!(pool<visibility_pool(&limits,ViewShape {boundaries:0,..shape},extent,samples));
+        let bare=ViewShape {boundaries:0,..shape};
+        assert!(pool<=visibility_pool(&limits,bare,extent,samples));
+        // Eight retained descriptors fit the generous fixture without reducing
+        // its pool. Also test actual pressure: permit exactly the bare view's
+        // full metadata binding, so occupancy must reclaim speculative space.
+        let tight_bytes=check_view(&limits,extent,samples,bare)?[1];
+        let tight=wgpu::Limits {max_storage_buffer_binding_size:tight_bytes,max_buffer_size:tight_bytes,..limits};
+        let tight_pool=visibility_pool(&tight,shape,extent,samples);
+        assert!(tight_pool<visibility_pool(&tight,bare,extent,samples));
+        let tight_sizes=check_view(&tight,extent,samples,shape)?;
+        let tight_metadata=tight_sizes[1]-row*u64::from(TILE);
+        let (_,tight_rows)=occupancy_bands(&tight,u64::MAX,tight_metadata,row,extent[1],extent[1])?;
+        assert!(tight_metadata+row*u64::from(tight_rows)<=tight_bytes);
         Ok(())
     }
     /// Force containment alone to split table-glass shading; compare all rows,
     /// including a short final band and camera origins inside a tinted solid.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn dielectric_occupancy_bands_preserve_camera_transport()->Result<()> {
-        let Some(mut r)=crate::test_renderer()? else {return Ok(());};
+        let mut r = crate::test_renderer()?;
         if !r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {return Ok(());}
         let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
         let mut input=vork_scene::v2::with_test_settings(include_str!("../../tests/fixtures/analytic.json"),include_str!("../../tests/presets/analytic-7fefd52a.json"))?;
@@ -1934,9 +2146,10 @@ mod tests {
     /// Per-sample program and blended shading split into bands reproduces the
     /// one-band linear image within float noise: each band classifies, evaluates and composes its rows.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     #[cfg(vork_private_tests)]
     fn shading_bands_reproduce_the_single_band_image() -> Result<()> {
-        let Some(mut r) = crate::test_renderer()? else {return Ok(());};
+        let mut r = crate::test_renderer()?;
         let (scene,root)=program_transparency()?;
         let render=|r:&Renderer| -> Result<(u32,Vec<[f32;4]>)> {
             let mut installed=r.install(scene.clone(),&root)?;
@@ -1956,8 +2169,9 @@ mod tests {
     /// Constant table glass has visibility-dependent per-sample work even when
     /// refraction uses rays. Its first submission must already budget that work.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn table_transparency_reserves_samples_before_first_submission() -> Result<()> {
-        let Some(mut r)=crate::test_renderer()? else {return Ok(());};
+        let mut r = crate::test_renderer()?;
         let scene:Scene=vork_scene::v2::from_test_value(serde_json::json!({"version":2,
             "render":{"resolution":[96,64],"settings":{"integrator":"raster","samples":32,"refraction":"ray",
                 "probes":{"gi_diffuse_bounces":1,"volume":{"resolution_x":1,"resolution_y":1,"resolution_z":1,"rays_per_probe":32}}}},
@@ -1989,9 +2203,10 @@ mod tests {
     /// A frame whose evaluations overflow the view's estimate redoes with the
     /// reported demand, destroys the outgrown storage, and keeps its pixels.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     #[cfg(vork_private_tests)]
     fn evaluation_overflow_redoes_and_destroys_the_outgrown_storage() -> Result<()> {
-        let Some(mut r) = crate::test_renderer()? else {return Ok(());};
+        let mut r = crate::test_renderer()?;
         let (scene,root)=program_transparency()?;
         let expected={
             let mut installed=r.install(scene.clone(),&root)?;
@@ -2020,9 +2235,10 @@ mod tests {
     /// Recovery preserves an accepted successor's pixels and GPU-only fence,
     /// but releases the saved result when a different request uses that slot.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     #[cfg(vork_private_tests)]
     fn recovery_retains_an_accepted_queued_exposure() -> Result<()> {
-        let Some(mut r) = crate::test_renderer()? else { return Ok(()); };
+        let mut r = crate::test_renderer()?;
         let (scene, root) = program_transparency()?;
         let mut installed = r.install(scene, &root)?;
         let good = installed.create_frame_slot(&r, crate::ReadbackPrecision::Float)?;
@@ -2065,8 +2281,9 @@ mod tests {
     /// A scene whose per-sample evaluations exceed what one material-bin binding
     /// addresses renders in bands within the device limits.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn per_sample_records_beyond_one_binding_render_in_bands() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let limits=r.device.limits();
         let records=limits.max_storage_buffer_binding_size.min(limits.max_buffer_size)/16;
         let samples=64u32;
@@ -2111,9 +2328,10 @@ mod tests {
     // Empty SIMD lanes must never reach descriptor loads in either the direct
     // opaque walk or the grouped one-sample transparent walk.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     #[cfg(vork_private_tests)]
     fn single_sample_shading_preserves_sparse_pixel_execution() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let root=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples");
         let mut scene=crate::load_test_fixture(&root.join("jitter-aa.json"), include_str!("../../tests/presets/jitter-aa-f8d98a5b.json"))?;
         scene.render.resolution=[64,64];scene.render.settings.samples=1;
@@ -2157,8 +2375,9 @@ mod tests {
         Ok(())
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn opaque_slot_results_preserve_multiple_pixels_with_overflow() -> Result<()> {
-        let Some(mut r)=crate::test_renderer()? else {return Ok(());};
+        let mut r = crate::test_renderer()?;
         // Force opaque compact results through multiple bands, including a
         // measured overflow pool larger than the retained evaluation store.
         r.evaluation_memory=Some(8*37*4*32*EVALUATION_MEMORY_SHARE);
@@ -2174,7 +2393,7 @@ mod tests {
             "geometry":{"quad":{"topology":"triangles","attributes":{"POSITION":"p"},"indices":"i"}},
             "materials":materials,
             "nodes":nodes,
-            "render":{"resolution":[2,2],"settings":{"integrator":"raster","samples":64,"reflections":"environment","fast_gi":null},"display":{"program":"std/standard","inputs":{"dither_intensity":0.}}}
+            "composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[2,2],"settings":{"integrator":"raster","samples":64,"reflections":"environment","fast_gi":null}}
         }))?;
         let render=|scene:Scene,indexed:bool|->Result<Vec<[f32;4]>> {
             let require_overflow=scene.render.resolution[0]==2;
@@ -2216,8 +2435,9 @@ mod tests {
     // Sparse pixels make neighbouring SIMD lanes finish their gathered-key walks
     // at different times; nested early returns crash llvmpipe here.
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn merge_sparse_keys_preserves_dense_overflow_and_mask_words() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let d = &r.device;
         let (w, h, layers, samples) = (8u32, 8u32, MERGE_BATCH, 64u32);
         let mut keys = vec![[0u32; 2]; (w*h*layers) as usize];
@@ -2293,27 +2513,59 @@ mod tests {
 }
 
 #[cfg(test)]
+mod transport_feature_tests {
+    use super::*;
+    use crate::forward_variant::*;
+
+    #[test]
+    fn refraction_entries_keep_off_bin_solid_materials() {
+        let thin=FEATURE_SPECIALIZED|FEATURE_TRANSMISSION|FEATURE_GLTF_TINT;
+        let solid=FEATURE_SPECIALIZED|FEATURE_TRANSMISSION|FEATURE_SOLID_TRANSMISSION;
+        let camera=FEATURE_CAMERA_RECEIVERS|FEATURE_REFLECTIONS|FEATURE_INDIRECT_CONTROLS;
+        let programs=[thin,thin,solid];
+        // A thin primary program can refract onto another program or table bin.
+        // Even an off-camera solid must prevent the no-owner-state prune.
+        for other in [thin,solid] {
+            let programs=[thin,thin,other];
+            let scene=thin|other|camera;
+            for stage in [ShadeStage::Evaluate,ShadeStage::EvaluateProgram(1),ShadeStage::EvaluateProgram(2),ShadeStage::Occupancy] {
+                assert_eq!(camera_stage_features(stage,scene,&programs,true),scene);
+            }
+        }
+        assert_eq!(camera_stage_features(ShadeStage::EvaluateProgram(1),thin|solid|camera,&programs,false),thin|camera);
+        let opaque=camera_stage_features(ShadeStage::EvaluateOpaque,thin|solid|camera,&programs,true);
+        assert_eq!(opaque & (FEATURE_TRANSMISSION|FEATURE_SOLID_TRANSMISSION),0,"opaque evaluation has no transport entry");
+        assert_eq!(opaque & camera,camera);
+        // Generic/fallback policies keep every capability, so an absent literal
+        // bit cannot accidentally prune their possible solid receivers.
+        let generic=camera_stage_features(ShadeStage::EvaluateProgram(1),0,&programs,true);
+        assert_eq!(variant_capabilities(generic,false,false,false).into_iter().find(|(name,_)|*name=="has_solid_transmission").unwrap().1,Capability::Bool(true));
+    }
+}
+
+#[cfg(test)]
 mod warm_key_tests {
     use super::*;
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn direct_camera_constructors_remember_their_complete_kernel() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         if !r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY) {return Ok(());}
-        let p=r.program_pipelines("",RESOLVE,1,true,crate::slang_forward::SlangScene {
+        let p=r.program_pipelines(RESOLVE,1,true,crate::slang_forward::SlangScene {
             probes:true,ray_refraction:true,..Default::default()
-        })?;
+        },&Default::default(),&[pipelines::ProgramKernel::Decoupled {stage:ShadeStage::Indirect,features:0,subsurface:false,emitter_profiles:false,boundaries:0},pipelines::ProgramKernel::Decoupled {stage:ShadeStage::Occupancy,features:0,subsurface:false,emitter_profiles:false,boundaries:1}])?;
         let root=std::env::temp_dir().join(format!("vork-camera-known-{}",std::process::id()));
         let known=pipelines::Known::load(root.join("keys.entry"),false);
-        let c=pipelines::Compiler::new(&r.device,r.cache.as_ref(),known);
+        let c=pipelines::Compiler::new(&r.device,r.cache.as_ref(),known,r.compiler.blob());
         let layout=shade_layout(&r.device,&p);
         for stage in [ShadeStage::Indirect,ShadeStage::Occupancy] {
             let boundaries=if stage==ShadeStage::Occupancy {1} else {0};
             let different=pipelines::ProgramKernel::Decoupled {stage,features:0,subsurface:false,emitter_profiles:false,boundaries};
             let kernel=different.superset().expect("specialized camera stage");
-            assert!(!c.is_known(&p.kernel_content_key(kernel)));
+            assert!(!c.is_known_input(p.kernel_content_key(kernel)));
             kernel_pipeline(&c,&p,&layout,kernel,&kernel.camera_label().unwrap())?;
-            assert!(c.is_known(&p.kernel_content_key(kernel)));
-            assert!(!c.is_known(&p.kernel_content_key(different)),"publication must retain the complete feature key");
+            assert!(c.is_known_input(p.kernel_content_key(kernel)));
+            assert!(!c.is_known_input(p.kernel_content_key(different)),"publication must retain the complete feature key");
             assert_eq!(p.drawn_kernel(different,&pipelines::VariantCompile::Fallback,&c),kernel);
         }
         r.errors.check()

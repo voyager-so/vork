@@ -1,0 +1,10 @@
+[package]
+name = "vork-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+hound = "3.5"
+rustfft = "6"

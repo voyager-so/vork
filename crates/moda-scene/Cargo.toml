@@ -1,0 +1,30 @@
+# Ported from Moda (desktop-moda native/crates/moda-scene); the changes are listed in PROVENANCE.md.
+[package]
+name = "moda-scene"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Moda's scene layer: scene JSON to a normalized, expanded display list; paints, strokes, effects and path geometry."
+
+[dependencies]
+flo_curves = "=0.8.1"
+# Integer-robust polygon booleans: Offset Path (path_geom/offset_path.rs) and the
+# boolean / Pathfinder solver's polygon lane (path_bool/overlay.rs).
+i_overlay = { version = "=9.0.0", default-features = false }
+# Typed paint stacks (src/paint.rs), the first serde structs in the scene layer.
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["preserve_order"] }
+# Insertion-ordered objects of typed scene values (src/value); the map serde_json's `preserve_order` uses.
+indexmap = "2"
+# FxHash for the scene's id-keyed indexes (the std SipHash dominated plan building in wasm).
+rustc-hash = "2"
+
+[lints.rust]
+# Moda's `code` feature (live generators through the moda-code sandbox) is not ported; its cfg stays declared.
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(feature, values("code"))'] }
+
+[dev-dependencies]
+serde_json = { version = "1", features = ["preserve_order", "float_roundtrip"] }
+png = "0.18"
+proptest = { version = "1", default-features = false, features = ["std"] }

@@ -146,7 +146,7 @@ mod tail_tests {
             let positive=p.inputs.pack(&inputs,|_,_|unreachable!())?;
             assert!(!p.scattering_free_for_inputs(&abi,&positive.into_iter().map(Some).collect::<Vec<_>>())?);
         }
-        let fog=Compiler::discover().compile_medium(&abi,include_str!("../../../libraries/std/fog.slang"),Path::new("fog-proof.slang"),"fogproof")?;
+        let fog=Compiler::discover().compile_medium(&abi,include_str!("../../vork-scene/tests/fixtures/medium.slang"),Path::new("fog-proof.slang"),"fogproof")?;
         for density in [0.1,1.,10.] {
             let inputs=serde_json::from_value(serde_json::json!({"density":density,"scattering":[0.,0.,0.]}))?;
             let words=fog.inputs.pack(&inputs,|_,_|unreachable!())?;
@@ -194,6 +194,31 @@ mod tail_tests {
         assert_eq!(program.exponential_for_inputs(&abi,&words.iter().copied().map(Some).collect::<Vec<_>>())?,Some(([0.,2.,4.],[1.,0.,2.],[0.,-0.5,0.])));
         Ok(())
     }
+    #[test]
+    fn authored_height_fixture_certifies_vacuum_channels() -> Result<()> {
+        let abi=Abi {aov_count:0,context:Abi::spec_context(),closure:openpbr_fields()};
+        let source=include_str!("../../vork-scene/tests/fixtures/medium.slang");
+        let program=Compiler::discover().compile_medium(&abi,source,Path::new("authored-height.slang"),"authoredheight")?;
+        for mask in 1..8 {
+            let absorption: [f32;3]=std::array::from_fn(|c|if mask&(1<<c)!=0 {1.} else {0.});
+            let inputs=serde_json::from_value(serde_json::json!({
+                "density":0.2,"height_falloff":0.4,"absorption":absorption,"scattering":[0,0,0]
+            }))?;
+            let words=program.inputs.pack(&inputs,|_,_|unreachable!())?;
+            let known=words.iter().copied().map(Some).collect::<Vec<_>>();
+            let expected=Some((absorption.map(|x|x*0.2),[0.;3],[0.,-0.4,0.]));
+            assert_eq!(program.exponential_for_inputs(&abi,&known)?,expected,"vacuum channel mask {mask}");
+        }
+        for (density,coefficients) in [(0.2,[0.;3]),(0.,[1.;3])] {
+            let inputs=serde_json::from_value(serde_json::json!({
+                "density":density,"height_falloff":0.4,"absorption":coefficients,"scattering":coefficients
+            }))?;
+            let words=program.inputs.pack(&inputs,|_,_|unreachable!())?;
+            assert!(program.homogeneous_for_inputs(&abi,&words.iter().copied().map(Some).collect::<Vec<_>>())?);
+        }
+        Ok(())
+    }
+
     #[test]
     #[ignore = "requires pinned Slang"]
     fn imported_constant_volume_retains_homogeneous_tail() -> Result<()> {
@@ -428,7 +453,7 @@ mod connection_profile_tests {
             if let Some((a,b,g))=profile {assert_eq!(a,[0.2;3]);assert_eq!(b,[0.3;3]);assert_eq!(g,gradient);}
             if factor!="1." {assert!(p.connection_profile_for_inputs(&abi,&vec![None;words.len()])?.is_none(),"animated amplitude must remain linked");}
         }
-        let fog=Compiler::discover().compile_medium(&abi,include_str!("../../../libraries/std/fog.slang"),Path::new("fog-connection.slang"),"fogconnection")?;
+        let fog=Compiler::discover().compile_medium(&abi,include_str!("../../vork-scene/tests/fixtures/medium.slang"),Path::new("fog-connection.slang"),"fogconnection")?;
         for height in [0.,0.5] {
             let inputs=serde_json::from_value(serde_json::json!({"density":0.7,"absorption":[0.2,0.2,0.2],"scattering":[0.3,0.3,0.3],"height_falloff":height}))?;
             let words=fog.inputs.pack(&inputs,|_,_|unreachable!())?;

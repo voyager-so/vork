@@ -1,0 +1,10 @@
+# Ported from Moda (desktop-moda native/crates/moda-color); the changes are listed in PROVENANCE.md.
+[package]
+name = "moda-color"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Deterministic colour tables shared by the paint engine and the renderer"
+
+[dependencies]

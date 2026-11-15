@@ -9,12 +9,15 @@ mod update_notice;
 
 mod constants;
 mod init;
+mod skills;
 mod gpu_diagnostics;
 mod progress;
 mod interrupt;
 mod setup;
 mod help;
 mod std_command;
+mod session;
+mod ask;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::{io::Write, path::PathBuf};
@@ -37,6 +40,9 @@ struct Args {
 enum Command {
     /// Create a small offline project ready to render.
     Init(init::Args),
+    /// Install the bundled vork skill for Claude Code and Codex.
+    #[command(verbatim_doc_comment)]
+    Skills(skills::Args),
     /// Warm the init starter at the default profile in this machine's driver cache.
     Setup {
         /// Also warm every bundled program/profile and built-in descriptor.
@@ -61,6 +67,8 @@ enum Command {
     },
     /// Standard-library JSON fragments.
     Std(std_command::Args),
+    /// Read scene values without rendering.
+    Ask(ask::Args),
     /// Topic reference.
     Help {
         topic: Option<String>,
@@ -69,6 +77,12 @@ enum Command {
         /// Include generated fields and complete stage declarations.
         #[arg(long)]
         all: bool,
+    },
+    /// Keep the GPU and the installed scene alive between renders: open, render and close requests as JSON lines on stdin, replies on stdout; edit by opening the whole document again (vork help render).
+    Session {
+        /// Hardware GPU index in PCI bus order, or cpu for software rendering; default the high-performance GPU. Also VORK_GPU.
+        #[arg(long, value_name = "N|cpu")]
+        gpu: Option<vork_render::GpuSelection>,
     },
     /// Validate scene installation without opening a GPU or rendering.
     Check {
@@ -108,13 +122,12 @@ enum Command {
             long = "channels",
             value_name = "CHANNELS",
             value_delimiter = ',',
-            default_value = "color",
             value_parser = channel
         )]
         outputs: Vec<String>,
-        /// MP4 (H.264), MOV (ProRes 4444), one still .png, PNG/control directory, or %06d.exr multilayer frames; repeat for simultaneous outputs.
-        #[arg(long, required = true)]
-        out: Vec<PathBuf>,
+        /// Path or JSON {"file":"still.png","display":"sRGB"}; repeat for simultaneous outputs. Path shorthand defaults to sRGB.
+        #[arg(long, required = true, value_parser = parse_destination)]
+        out: Vec<vork_scene::v2::OutputDestination>,
         /// Blender ImageFormatSettings.exr_codec; default zip.
         #[arg(long, default_value = "zip")]
         exr_codec: vork_render::ExrCodec,
@@ -142,7 +155,7 @@ enum Command {
         /// Keep pixels on GPU; no PNG output or pixel readback.
         #[arg(long, hide = true, requires = "diagnostics")]
         gpu_only: bool,
-        /// Adapter/cache/GPU timings; default false.
+        /// Memory snapshots and non-finite pixel counts beside the timings every written render reports; default false.
         #[arg(long)]
         diagnostics: bool,
         /// Hardware GPU index in PCI bus order, or cpu for software rendering; default the high-performance GPU. Also VORK_GPU. On a multi-GPU machine,
@@ -155,10 +168,24 @@ fn channel(value: &str) -> Result<String, String> {
     if value != "all" { value.parse::<Output>().map_err(|e| e.to_string())?; }
     Ok(value.to_owned())
 }
+fn render_channels(outputs: Vec<String>, out: &[vork_scene::v2::OutputDestination]) -> Result<Vec<Output>> {
+    let wav = out.iter().all(|p| !p.as_os_str().to_string_lossy().ends_with(std::path::is_separator)
+        && p.extension().is_some_and(|e| e.eq_ignore_ascii_case("wav")));
+    if wav && !outputs.is_empty() {
+        return Err(anyhow::anyhow!("WAV does not accept --channels").context(vork_render::failure::FailureKind::Usage));
+    }
+    if outputs.is_empty() { return Ok(if wav { Vec::new() } else { vec![Output::Color] }); }
+    if outputs == ["all"] { return Ok(Vec::new()); }
+    outputs.iter().map(|s| s.parse()).collect::<Result<Vec<Output>, _>>()
+        .map_err(|e| anyhow::anyhow!(e).context(vork_render::failure::FailureKind::Usage))
+}
 fn main() -> std::process::ExitCode {
+    if let Some(result) = vork_render::specialization::worker_entry() {
+        return if let Err(error) = result { eprintln!("{error:#}"); std::process::ExitCode::FAILURE } else { std::process::ExitCode::SUCCESS };
+    }
+    vork_render::specialization::enable();
     if update_notice::worker_entry() { return std::process::ExitCode::SUCCESS; }
     let result = run();
-    update_notice::after_command();
     match result {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(error) if output::broken_pipe(&error) => std::process::ExitCode::SUCCESS,
@@ -181,6 +208,15 @@ fn run() -> Result<()> {
             std::process::exit(code);
         }
     };
+    let notify = !matches!(command, Command::Skills(_) | Command::Ask(_));
+    let result = run_command(command, entry, start);
+    if notify { update_notice::after_command(); }
+    result
+}
+fn run_command(command: Command, entry: std::time::SystemTime, start: std::time::Instant) -> Result<()> {
+    if let Command::Skills(args) = &command {
+        return args.run();
+    }
     if matches!(command, Command::Render { diagnostics: true, .. }) {
         eprintln!(
             "cli_entry_unix_ns: {}; cli_parse_ms: {:.3}",
@@ -252,6 +288,12 @@ fn run() -> Result<()> {
     if let Command::Std(args) = &command {
         return args.run();
     }
+    if let Command::Ask(args) = &command {
+        return args.run();
+    }
+    if let Command::Session { gpu } = command {
+        return session::run(gpu);
+    }
     if let Command::Check { scene, profile, shaders } = &command {
         let profile = vork_scene::Profile::load(profile.as_deref().unwrap_or(vork_scene::DEFAULT_PROFILE))
             .map_err(|error| error.context(vork_render::failure::FailureKind::Usage))?;
@@ -265,18 +307,22 @@ fn run() -> Result<()> {
         for issue in report["issues"].as_array().into_iter().flatten() {eprintln!("WARNING {} at {}: {}; {}",issue["code"],issue["source"],issue["dropped"],issue["remediation"]);}
         return Ok(());
     }
-    let progress = progress::Monitor::start("Render: loading scene and opening GPU");
+    let progress = progress::Monitor::start("Render: loading scene");
     let diagnostics = matches!(command, Command::Render { diagnostics: true, .. });
+    // This command owns the process and its stderr: with --diagnostics every
+    // shader compile and driver pipeline is written there as it begins and ends.
+    vork_slang::progress::events(diagnostics);
     let (rendered, out) = match command {
         Command::Render {
             scene: scene_path, outputs, out, exr_codec, png_depth, at, frame_start, frame_end,
             profile, set, no_write, gpu_only, diagnostics, ..
         } => {
+            let outputs = render_channels(outputs, &out)?;
             let stop = interrupt::install()?;
             let rendered = Shot {
                 stop,
                 scene: scene_path,
-                outputs: if outputs == ["all"] { Vec::new() } else { outputs.iter().map(|s| s.parse()).collect::<Result<Vec<Output>, _>>().map_err(|e| anyhow::anyhow!(e).context(vork_render::failure::FailureKind::Usage))? },
+                outputs,
                 out: out.clone(),
                 resolution: None,
                 profile: Some(vork_scene::Profile::load(profile.as_deref().unwrap_or(vork_scene::DEFAULT_PROFILE))
@@ -315,17 +361,24 @@ fn run() -> Result<()> {
         let line = exposure_line(&row["exposure"]);
         if exposures.len() == 1 { output!("{line}"); } else { output!("{}: {line}", row["output"].as_str().unwrap_or_default()); }
     }
-    if let Some(warnings) = report["warnings"].as_array().filter(|warnings| !warnings.is_empty()) {
+    // The marker warning already carries its count and location in one final line.
+    let warnings: Vec<_> = report["warnings"].as_array().into_iter().flatten()
+        .filter(|warning| warning["code"] != "nonfinite_samples").collect();
+    if !warnings.is_empty() {
         eprintln!("\nWARNING: {} RENDER WARNING(S): {}. Review the detailed warnings above and in render metadata before accepting this render.",
             warnings.len(), warnings.iter().filter_map(|warning| warning["code"].as_str()).collect::<Vec<_>>().join(", "));
     }
-    if let Some(line) = interruption_line(report, &out) { eprintln!("{line}"); }
-    // Shot::render has joined file writers, reaped input decoders, finished muxing, saved idle caches and
-    // written reports. Keep GPU owners alive: process exit discards unused variants
-    // and reclaims resources without driver teardown. Errors still unwind.
+    if let Some(line) = interruption_line(report, &out.iter().map(|d|d.file.clone()).collect::<Vec<_>>()) { eprintln!("{line}"); }
+    // Shot::render has joined file writers, reaped input decoders, finished muxing and written
+    // reports. Keep GPU owners alive: process exit finishes the pipeline-cache save the render asked
+    // for, discards unused variants and reclaims resources without driver teardown. Errors still unwind.
     std::io::stdout().flush().map_err(output::error)?;
     std::io::stderr().flush()?;
     rendered.exit_process()
+}
+
+fn parse_destination(value: &str) -> Result<vork_scene::v2::OutputDestination, String> {
+    value.parse()
 }
 
 fn interruption_line(report: &serde_json::Value, paths: &[PathBuf]) -> Option<String> {
@@ -342,7 +395,8 @@ fn setting(text: &str) -> Result<(String, serde_json::Value), String> {
     vork_scene::CallOverrides::parse(text).map_err(|error| error.to_string())
 }
 
-/// `exposure: 12% clipped, 3% near-black, mean 0.41`; a clip adds each worst frame.
+/// `exposure: 12% clipped, 3% near-black, mean 0.41`; a clip adds each worst frame. A picture no view made
+/// (a canvas of authored display colours) has no clipped share and the line leaves it out.
 fn exposure_line(e: &serde_json::Value) -> String {
     if e["coverage"].as_f64() == Some(0.) {
         return "exposure: undefined (no covered pixels)".into();
@@ -366,7 +420,8 @@ fn exposure_line(e: &serde_json::Value) -> String {
         text
     };
     let covered = if e["coverage"].as_f64().is_some_and(|a| a < 1.) { " of covered pixels" } else { "" };
-    format!("exposure: {}, {}, mean {:.2}{covered}", part("clipped", "clipped"), part("near_black", "near-black"), share("mean"))
+    let clipped = if e["clipped"].is_null() { String::new() } else { part("clipped", "clipped") + ", " };
+    format!("exposure: {clipped}{}, mean {:.2}{covered}", part("near_black", "near-black"), share("mean"))
 }
 
 fn help_text(document: &str) -> String {
@@ -398,7 +453,7 @@ fn topic_for_line(line: &str) -> Option<&'static str> {
     let area = line.split(['.', ':', ' ']).next()?;
     Some(match area {
         "scene" | "names" | "paths" | "structure" | "coordinates" => "contract",
-        "node" => "nodes",
+        "node" | "composition" | "paint" | "run" => "nodes",
         "camera" | "asset" => "cameras",
         "light" | "lights" => "lights",
         "material" | "normal" => "materials",
@@ -409,6 +464,7 @@ fn topic_for_line(line: &str) -> Option<&'static str> {
         "animation" => "animation",
         "settings" | "profile" => "profiles",
         "render" | "colour" => "render",
+        "output" => "outputs",
         "compositor" => "compositor",
         _ => return None,
     })
@@ -417,6 +473,15 @@ fn topic_for_line(line: &str) -> Option<&'static str> {
 mod help_tests {
     use super::*;
 
+    #[test]
+    fn destination_json_uses_fallible_parser_not_path_conversion() {
+        let descriptor=r#"{"file":"hdr.png","display":"Rec.2100-PQ"}"#;
+        let Command::Render {out,..}=Args::try_parse_from(["vork","render","s.json","--out",descriptor,"--out","sdr.png"]).unwrap().command else {panic!()};
+        assert_eq!(out[0].file,PathBuf::from("hdr.png"));
+        assert_eq!(out[0].display_target(),vork_scene::v2::OutputDisplay::Rec2100Pq);
+        assert_eq!(out[1].display_target(),vork_scene::v2::OutputDisplay::Srgb);
+        assert!(Args::try_parse_from(["vork","render","s.json","--out",r#"{"file":"x.png","display":"PQ"}"#]).is_err());
+    }
     #[test]
     fn benchmark_flags_require_diagnostics() {
         for flag in ["--no-write", "--gpu-only"] {
@@ -430,15 +495,28 @@ mod help_tests {
     #[test]
     fn channels_default_to_color_and_preserve_explicit_selections() {
         for (flags, expected) in [
-            (vec![], vec!["color".to_string()]),
-            (vec!["--channels", "all"], vec!["all".to_string()]),
-            (vec!["--channels", "color,aov:heat"], vec!["color".to_string(), "aov:heat".to_string()]),
+            (vec![], vec![Output::Color]),
+            (vec!["--channels", "all"], vec![]),
+            (vec!["--channels", "color,aov:heat"], vec![Output::Color, Output::Aov("heat".into())]),
         ] {
             let mut args = vec!["vork", "render", "scene.json", "--out", "still"];
             args.extend(flags);
-            let Command::Render { outputs, .. } = Args::try_parse_from(args).unwrap().command else { panic!() };
-            assert_eq!(outputs, expected);
+            let Command::Render { outputs, out, .. } = Args::try_parse_from(args).unwrap().command else { panic!() };
+            assert_eq!(render_channels(outputs, &out).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn wav_has_no_picture_channel_default() {
+        for flags in [vec![], vec!["--channels", "color"], vec!["--channels", "all"]] {
+            let mut args = vec!["vork", "render", "scene.json", "--out", "sound.wav"];
+            args.extend(&flags);
+            let Command::Render { outputs, out, .. } = Args::try_parse_from(args).unwrap().command else { panic!() };
+            let channels = render_channels(outputs, &out);
+            if flags.is_empty() { assert_eq!(channels.unwrap(), vec![]); }
+            else { assert!(channels.is_err()); }
+        }
+        assert_eq!(render_channels(vec![], &["frames.wav/".into()]).unwrap(), vec![Output::Color]);
     }
 
     #[test]
@@ -588,14 +666,6 @@ mod help_tests {
     }
 
     #[test]
-    fn hair_inputs_are_documented_by_the_std_program() {
-        assert!(!help::REFERENCE.lines().any(|line| line.starts_with("hair.")));
-        let help = include_str!("../../../libraries/std/HELP.txt");
-        assert!(help.contains("std/hair:"));
-        assert!(help.contains("vork help field std/hair"));
-    }
-
-    #[test]
     fn every_reference_line_has_a_focused_topic() {
         for line in help::REFERENCE
             .lines()
@@ -617,6 +687,8 @@ mod exposure_tests {
         assert_eq!(exposure_line(&e), "exposure: 0% clipped, 0% near-black, mean 0.50");
         e["coverage"] = serde_json::json!(0.1);
         assert_eq!(exposure_line(&e), "exposure: 0% clipped, 0% near-black, mean 0.50 of covered pixels");
+        e["clipped"] = serde_json::Value::Null;
+        assert_eq!(exposure_line(&e), "exposure: 0% near-black, mean 0.50 of covered pixels");
         e["coverage"] = serde_json::json!(0.);
         assert_eq!(exposure_line(&e), "exposure: undefined (no covered pixels)");
     }

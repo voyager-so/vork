@@ -1459,7 +1459,7 @@ impl Queue {
                     }
                     for tlas_build in &build.tlas_s_built {
                         let generation = *tlas_build.tlas.built_index.read();
-                        *tlas_build.tlas.submitted_refit.write() = tlas_build.refit.and_then(|(_, count)| generation.map(|generation| (generation, count)));
+                        *tlas_build.tlas.submitted_refit.write() = tlas_build.refit.and_then(|refit| generation.map(|generation| (generation, refit.count)));
                     }
                     for refit in &build.blas_refits {
                         let generation = refit.blas.built_index.read().unwrap();

@@ -522,7 +522,7 @@ impl crate::Device for Context {
     fn tlas_instance_layout(&self) -> Option<crate::TlasInstanceLayout> {
         // A finite mock descriptor for CPU-only resource construction. Nothing
         // on this backend executes or dereferences the native reference.
-        Some(crate::TlasInstanceLayout { stride: 64, transform: [0,1,2,3,4,5,6,7,8,9,10,11], custom_index: 12, mask: 12, mask_shift: 24 })
+        Some(crate::TlasInstanceLayout { stride: 64, transform: [0,1,2,3,4,5,6,7,8,9,10,11], custom_index: 12, mask: 12, mask_shift: 24, triangle_flags: 13, disable_triangle_culling: 1 << 24, force_non_opaque: 8 << 24 })
     }
 
     fn tlas_instance_to_bytes(&self, instance: TlasInstance) -> Vec<u8> {

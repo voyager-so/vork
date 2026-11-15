@@ -48,7 +48,44 @@ struct VertexIn {
     [[vk::location(14)]] float4 attr7 : ATTRIBUTE7;
 #endif
 #if VORK_ATTRIBUTES > 8
+#ifdef VORK_STAGE_SCALARS
+    // Metal accepts no array as a stage input (a vertex attribute or a fragment
+    // varying), so there the attributes after the eighth are separate members at
+    // the array's locations. Eleven reach Metal's last vertex attribute location.
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+1)]] float4 attr8 : ATTRIBUTE8;
+#if VORK_ATTRIBUTES > 9
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+2)]] float4 attr9 : ATTRIBUTE9;
+#endif
+#if VORK_ATTRIBUTES > 10
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+3)]] float4 attr10 : ATTRIBUTE10;
+#endif
+#if VORK_ATTRIBUTES > 11
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+4)]] float4 attr11 : ATTRIBUTE11;
+#endif
+#if VORK_ATTRIBUTES > 12
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+5)]] float4 attr12 : ATTRIBUTE12;
+#endif
+#if VORK_ATTRIBUTES > 13
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+6)]] float4 attr13 : ATTRIBUTE13;
+#endif
+#if VORK_ATTRIBUTES > 14
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+7)]] float4 attr14 : ATTRIBUTE14;
+#endif
+#if VORK_ATTRIBUTES > 15
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+8)]] float4 attr15 : ATTRIBUTE15;
+#endif
+#if VORK_ATTRIBUTES > 16
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+9)]] float4 attr16 : ATTRIBUTE16;
+#endif
+#if VORK_ATTRIBUTES > 17
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+10)]] float4 attr17 : ATTRIBUTE17;
+#endif
+#if VORK_ATTRIBUTES > 18
+    [[vk::location(REG_VISIBILITY_LENS_LOCATION+11)]] float4 attr18 : ATTRIBUTE18;
+#endif
+#else
     [[vk::location(REG_VISIBILITY_LENS_LOCATION+1)]] float4 attr_extra[VORK_ATTRIBUTES-8] : ATTRIBUTE_EXTRA;
+#endif
 #endif
 
 };
@@ -93,10 +130,181 @@ struct Varying {
     [[vk::location(15)]] float4 attr7 : VARYING_ATTRIBUTE7;
 #endif
 #if VORK_ATTRIBUTES > 8
+#ifdef VORK_STAGE_SCALARS
+    [[vk::location(16)]] float4 attr8 : VARYING_ATTRIBUTE8;
+#if VORK_ATTRIBUTES > 9
+    [[vk::location(17)]] float4 attr9 : VARYING_ATTRIBUTE9;
+#endif
+#if VORK_ATTRIBUTES > 10
+    [[vk::location(18)]] float4 attr10 : VARYING_ATTRIBUTE10;
+#endif
+#if VORK_ATTRIBUTES > 11
+    [[vk::location(19)]] float4 attr11 : VARYING_ATTRIBUTE11;
+#endif
+#if VORK_ATTRIBUTES > 12
+    [[vk::location(20)]] float4 attr12 : VARYING_ATTRIBUTE12;
+#endif
+#if VORK_ATTRIBUTES > 13
+    [[vk::location(21)]] float4 attr13 : VARYING_ATTRIBUTE13;
+#endif
+#if VORK_ATTRIBUTES > 14
+    [[vk::location(22)]] float4 attr14 : VARYING_ATTRIBUTE14;
+#endif
+#if VORK_ATTRIBUTES > 15
+    [[vk::location(23)]] float4 attr15 : VARYING_ATTRIBUTE15;
+#endif
+#if VORK_ATTRIBUTES > 16
+    [[vk::location(24)]] float4 attr16 : VARYING_ATTRIBUTE16;
+#endif
+#if VORK_ATTRIBUTES > 17
+    [[vk::location(25)]] float4 attr17 : VARYING_ATTRIBUTE17;
+#endif
+#if VORK_ATTRIBUTES > 18
+    [[vk::location(26)]] float4 attr18 : VARYING_ATTRIBUTE18;
+#endif
+#else
     [[vk::location(16)]] float4 attr_extra[VORK_ATTRIBUTES-8] : VARYING_ATTRIBUTE_EXTRA;
+#endif
 #endif
 
 };
+#if VORK_ATTRIBUTES > 8 && defined(VORK_STAGE_SCALARS)
+// The separate members by their index in the other targets' attr_extra array.
+float4 attribute_extra(VertexIn v, uint i) {
+    if(i==0u) return v.attr8;
+#if VORK_ATTRIBUTES > 9
+    if(i==1u) return v.attr9;
+#endif
+#if VORK_ATTRIBUTES > 10
+    if(i==2u) return v.attr10;
+#endif
+#if VORK_ATTRIBUTES > 11
+    if(i==3u) return v.attr11;
+#endif
+#if VORK_ATTRIBUTES > 12
+    if(i==4u) return v.attr12;
+#endif
+#if VORK_ATTRIBUTES > 13
+    if(i==5u) return v.attr13;
+#endif
+#if VORK_ATTRIBUTES > 14
+    if(i==6u) return v.attr14;
+#endif
+#if VORK_ATTRIBUTES > 15
+    if(i==7u) return v.attr15;
+#endif
+#if VORK_ATTRIBUTES > 16
+    if(i==8u) return v.attr16;
+#endif
+#if VORK_ATTRIBUTES > 17
+    if(i==9u) return v.attr17;
+#endif
+#if VORK_ATTRIBUTES > 18
+    if(i==10u) return v.attr18;
+#endif
+    return float4(0.);
+}
+void set_attribute_extra(inout VertexIn v, uint i, float4 value) {
+    if(i==0u) v.attr8=value;
+#if VORK_ATTRIBUTES > 9
+    if(i==1u) v.attr9=value;
+#endif
+#if VORK_ATTRIBUTES > 10
+    if(i==2u) v.attr10=value;
+#endif
+#if VORK_ATTRIBUTES > 11
+    if(i==3u) v.attr11=value;
+#endif
+#if VORK_ATTRIBUTES > 12
+    if(i==4u) v.attr12=value;
+#endif
+#if VORK_ATTRIBUTES > 13
+    if(i==5u) v.attr13=value;
+#endif
+#if VORK_ATTRIBUTES > 14
+    if(i==6u) v.attr14=value;
+#endif
+#if VORK_ATTRIBUTES > 15
+    if(i==7u) v.attr15=value;
+#endif
+#if VORK_ATTRIBUTES > 16
+    if(i==8u) v.attr16=value;
+#endif
+#if VORK_ATTRIBUTES > 17
+    if(i==9u) v.attr17=value;
+#endif
+#if VORK_ATTRIBUTES > 18
+    if(i==10u) v.attr18=value;
+#endif
+}
+float4 attribute_extra(Varying v, uint i) {
+    if(i==0u) return v.attr8;
+#if VORK_ATTRIBUTES > 9
+    if(i==1u) return v.attr9;
+#endif
+#if VORK_ATTRIBUTES > 10
+    if(i==2u) return v.attr10;
+#endif
+#if VORK_ATTRIBUTES > 11
+    if(i==3u) return v.attr11;
+#endif
+#if VORK_ATTRIBUTES > 12
+    if(i==4u) return v.attr12;
+#endif
+#if VORK_ATTRIBUTES > 13
+    if(i==5u) return v.attr13;
+#endif
+#if VORK_ATTRIBUTES > 14
+    if(i==6u) return v.attr14;
+#endif
+#if VORK_ATTRIBUTES > 15
+    if(i==7u) return v.attr15;
+#endif
+#if VORK_ATTRIBUTES > 16
+    if(i==8u) return v.attr16;
+#endif
+#if VORK_ATTRIBUTES > 17
+    if(i==9u) return v.attr17;
+#endif
+#if VORK_ATTRIBUTES > 18
+    if(i==10u) return v.attr18;
+#endif
+    return float4(0.);
+}
+void set_attribute_extra(inout Varying v, uint i, float4 value) {
+    if(i==0u) v.attr8=value;
+#if VORK_ATTRIBUTES > 9
+    if(i==1u) v.attr9=value;
+#endif
+#if VORK_ATTRIBUTES > 10
+    if(i==2u) v.attr10=value;
+#endif
+#if VORK_ATTRIBUTES > 11
+    if(i==3u) v.attr11=value;
+#endif
+#if VORK_ATTRIBUTES > 12
+    if(i==4u) v.attr12=value;
+#endif
+#if VORK_ATTRIBUTES > 13
+    if(i==5u) v.attr13=value;
+#endif
+#if VORK_ATTRIBUTES > 14
+    if(i==6u) v.attr14=value;
+#endif
+#if VORK_ATTRIBUTES > 15
+    if(i==7u) v.attr15=value;
+#endif
+#if VORK_ATTRIBUTES > 16
+    if(i==8u) v.attr16=value;
+#endif
+#if VORK_ATTRIBUTES > 17
+    if(i==9u) v.attr17=value;
+#endif
+#if VORK_ATTRIBUTES > 18
+    if(i==10u) v.attr18=value;
+#endif
+}
+#endif
 
 float4 world_position(uint object, float3 p) {return mul(float4(p,1.),object_model(object));}
 float4 clip_position(uint object, float3 p) {
@@ -155,7 +363,11 @@ Varying varying(VertexIn v, uint object, float4 position, float3 world) {
     o.attr7=v.attr7;
 #endif
 #if VORK_ATTRIBUTES > 8
+#ifdef VORK_STAGE_SCALARS
+    [unroll] for(uint i=0u;i<VORK_ATTRIBUTES-8;i++) set_attribute_extra(o,i,attribute_extra(v,i));
+#else
     [unroll] for(uint i=0u;i<VORK_ATTRIBUTES-8;i++) o.attr_extra[i]=v.attr_extra[i];
+#endif
 #endif
     return o;
 }

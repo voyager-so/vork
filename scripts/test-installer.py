@@ -12,7 +12,10 @@ import shutil
 import unittest
 import zipfile
 
+from test_support import write_executable
+
 INSTALLER = Path(__file__).resolve().parents[1] / 'install.sh'
+TAR_READS_XZ = os.name != 'nt' and 'liblzma' in subprocess.run(['tar', '--version'], capture_output=True, text=True).stdout
 PS_INSTALLER = INSTALLER.with_name('install.ps1')
 
 @unittest.skipIf(os.name == 'nt', 'POSIX installer')
@@ -144,7 +147,7 @@ class InstallerTests(unittest.TestCase):
         result = self.run_installer()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn('Could not download', result.stderr)
-        self.assertIn('absent/' + self.archive.name, result.stderr)
+        self.assertIn('absent/SHA256SUMS', result.stderr)
         self.assertTrue((self.root / 'prefix/lib/vork/NOTICE').exists())
 
     def test_default_prefix_adds_path_once_for_a_new_shell(self):
@@ -231,19 +234,90 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual(self.run_installer().returncode, 0)
         self.assertFalse((home / '.zshenv').exists())
 
+    def compact_fixture(self):
+        """A .tar.xz beside the .tar.gz, both in SHA256SUMS; its binary says which archive was installed."""
+        compact = self.archive.with_name(self.archive.name.removesuffix('.gz') + '.xz')
+        data = b'#!/bin/sh\necho fixture-xz "$@"\n'
+        with tarfile.open(compact, 'w:xz') as tar:
+            info = tarfile.TarInfo('vork'); info.size = len(data); info.mode = 0o755
+            tar.addfile(info, io.BytesIO(data))
+        (self.root / 'SHA256SUMS').write_text(''.join(
+            hashlib.sha256(path.read_bytes()).hexdigest() + '  ' + path.name + '\n' for path in (self.archive, compact)))
+        return compact
+
+    def path_without_xz(self, tar_reads_xz):
+        """PATH with every command but xz. `tar_reads_xz` False also makes tar report no xz support of its own."""
+        tools = self.root / 'tools'; tools.mkdir()
+        for folder in os.environ['PATH'].split(os.pathsep):
+            for entry in (sorted(Path(folder).iterdir()) if Path(folder).is_dir() else []):
+                if entry.name != 'xz' and not (tools / entry.name).exists() and not (tools / entry.name).is_symlink():
+                    (tools / entry.name).symlink_to(entry)
+        if not tar_reads_xz:
+            (tools / 'tar').unlink()
+            write_executable(tools / 'tar', '#!/bin/sh\nif [ "$1" = --version ]; then echo "tar (fixture)"; exit 0; fi\nexec "' + shutil.which('tar') + '" "$@"\n')
+        self.env['PATH'] = str(tools)
+
+    @unittest.skipUnless(shutil.which('xz'), 'needs the xz program')
+    def test_xz_program_installs_the_tar_xz(self):
+        self.compact_fixture()
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('fixture-xz setup', result.stdout)
+        dry = self.run_installer('--dry-run')
+        self.assertIn(self.archive.name.removesuffix('.gz') + '.xz', dry.stdout)
+
+    @unittest.skipUnless(TAR_READS_XZ, 'needs a tar with its own xz support (bsdtar with liblzma)')
+    def test_tar_with_xz_support_installs_the_tar_xz_without_the_xz_program(self):
+        self.compact_fixture()
+        self.path_without_xz(tar_reads_xz=True)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('fixture-xz setup', result.stdout)
+
+    def test_without_xz_the_tar_gz_is_installed(self):
+        self.compact_fixture()
+        self.path_without_xz(tar_reads_xz=False)
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('fixture setup', result.stdout)
+        self.assertNotIn('fixture-xz', result.stdout)
+        dry = self.run_installer('--dry-run')
+        self.assertIn(self.archive.name, dry.stdout)
+        self.assertNotIn('.tar.xz', dry.stdout)
+
+    @unittest.skipUnless(shutil.which('xz') or TAR_READS_XZ, 'needs xz support')
+    def test_tar_xz_checksum_is_verified(self):
+        compact = self.compact_fixture()
+        compact.write_bytes(compact.read_bytes() + b'corruption')
+        result = self.run_installer()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn('Checksum mismatch for ' + compact.name, result.stderr)
+        self.assertFalse((self.root / 'prefix/bin/vork').exists())
+
+    @unittest.skipUnless(shutil.which('xz') or TAR_READS_XZ, 'needs xz support')
+    def test_bundled_tar_xz_is_preferred(self):
+        self.compact_fixture()
+        result = self.bundled_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('Using bundled archive:', result.stdout)
+        self.assertIn('fixture-xz setup', result.stdout)
+
     def test_macos_floor_is_checked_before_download(self):
         tools = self.root / 'tools'; tools.mkdir()
         for name, content in [('uname', '#!/bin/sh\ncase "$1" in -s) echo Darwin;; -m) echo arm64;; esac\n'),
                               ('sw_vers', '#!/bin/sh\necho "$TEST_MACOS_VERSION"\n')]:
-            path = tools / name; path.write_text(content); path.chmod(0o755)
+            path = tools / name; write_executable(path, content)
         self.env['PATH'] = str(tools) + os.pathsep + os.environ['PATH']
-        for version in ['15.7', '25.9', 'unknown', '']:
+        # The installer is a standalone download, so it spells the floor itself; dist/macos-minimum.txt owns it.
+        major, minor = map(int, INSTALLER.with_name('dist').joinpath('macos-minimum.txt').read_text().strip().split('.'))
+        self.assertEqual(minor, 0, 'install.sh compares the major version only')
+        for version in [f'{major - 1}.7', '11.0', 'unknown', '']:
             self.env['TEST_MACOS_VERSION'] = version
             result = self.run_installer('--dry-run')
             self.assertNotEqual(result.returncode, 0)
-            self.assertIn('bundled Slang', result.stderr)
+            self.assertIn(f'macOS {major}+', result.stderr)
             self.assertIn('Nothing was downloaded', result.stderr)
-        for version in ['26.0', '26.1', '27.0']:
+        for version in [f'{major}.0', f'{major}.7', '26.0', '26.1', '27.0']:
             self.env['TEST_MACOS_VERSION'] = version
             self.assertEqual(self.run_installer('--dry-run').returncode, 0)
         self.assertFalse((self.root / 'prefix').exists())
@@ -254,8 +328,7 @@ class InstallerTests(unittest.TestCase):
         tools = self.root / 'tools'; tools.mkdir()
         real_tar = shutil.which('tar')
         fake = tools / 'tar'
-        fake.write_text('#!/bin/sh\nif [ "$1" = -xzf ]; then i=0; while [ "$i" -lt 2000 ]; do echo "tar: No space left on device" >&2; i=$((i+1)); done; exit 2; fi\nexec "' + real_tar + '" "$@"\n')
-        fake.chmod(0o755)
+        write_executable(fake, '#!/bin/sh\nif [ "$1" = -xzf ]; then i=0; while [ "$i" -lt 2000 ]; do echo "tar: No space left on device" >&2; i=$((i+1)); done; exit 2; fi\nexec "' + real_tar + '" "$@"\n')
         self.env['PATH'] = str(tools) + os.pathsep + os.environ['PATH']
         result = self.run_installer()
         self.assertNotEqual(result.returncode, 0)
@@ -270,8 +343,7 @@ class InstallerTests(unittest.TestCase):
         tools = self.root / 'tools'; tools.mkdir()
         real_mv = shutil.which('mv')
         fake = tools / 'mv'
-        fake.write_text('#!/bin/sh\ncase "$1" in */.vork-new.*) echo "injected rename failure" >&2; exit 1;; esac\nexec "' + real_mv + '" "$@"\n')
-        fake.chmod(0o755)
+        write_executable(fake, '#!/bin/sh\ncase "$1" in */.vork-new.*) echo "injected rename failure" >&2; exit 1;; esac\nexec "' + real_mv + '" "$@"\n')
         self.env['PATH'] = str(tools) + os.pathsep + os.environ['PATH']
         result = self.run_installer()
         self.assertNotEqual(result.returncode, 0)

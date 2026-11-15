@@ -9,6 +9,17 @@ public float specular_alpha(float roughness) {
 public float specular_roughness(float roughness) {
     return sqrt(specular_alpha(roughness));
 }
+// OpenPBR 1.1.1, modulated_ior: weight scales normal reflectivity by
+// changing the signed IOR contrast, including interfaces viewed from below.
+public float modulated_ior(float eta,float weight) {
+    if(weight==1. || eta==1.) return eta;
+    let contrast=(eta-1.)/(eta+1.);
+    // The next float below one keeps the reconstructed IOR finite at the
+    // unit-reflectivity endpoint, within the precision of float Fresnel.
+    let limit=asfloat(0x3f7fffffu);
+    let epsilon=clamp(sqrt(max(weight,0.))*contrast,-limit,limit);
+    return (1.+epsilon)/(1.-epsilon);
+}
 public float fresnel(float c, float eta) {
     c=clamp(c,0.,1.);
     if (eta==1.) {return 0.;}
@@ -22,15 +33,19 @@ public float3 metal_edge_correction(float3 f0, float3 tint) {
     let mu=1./7.;let edge=f0+(float3(1.)-f0)*pow(1.-mu,5.);
     return edge*(float3(1.)-tint)/(mu*pow(1.-mu,6.));
 }
-public float3 reflection_fresnel(float3 base_color, float base_weight, float metalness,
+public float3 reflection_fresnel_at_ior(float3 base_color, float base_weight, float metalness,
     float specular_weight, float3 specular_color, float cosine, float eta) {
     // Unit-vector dot products can round outside the physical cosine domain.
     cosine=clamp(cosine,0.,1.);
     let dielectric=float3(fresnel(cosine,eta))*specular_color;
-    if (metalness<=0.) {return specular_weight*dielectric;}
+    if (metalness<=0.) {return dielectric;}
     let f0=base_weight*base_color;let f=pow(1.-cosine,5.);
     let metal=max(f0+(float3(1.)-f0)*f-metal_edge_correction(f0,specular_color)*cosine*pow(1.-cosine,6.),float3(0.));
-    return specular_weight*lerp(dielectric,metal,metalness);
+    return lerp(dielectric,specular_weight*metal,metalness);
+}
+public float3 reflection_fresnel(float3 base_color, float base_weight, float metalness,
+    float specular_weight, float3 specular_color, float cosine, float eta) {
+    return reflection_fresnel_at_ior(base_color,base_weight,metalness,specular_weight,specular_color,cosine,modulated_ior(eta,specular_weight));
 }
 // Albedo scaling reserves the integrated reflection, not Fresnel at an
 // individual half-vector. This is the nonreciprocal OpenPBR layering rule.

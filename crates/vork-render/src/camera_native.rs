@@ -17,8 +17,8 @@ pub const CONFIG_BINDING:u32=11;
 #[allow(dead_code)] // Used by build_slang.rs.
 pub fn defines(rays:bool)->Vec<String> {
     let mut defines=vec!["VORK_NO_IMPLICIT".to_owned(),"VORK_CAMERA_SPLIT".to_owned(),"VORK_ATTRIBUTES=8".into(),
-        "VORK_PROBES".into(),"VORK_PROBE_BINDING=9".into(),"VORK_PROBE_IRRADIANCE_REGISTER=t15".into(),
-        "VORK_PROBE_VISIBILITY_REGISTER=t16".into(),"VORK_PROBE_GRID_REGISTER=u17".into(),
+        "VORK_PROBES".into(),"VORK_PROBE_BINDING=9".into(),"VORK_PROBE_IRRADIANCE_REGISTER=t16".into(),
+        "VORK_PROBE_VISIBILITY_REGISTER=t17".into(),"VORK_PROBE_GRID_REGISTER=u18".into(),
         "VORK_FIBRE".into(),"VORK_FIBRE_BINDING=4".into()];
     if rays {defines.extend(["VORK_RAY_BINDINGS".into(),"VORK_RAY_REFRACTION".into()]);}
     defines
@@ -66,7 +66,7 @@ pub fn config_source()->String {
     macro_rules! declare {
         ($($field:ident:$rust:ty=>$slang:ident),*) => {concat!("public struct CameraConfig {", $("public ",stringify!($slang)," ",stringify!($field),";",)* "};\n")};
     }
-    format!("{}[[vk::binding({binding},4)]] public ConstantBuffer<CameraConfig> camera_config : register(b26);\n",camera_config_fields!(declare))
+    format!("{}[[vk::binding({binding},4)]] public ConstantBuffer<CameraConfig> camera_config : register(b27);\n",camera_config_fields!(declare))
 }
 pub struct BufferTable {
     pub name:&'static str,
@@ -76,7 +76,7 @@ pub struct BufferTable {
     pub resources:&'static [&'static str],
 }
 pub const TABLES:[BufferTable;3]=[
-    BufferTable {name:"camera_read_words",element:"uint",read_only:true,binding:2,resources:&["slots","draw_table","object_draws"]},
+    BufferTable {name:"camera_read_words",element:"uint",read_only:true,binding:2,resources:&["slots","draw_table","object_draws","environment_images"]},
     BufferTable {name:"camera_write_words",element:"uint",read_only:false,binding:3,resources:&["reflection_guides","subsurface_records","evaluation_metadata","evaluation_bins","evaluation_allocator"]},
     BufferTable {name:"camera_write_vectors",element:"float4",read_only:false,binding:4,resources:&["aov_values","refraction_receivers"]},
 ];
@@ -88,7 +88,7 @@ pub fn evaluation_source(source:&str)->String {
         let (name,binding,names)=(table.name,table.binding,table.resources);
         let ty=format!("{}StructuredBuffer<{}>",if table.read_only {""} else {"RW"},table.element);
         let count=names.len();
-        let register=18+binding;
+        let register=19+binding;
         writeln!(declarations,"#ifdef VORK_METAL\nstruct {name}Table {{{ty} buffers[{count}];}};\n[[vk::binding({binding},3)]] ParameterBlock<{name}Table> {name} : register(b{register});\n#else\n[[vk::binding({binding},3)]] {ty} {name}[{count}];\n#endif").unwrap();
         for (index,resource) in names.iter().enumerate() {
             writeln!(declarations,"#ifdef VORK_METAL\n#define {resource} {name}.buffers[{index}]\n#else\n#define {resource} {name}[{index}]\n#endif").unwrap();
@@ -97,7 +97,7 @@ pub fn evaluation_source(source:&str)->String {
     declarations.push_str(r#"
 #ifdef VORK_METAL
 struct CameraReflectionFields {RWStructuredBuffer<uint> buffers[REG_VISIBILITY_REFLECTION_WORDS];};
-[[vk::binding(5,3)]] ParameterBlock<CameraReflectionFields> camera_reflections : register(b23);
+[[vk::binding(5,3)]] ParameterBlock<CameraReflectionFields> camera_reflections : register(b24);
 #define reflection_records camera_reflections.buffers
 #else
 [[vk::binding(5,3)]] RWStructuredBuffer<uint> camera_reflections[REG_VISIBILITY_REFLECTION_WORDS];
@@ -106,7 +106,7 @@ struct CameraReflectionFields {RWStructuredBuffer<uint> buffers[REG_VISIBILITY_R
 "#);
     source=format!("{declarations}\n{source}");
     let mut code=String::new();
-    writeln!(code,"#ifdef VORK_METAL\nstruct CameraEvaluationPages {{RWStructuredBuffer<float4> buffers[];}};\n[[vk::binding(1,3)]] ParameterBlock<CameraEvaluationPages> evaluation_pages : register(b19);\n#else\n[[vk::binding(1,3)]] RWStructuredBuffer<float4> evaluation_pages[] : register(u12);\n#endif").unwrap();
+    writeln!(code,"#ifdef VORK_METAL\nstruct CameraEvaluationPages {{RWStructuredBuffer<float4> buffers[];}};\n[[vk::binding(1,3)]] ParameterBlock<CameraEvaluationPages> evaluation_pages : register(b20);\n#else\n[[vk::binding(1,3)]] RWStructuredBuffer<float4> evaluation_pages[] : register(u12);\n#endif").unwrap();
     code.push_str(r#"
 float4 evaluation_load(uint page,uint at) {
 #ifdef VORK_METAL
@@ -128,22 +128,24 @@ void evaluation_store(uint page,uint at,float4 value) {
         writeln!(code,"{result} evaluation_{name}<V:IVariant>(uint index{arg}) {{uint page=index/camera_config.capacity;uint at=(index%camera_config.capacity)*camera_config.words;\n").unwrap();
         if !write {code.push_str("EvaluatedSlot e=(EvaluatedSlot)0;\n");}
 
-            let fields=[("response.color","e.response.roughness"),("response.baseline.diffuse","e.ray_distance"),("response.reflected","0."),("response.diffuse","0."),("response.normal","0."),("world","e.barycentrics.x"),("geometric","e.barycentrics.y"),("alpha.xyz","e.alpha.w"),("diffusion.light","0."),("diffusion.ambient","0."),("diffusion.radius","0."),("diffusion.albedo","0."),("diffusion.light_albedo","0."),("diffusion.ambient_albedo","0.")];
+            let fields=[("response.color","e.response.roughness"),("response.baseline.diffuse","e.ray_distance"),("response.reflected","e.response.reflection.data[11].x"),("response.diffuse","0."),("response.normal","V.has_reflections ? e.response.reflection.data[11].y : 0."),("world","e.barycentrics.x"),("geometric","e.barycentrics.y"),("alpha.xyz","e.alpha.w"),("diffusion.light","0."),("diffusion.ambient","0."),("diffusion.radius","0."),("diffusion.albedo","0."),("diffusion.light_albedo","0."),("diffusion.ambient_albedo","0.")];
             for (i,(field,w)) in fields.iter().enumerate() {
                 if i==8 {code.push_str("if(VORK_CAMERA_DIFFUSION!=0u) {\n");}
-                let gate=match i {2=>Some("V.has_reflections"),3=>Some("V.has_indirect_controls"),4=>Some("V.has_camera_receivers"),5|6=>Some("V.has_camera_receivers || V.subsurface || camera_config.diffusion!=0u"),7=>Some("VORK_CAMERA_TRANSPARENT!=0"),_=>None};
+                let gate=match i {2=>Some("V.has_reflections"),3=>Some("V.has_indirect_controls"),4=>Some("V.has_camera_receivers || V.has_reflections"),5|6=>Some("V.has_camera_receivers || V.subsurface || camera_config.diffusion!=0u"),7=>Some("VORK_CAMERA_TRANSPARENT!=0"),_=>None};
                 if let Some(gate)=gate {writeln!(code,"if({gate}) {{").unwrap();}
                 if write {writeln!(code,"evaluation_store(page,at+{i}u,float4(e.{field},{w}));").unwrap();}
                 else {
                     writeln!(code,"let v{i}=evaluation_load(page,at+{i}u);e.{field}=v{i}.xyz;").unwrap();
-                    match i {0=>writeln!(code,"e.response.roughness=v{i}.w;"),1=>writeln!(code,"e.ray_distance=v{i}.w;"),5=>writeln!(code,"e.barycentrics.x=v{i}.w;"),6=>writeln!(code,"e.barycentrics.y=v{i}.w;"),7=>writeln!(code,"e.alpha.w=v{i}.w;"),_=>Ok(())}.unwrap();
+                    match i {0=>writeln!(code,"e.response.roughness=v{i}.w;"),1=>writeln!(code,"e.ray_distance=v{i}.w;"),2=>writeln!(code,"e.response.reflection.data[11].x=v{i}.w;"),4=>writeln!(code,"if(V.has_reflections) {{e.response.reflection.data[11].y=v{i}.w;}}"),5=>writeln!(code,"e.barycentrics.x=v{i}.w;"),6=>writeln!(code,"e.barycentrics.y=v{i}.w;"),7=>writeln!(code,"e.alpha.w=v{i}.w;"),_=>Ok(())}.unwrap();
                 }
                 if gate.is_some() {code.push_str("}\n");}
             }
             code.push_str("}\n");
-            code.push_str("if(V.has_reflections) {for(uint i=0u;i<REG_REFLECTION_BSDF_VECTORS;i++) {let offset=8u+VORK_CAMERA_DIFFUSION*6u+VORK_CAMERA_AOVS+i;\n");
-            if write {code.push_str("evaluation_store(page,at+offset,e.response.reflection.data[i]);\n");} else {code.push_str("e.response.reflection.data[i]=evaluation_load(page,at+offset);\n");}
-            code.push_str("}}\n");
+            code.push_str("if(V.has_reflections) {for(uint i=0u;i<REG_REFLECTION_EVALUATION_VECTORS;i++) {let offset=8u+VORK_CAMERA_DIFFUSION*6u+VORK_CAMERA_AOVS+i;\n");
+            if write {code.push_str("var value=e.response.reflection.data[i];if(i==9u) {value.w=e.response.reflection.data[11].z;}if(i==10u) {value.w=e.response.reflection.data[11].w;}evaluation_store(page,at+offset,value);\n");} else {code.push_str("e.response.reflection.data[i]=evaluation_load(page,at+offset);\n");}
+            code.push_str("}\n");
+            if !write {code.push_str("e.response.reflection.data[11].zw=float2(e.response.reflection.data[9].w,e.response.reflection.data[10].w);e.response.reflection.data[9].w=0.;e.response.reflection.data[10].w=0.;\n");}
+            code.push_str("}\n");
             writeln!(code,"if(VORK_AOV_CHANNELS!=0u) for(uint a=0u;a<VORK_CAMERA_AOVS;a++) {{let offset=8u+VORK_CAMERA_DIFFUSION*6u+a;").unwrap();
             if write {writeln!(code,"evaluation_store(page,at+offset,e.aovs[a]);").unwrap();} else {writeln!(code,"e.aovs[a]=evaluation_load(page,at+offset);").unwrap();}
             code.push_str("}\n");

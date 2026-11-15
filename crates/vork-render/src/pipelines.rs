@@ -87,13 +87,62 @@ pub(crate) struct Compiler {
     pub(crate) hit_selections: std::sync::Arc<Mutex<Vec<(ProgramKernel, ProgramKernel)>>>,
     device: wgpu::Device,
     cache: Option<wgpu::PipelineCache>,
-    /// Wall time per driver pipeline creation call; concurrent times overlap.
+    /// Wall time per driver pipeline creation call; concurrent times overlap. On Metal a call
+    /// includes its wait for the process's compile admission (wgpu-hal metal/compile_admission.rs).
     pub(crate) timings: std::sync::Arc<Mutex<std::collections::BTreeMap<String, f64>>>,
     known: std::sync::Arc<Mutex<Known>>,
     pending: std::sync::Arc<(Mutex<Pending>, std::sync::Condvar)>,
     schedule: std::sync::Arc<(Mutex<Schedule>, std::sync::Condvar)>,
     /// Driver creations so far; unchanged since the last save means nothing to persist.
     created: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    persistence: std::sync::Arc<Persistence>,
+}
+/// How many pipelines the device's driver cache has gained, where the backend counts them. A
+/// creation through the cache is a hit or an addition, and only an addition changes what a
+/// serialization would write. Metal counts the additions to a device's binary archives, and a
+/// device here has the one pipeline cache; Vulkan does not say, so there every save after a
+/// creation serializes and compares the bytes.
+fn cache_additions(device: &wgpu::Device) -> Option<usize> {
+    #[cfg(target_os = "macos")]
+    // SAFETY: only reads a counter of the backend device.
+    if let Some(metal) = unsafe { device.as_hal::<wgpu::hal::api::Metal>() } {
+        return Some(metal.archive_additions());
+    }
+    let _ = device;
+    None
+}
+/// Where a compiler's finished driver work is saved in the disk store.
+#[derive(Clone)]
+pub(crate) struct Blob {
+    /// The driver's pipeline-cache entry.
+    pub(crate) path: std::path::PathBuf,
+    /// Without a persistent pipeline cache: the entry recording that this process's driver work reached
+    /// the system shader cache.
+    pub(crate) marker: Option<std::path::PathBuf>,
+    /// Content of the entry the pipeline cache was loaded from: unchanged bytes are not rewritten.
+    pub(crate) loaded: Option<blake3::Hash>,
+    /// False for CPU-only release preparation, which cannot warm a driver's cache or its ledger.
+    pub(crate) save: bool,
+}
+impl Blob {
+    /// A compiler without a driver cache saves only its ledger.
+    #[cfg(test)]
+    pub(crate) fn ledger_only() -> Self {
+        Self { path: Default::default(), marker: None, loaded: None, save: true }
+    }
+}
+/// What of a compiler's driver work is on disk; one state for all its clones.
+struct Persistence {
+    blob: Blob,
+    /// Driver creations counted at the last save, and the blob content on disk. Held for a whole
+    /// save, so saves never interleave.
+    saved: Mutex<(usize, Option<blake3::Hash>)>,
+    /// The driver cache's additions (`cache_additions`) covered by the last serialization.
+    /// Written only while `saved` is held.
+    serialized_additions: std::sync::atomic::AtomicUsize,
+    /// A background save waits for the cache persistence worker. Set until that save holds `saved`,
+    /// so a save asked for is never neither queued nor running.
+    queued: std::sync::atomic::AtomicBool,
 }
 /// Background variant workers still compiling, and the first one that failed.
 #[derive(Default)]
@@ -141,7 +190,15 @@ impl Compiler {
         device: &wgpu::Device,
         cache: Option<&wgpu::PipelineCache>,
         known: Known,
+        blob: Blob,
     ) -> Self {
+        let persistence = std::sync::Arc::new(Persistence {
+            saved: Mutex::new((0, blob.loaded)),
+            blob,
+            // The loaded blob is the cache as it stands: only additions from here on are new.
+            serialized_additions: cache_additions(device).unwrap_or(0).into(),
+            queued: Default::default(),
+        });
         Self {
             #[cfg(test)]
             hit_selections: Default::default(),
@@ -152,6 +209,7 @@ impl Compiler {
             pending: Default::default(),
             schedule: Default::default(),
             created: Default::default(),
+            persistence,
         }
     }
     pub(crate) fn created(&self) -> usize {
@@ -176,15 +234,133 @@ impl Compiler {
     pub(crate) fn is_idle(&self) -> bool {
         self.pending.0.lock().unwrap().workers == 0
     }
-    /// Extract a cache only between driver creations. Holding admission closed
-    /// prevents a deferred worker entering the driver during the snapshot; workers
-    /// still compiling Slang need not finish. Never wait for an active creation.
-    pub(crate) fn when_idle<T>(&self, save: impl FnOnce() -> T) -> Option<T> {
-        let state = self.schedule.0.try_lock().ok()?;
-        if state.active != 0 {
-            return None;
+    /// Save the driver's pipeline cache and the known-key ledger to the disk store, on the calling
+    /// thread. Setup, a dropped library renderer and `settle_pipelines` need the cache on disk
+    /// before they return; renders never do, and call `save_soon`.
+    ///
+    /// Saving takes no creation permit and waits for none: the driver's cache object is safe to read
+    /// while pipelines are created through it (Vulkan synchronizes it internally; the Metal binary
+    /// archive is locked around additions and serialization, and an addition that meets a
+    /// serialization is deferred instead of waiting). A pipeline that finishes during the save is
+    /// in the next one.
+    pub(crate) fn save(&self) -> Result<()> {
+        let persistence = &*self.persistence;
+        if !persistence.blob.save {
+            return Ok(());
         }
-        Some(save())
+        // Serialize snapshot and publication together so an older save cannot
+        // overwrite a newer ledger or acknowledge its dirty state.
+        let mut saved = persistence.saved.lock().unwrap();
+        self.save_holding(&mut saved)
+    }
+    fn save_holding(&self, saved: &mut (usize, Option<blake3::Hash>)) -> Result<()> {
+        let persistence = &*self.persistence;
+        // Snapshot the keys before the blob: a variant finishing during serialization must not
+        // be recorded as warm unless its binary is in the saved blob.
+        let known = self.known_snapshot();
+        let created = self.created();
+        // Serialize only after new driver work, and rewrite only changed bytes: a
+        // warm process (all cache hits) leaves the blob untouched.
+        if created != saved.0 {
+            if let Some(marker) = &persistence.blob.marker {
+                if !self.publish("shader-warm", marker, b"warm")? {
+                    return Ok(());
+                }
+            }
+            // Read before serializing: the serialization writes every addition this count includes
+            // (`metal::Device::archive_additions`), and one made during it is new again next time.
+            let gained = cache_additions(&self.device);
+            let unchanged = gained.is_some_and(|gained| gained == persistence.serialized_additions.load(std::sync::atomic::Ordering::Acquire));
+            // Every creation since the last serialization was a hit: the cache on disk is the cache.
+            if let (Some(cache), false) = (&self.cache, unchanged) {
+                let step = crate::timing::begin_cache_save(&self.device, "serialize", "pipeline");
+                let data = cache.get_data();
+                step.finish(data.as_ref().map_or(0, Vec::len), data.is_some());
+                let Some(data) = data else { return Ok(()); };
+                let hash = blake3::hash(&data);
+                if saved.1 != Some(hash) {
+                    if !self.publish("pipeline", &persistence.blob.path, &data)? {
+                        return Ok(());
+                    }
+                    saved.1 = Some(hash);
+                }
+                if let Some(gained) = gained {
+                    persistence.serialized_additions.store(gained, std::sync::atomic::Ordering::Release);
+                }
+            }
+            saved.0 = created;
+        }
+        if let Some(known) = known {
+            let (step, bytes) = (crate::timing::begin_cache_save(&self.device, "publish", "pipeline-keys"), known.keys.len() * 32);
+            let written = self.save_known(known);
+            step.finish(bytes, matches!(written, Ok(true)));
+            written?;
+        }
+        Ok(())
+    }
+    /// Write one entry of a save; false when the store's budget refused it.
+    fn publish(&self, entry: &'static str, path: &std::path::Path, payload: &[u8]) -> Result<bool> {
+        let step = crate::timing::begin_cache_save(&self.device, "publish", entry);
+        let written = crate::disk_cache::write_entry(path, payload);
+        step.finish(payload.len(), matches!(written, Ok(true)));
+        Ok(written?)
+    }
+    /// Save in the background, on the cache persistence worker: the caller never waits for the
+    /// driver's serialization or for the filesystem. Requests coalesce, and one made when no driver
+    /// work is new does nothing. Ask when the pipelines a piece of work needs all exist: every request
+    /// after an addition serializes the whole cache again, 0.02 to 0.1 s on Metal. A process that ends mid-save leaves the previous entries, which stay
+    /// valid: entries are published by atomic rename, and the next writer removes an abandoned
+    /// temporary file. A failed save is retried by the next request, as its dirty state is kept.
+    pub(crate) fn save_soon(&self) {
+        let persistence = &*self.persistence;
+        if !persistence.blob.save {
+            return;
+        }
+        // A save in flight holds `saved`: work finished since it began needs the save queued behind it.
+        if let Ok(saved) = persistence.saved.try_lock() {
+            if saved.0 == self.created() && !self.known.lock().unwrap().added {
+                return;
+            }
+        }
+        if persistence.queued.swap(true, std::sync::atomic::Ordering::AcqRel) {
+            return;
+        }
+        let compiler = self.clone();
+        crate::disk_cache::persist(move || {
+            let persistence = &*compiler.persistence;
+            if !persistence.blob.save {
+                return;
+            }
+            // Queued until this save holds `saved`: a request is always visible as one or the other
+            // (`save_pending`), and one made from here on queues the save after this one.
+            let mut saved = persistence.saved.lock().unwrap();
+            persistence.queued.store(false, std::sync::atomic::Ordering::Release);
+            // Cache availability never controls rendering; the save's receipts say what was written.
+            let _ = compiler.save_holding(&mut saved);
+        });
+    }
+    /// Leave on disk whatever this compiler has finished, on the calling thread: wait for a save
+    /// that is running, then save what is still new. That includes a background variant that
+    /// finished after the last request; one still compiling is not waited for. A process about to
+    /// exit calls this once its output is delivered. Nothing new, nothing is done.
+    pub(crate) fn finish_save(&self) {
+        // Cache availability never controls the exit status.
+        let _ = self.save();
+    }
+    /// Whether a background save is queued or running.
+    pub(crate) fn save_pending(&self) -> bool {
+        self.persistence.queued.load(std::sync::atomic::Ordering::Acquire) || self.persistence.saved.try_lock().is_err()
+    }
+    /// Driver creations counted at the last save and the blob content on disk, once any save in
+    /// flight has finished.
+    pub(crate) fn saved(&self) -> (usize, Option<blake3::Hash>) {
+        *self.persistence.saved.lock().unwrap()
+    }
+    /// This compiler's place in the store, with what is on disk now: a replacement compiler on the
+    /// same device keeps saving there.
+    #[cfg(test)]
+    pub(crate) fn blob(&self) -> Blob {
+        Blob { loaded: self.saved().1, ..self.persistence.blob.clone() }
     }
     /// Block until every background variant has finished; a failed worker is an error.
     pub(crate) fn settle(&self) -> Result<()> {
@@ -199,6 +375,11 @@ impl Compiler {
     /// or panic still retires the worker (its drawn key keeps the superset fallback),
     /// so settling reports it instead of waiting forever.
     pub(crate) fn spawn_variant(&self, mode: VariantCompile, build: impl FnOnce() -> Result<()> + Send + 'static) {
+        self.spawn_worker(mode, true, build)
+    }
+    /// One background compilation, counted until it retires. `after_foreground`
+    /// holds it back until foreground preparation has finished.
+    fn spawn_worker(&self, mode: VariantCompile, after_foreground: bool, build: impl FnOnce() -> Result<()> + Send + 'static) {
         self.pending.0.lock().unwrap().workers += 1;
         let c = self.clone();
         std::thread::spawn(move || {
@@ -207,7 +388,7 @@ impl Compiler {
                 let _open = signal.wait_while(open.lock().unwrap(), |open| !*open);
             }
             let failure = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                drop(c.permit(true));
+                if after_foreground { drop(c.permit(true)); }
                 build()
             })) {
                 Ok(Ok(())) => None,
@@ -234,16 +415,22 @@ impl Compiler {
     pub(crate) fn render(&self, descriptor: &wgpu::RenderPipelineDescriptor<'_>) -> wgpu::RenderPipeline {
         let _permit = self.permit(false);
         let start = std::time::Instant::now();
-        let _progress = vork_slang::progress::Job::start(true);
+        let _progress = vork_slang::progress::Job::start(true).named(descriptor.label.unwrap_or("pipeline"));
         let pipeline = crate::gpu_memory::render_pipeline(&self.device, descriptor);
         self.created.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.time(descriptor.label, start);
         pipeline
     }
     pub(crate) fn compute(&self, descriptor: &wgpu::ComputePipelineDescriptor<'_>) -> wgpu::ComputePipeline {
-        let _permit = self.permit(false);
+        self.compute_admitted(descriptor, false)
+    }
+    /// One compute pipeline creation, admitted as foreground work or as
+    /// background work: the latter enters the driver only while no foreground
+    /// preparation and no critical-path work is in flight.
+    fn compute_admitted(&self, descriptor: &wgpu::ComputePipelineDescriptor<'_>, background: bool) -> wgpu::ComputePipeline {
+        let _permit = self.permit(background);
         let start = std::time::Instant::now();
-        let _progress = vork_slang::progress::Job::start(true);
+        let _progress = vork_slang::progress::Job::start(true).named(descriptor.label.unwrap_or("pipeline"));
         let pipeline = crate::gpu_memory::compute_pipeline(&self.device, descriptor);
         self.created.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
         self.time(descriptor.label, start);
@@ -254,6 +441,14 @@ impl Compiler {
         if let (true,Some(pipeline))=(mode.fallback(),&fallback) {return Ok(Drawn::inline(pipeline.clone()));}
         let deferred=fallback.is_some();
         self.publish_variant(mode,slot,fallback,deferred,build)
+    }
+    /// Install a kernel behind the prebuilt engine. Longer renders can promote
+    /// it at an exposure boundary; delivery never waits for optional compilation.
+    /// Completed pipelines are saved normally; explicit settling joins workers.
+    pub(crate) fn install_behind_engine<P:Clone+Send+Sync+'static>(&self,mode:&VariantCompile,slot:std::sync::Arc<OnceLock<P>>,engine:P,build:impl FnOnce(&Compiler)->Result<P>+Send+'static)->Drawn<P> {
+        let (worker,target)=(self.clone(),slot.clone());
+        self.spawn_worker(mode.clone(),false,move || try_init(&target,||build(&worker)).map(drop));
+        Drawn {variant:slot,fallback:Some(engine),deferred:true}
     }
     /// The caller keeps its existing pass sequence until this optional kernel is ready.
     pub(crate) fn install_optional<P:Clone+Send+Sync+'static>(&self,mode:&VariantCompile,slot:std::sync::Arc<OnceLock<P>>,warm:bool,build:impl FnOnce(&Compiler)->Result<P>+Send+'static)->Result<Drawn<P>> {
@@ -267,13 +462,25 @@ impl Compiler {
         } else {try_init(&slot,||build(self))?;}
         Ok(Drawn {variant:slot,fallback,deferred})
     }
+    /// A render pipeline whose descriptor names no cache, created through the persistent one.
+    pub(crate) fn render_cached(&self, descriptor: &wgpu::RenderPipelineDescriptor<'_>) -> wgpu::RenderPipeline {
+        self.render(&wgpu::RenderPipelineDescriptor { cache: self.cache.as_ref(), ..descriptor.clone() })
+    }
+    /// A compute pipeline whose descriptor names no cache, created through the persistent one.
+    pub(crate) fn compute_cached(&self, descriptor: &wgpu::ComputePipelineDescriptor<'_>) -> wgpu::ComputePipeline {
+        self.compute(&wgpu::ComputePipelineDescriptor { cache: self.cache.as_ref(), ..descriptor.clone() })
+    }
     pub(crate) fn compute_entry(&self, layout:&wgpu::PipelineLayout, module:&wgpu::ShaderModule, entry:&str, label:&str)->wgpu::ComputePipeline {
         self.compute(&wgpu::ComputePipelineDescriptor {label:Some(label),layout:Some(layout),module,entry_point:Some(entry),compilation_options:Default::default(),cache:self.cache.as_ref()})
     }
     pub(crate) fn is_known(&self, key: &blake3::Hash) -> bool {
         self.known.lock().unwrap().keys.contains(key.as_bytes())
     }
-    pub(crate) fn remember(&self, key: blake3::Hash) {
+    pub(crate) fn is_known_input(&self,key:Option<blake3::Hash>)->bool {
+        key.is_some_and(|key|self.is_known(&key))
+    }
+    pub(crate) fn remember(&self, key: impl Into<Option<blake3::Hash>>) {
+        let Some(key)=key.into() else {return;};
         let mut known = self.known.lock().unwrap();
         known.added |= known.keys.insert(*key.as_bytes());
     }
@@ -288,14 +495,26 @@ impl Compiler {
         })
     }
     /// Acknowledge only a published ledger, after its blob or system-cache marker.
-    pub(crate) fn save_known(&self, snapshot: Known) -> Result<()> {
-        if snapshot.save()? {
+    /// False when the store's budget refused it.
+    pub(crate) fn save_known(&self, snapshot: Known) -> Result<bool> {
+        let written = snapshot.save()?;
+        if written {
             let mut known = self.known.lock().unwrap();
             // Keys only accumulate. A later insertion still needs another save;
             // remembering an existing key does not dirty a committed snapshot.
             known.added = known.keys.len() != snapshot.keys.len();
         }
-        Ok(())
+        Ok(written)
+    }
+}
+/// Moda's 2D pipelines are created like vork's own: through the persistent pipeline cache (a Metal binary archive
+/// on macOS), admitted, timed and counted, so a save after new canvas pipelines writes them to disk.
+impl moda_text_draw::device::PipelineHost for Compiler {
+    fn render_pipeline(&self, descriptor: &wgpu::RenderPipelineDescriptor<'_>) -> wgpu::RenderPipeline {
+        self.render_cached(descriptor)
+    }
+    fn compute_pipeline(&self, descriptor: &wgpu::ComputePipelineDescriptor<'_>) -> wgpu::ComputePipeline {
+        self.compute_cached(descriptor)
     }
 }
 /// Content keys of geometry pipelines the persistent pipeline cache holds: a known
@@ -324,6 +543,10 @@ impl Known {
             added: false,
         }
     }
+    #[cfg(test)]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.keys.is_empty()
+    }
     fn save(&self) -> Result<bool> {
         let mut keys: Vec<_> = self.keys.iter().collect();
         keys.sort_unstable();
@@ -331,6 +554,70 @@ impl Known {
             &self.path,
             &keys.into_iter().flatten().copied().collect::<Vec<u8>>(),
         )?)
+    }
+}
+#[cfg(test)]
+mod release_case_tests {
+    use super::*;
+    use crate::forward_variant::*;
+
+    fn path(features: FeatureMask, boundaries: u32) -> ProgramKernel {
+        ProgramKernel::Path { adaptive: true, catchers: false, random_walk: false, features, boundaries, emitter_profiles: false, media: None }
+    }
+    fn features(kernel: ProgramKernel) -> FeatureMask {
+        let ProgramKernel::Path { features, .. } = kernel else { unreachable!() };
+        features
+    }
+    const SUN: FeatureMask = 1 << FEATURE_LIGHT_SHIFT;
+    const POINT: FeatureMask = 1 << (FEATURE_LIGHT_SHIFT + 1);
+    const AREA: FeatureMask = 1 << (FEATURE_LIGHT_SHIFT + 3);
+
+    /// Whatever lights and camera the prepared scene has, the bundle holds the
+    /// same cases: its materials decide everything else in the key.
+    #[test]
+    fn a_prepared_path_scene_covers_the_same_light_and_camera_cases_whatever_its_own() {
+        let materials = FEATURE_SPECIALIZED | FEATURE_INSTALLED | FEATURE_COAT | FEATURE_SUBSURFACE;
+        let lights = [SUN, AREA, FEATURE_LIGHT_TYPES];
+        // No solids: three light cases, the camera fact as installed.
+        for camera in [0, FEATURE_CAMERA_EXTERIOR] {
+            for own in [SUN, POINT, AREA, FEATURE_LIGHT_TYPES] {
+                let cases = path(materials | own | camera, 0).release_cases();
+                assert_eq!(cases.iter().map(|&case| features(case)).collect::<Vec<_>>(),
+                    lights.iter().map(|light| materials | light | camera).collect::<Vec<_>>());
+            }
+        }
+        // Solids: both camera cases for each light case, from either starting point.
+        let expected: Vec<_> = lights.iter().flat_map(|light| [FEATURE_CAMERA_EXTERIOR, 0].map(|camera| materials | light | camera)).collect();
+        for camera in [0, FEATURE_CAMERA_EXTERIOR] {
+            let cases = path(materials | folded_light_kinds(POINT) | camera, 2).release_cases();
+            assert_eq!(cases.iter().map(|&case| features(case)).collect::<Vec<_>>(), expected);
+            // Only the two facts vary: every other field of the kernel is the scene's.
+            for case in cases {
+                assert_eq!(path(features(case), 2), case);
+                assert_eq!(features(case) & !(FEATURE_LIGHT_TYPES | FEATURE_CAMERA_EXTERIOR), materials);
+            }
+        }
+    }
+
+    /// The cases are keys a real scene installs: every light case is one
+    /// `folded_light_kinds` produces, so a prepared kernel is found by its key.
+    #[test]
+    fn release_light_cases_are_installable_keys() {
+        for case in path(FEATURE_SPECIALIZED | FEATURE_INSTALLED | POINT, 0).release_cases() {
+            let lights = features(case) & FEATURE_LIGHT_TYPES;
+            assert_eq!(folded_light_kinds(lights), lights);
+        }
+        assert_eq!(folded_light_kinds(0), FEATURE_LIGHT_TYPES, "no analytic light is the every-kind case");
+        assert_eq!(folded_light_kinds(SUN | AREA), FEATURE_LIGHT_TYPES, "a mix is the every-kind case");
+    }
+
+    /// Engine and test keys are not scene unions; other kernels have no cases.
+    #[test]
+    fn only_scene_keys_have_release_cases() {
+        let engine = path((SHADING_LAYERS | SHADING_METAL) as FeatureMask, 1);
+        assert_eq!(engine.release_cases(), vec![engine]);
+        let gi = ProgramKernel::Gi { features: FEATURE_SPECIALIZED | SUN };
+        assert_eq!(gi.release_cases(), vec![gi]);
     }
 }
 #[cfg(test)]
@@ -342,7 +629,7 @@ mod known_persistence_tests {
         let (device, _) = wgpu::Device::noop(&Default::default());
         let root = std::env::temp_dir().join(format!("vork-key-snapshot-{}", std::process::id()));
         let path = root.join("keys.entry");
-        let compiler = Compiler::new(&device, None, Known::load(path.clone(), false));
+        let compiler = Compiler::new(&device, None, Known::load(path.clone(), false), Blob::ledger_only());
         let first = blake3::hash(b"first pipeline");
         let later = blake3::hash(b"later pipeline");
         compiler.remember(first);
@@ -366,9 +653,64 @@ mod known_persistence_tests {
     }
 
     #[test]
+    fn background_save_publishes_off_the_calling_thread_and_only_new_work() -> Result<()> {
+        let (device, _) = wgpu::Device::noop(&Default::default());
+        let root = std::env::temp_dir().join(format!("vork-background-save-{}", std::process::id()));
+        let path = root.join("keys.entry");
+        let compiler = Compiler::new(&device, None, Known::load(path.clone(), false), Blob::ledger_only());
+        let key = blake3::hash(b"pipeline");
+        compiler.remember(key);
+        compiler.save_soon();
+        compiler.save_soon(); // Coalesces with the queued save, or finds nothing left to do.
+        crate::disk_cache::wait_persistence()?;
+        assert_eq!(crate::disk_cache::read(&path), Some(key.as_bytes().to_vec()));
+        assert!(compiler.known_snapshot().is_none());
+        // Nothing is new: no save is queued.
+        compiler.save_soon();
+        assert!(!compiler.save_pending());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    /// A process about to exit must not take a save for finished while the worker is between
+    /// taking it off the queue and running it.
+    #[test]
+    fn a_requested_save_stays_pending_until_it_runs_and_exit_finishes_it() -> Result<()> {
+        let (device, _) = wgpu::Device::noop(&Default::default());
+        let root = std::env::temp_dir().join(format!("vork-finish-save-{}", std::process::id()));
+        let path = root.join("keys.entry");
+        let compiler = Compiler::new(&device, None, Known::load(path.clone(), false), Blob::ledger_only());
+        let key = blake3::hash(b"pipeline");
+        compiler.remember(key);
+        // The worker is busy, so the save stays queued: finishing runs it on this thread.
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        crate::disk_cache::persist(move || { let _ = gate.recv(); });
+        compiler.save_soon();
+        assert!(compiler.save_pending());
+        compiler.finish_save();
+        assert_eq!(crate::disk_cache::read(&path), Some(key.as_bytes().to_vec()));
+        // The worker now takes the save off the queue but cannot run it while this thread holds the
+        // saved state: wherever the worker is, the save still counts as pending.
+        let later = blake3::hash(b"later pipeline");
+        compiler.remember(later);
+        let saved = compiler.persistence.saved.lock().unwrap();
+        compiler.save_soon();
+        release.send(()).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert!(compiler.persistence.queued.load(std::sync::atomic::Ordering::Acquire));
+        drop(saved);
+        compiler.finish_save();
+        assert!(Known::load(path.clone(), true).keys.contains(later.as_bytes()));
+        crate::disk_cache::wait_persistence()?;
+        assert!(!compiler.save_pending());
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+
+    #[test]
     fn abandoned_snapshot_keeps_keys_dirty() {
         let (device, _) = wgpu::Device::noop(&Default::default());
-        let compiler = Compiler::new(&device, None, Known::default());
+        let compiler = Compiler::new(&device, None, Known::default(), Blob::ledger_only());
         let key = blake3::hash(b"pipeline");
         compiler.remember(key);
         drop(compiler.known_snapshot().unwrap());
@@ -384,6 +726,8 @@ pub(crate) enum VariantCompile {
     #[default]
     Background,
     /// Draw only the generic; one-frame shots have no use for a later variant.
+    /// The path kernel behind its prebuilt engine is the exception: it compiles
+    /// for the next render of the scene (Compiler::install_behind_engine).
     Fallback,
     /// `vork setup`: Fallback's choices, and the hit kernels compile the superset
     /// key a later Fallback install draws with (CachedPipelines::drawn_kernel).
@@ -435,6 +779,7 @@ impl crate::InstalledScene {
     pub(crate) fn variants_ready(&self) -> bool {
         self.geometry_pipelines.values().all(Drawn::ready) && self.decoupled.as_ref().is_none_or(|d|d.variants_ready())
             && self.gi.as_ref().is_none_or(Drawn::ready) && self.reflections.as_ref().is_none_or(Drawn::ready)
+            && self.path.as_ref().is_none_or(|path|path.drawn().ready())
     }
     /// Drawn pipelines installed behind a superset fallback (cold variants).
     pub(crate) fn deferred_variants(&self) -> usize {
@@ -444,6 +789,7 @@ impl crate::InstalledScene {
             .count() + self.decoupled.as_ref().map_or(0,|d|d.deferred_variants())
             + usize::from(self.gi.as_ref().is_some_and(Drawn::deferred))
             + usize::from(self.reflections.as_ref().is_some_and(Drawn::deferred))
+            + usize::from(self.path.as_ref().is_some_and(|path|path.drawn().deferred()))
     }
 }
 
@@ -458,13 +804,18 @@ pub(crate) trait VariantShader: Send + Sync {
     fn constants(&self, key: GeometryKey) -> Vec<(&'static str, f64)>;
     /// Shipped table evaluator, when it can serve the scene's transport.
     fn camera_generic(&self, kernel: ProgramKernel) -> Option<&'static crate::native::Compiled>;
-    /// A shipped executable's warm hint, independent of unrelated scene state.
-    /// Constructors still create the current scene's complete pipeline layout.
-    fn shared_kernel_key(&self, _kernel: ProgramKernel) -> Option<blake3::Hash> { None }
+    fn geometry_input_key(&self, key: GeometryKey,lookup_only:bool) -> Result<blake3::Hash>;
+    /// Captured compiler inputs (or selected shipped bytes), before pipeline layout/state.
+    /// A missing resolver receipt is cold and must not invoke Slang during scheduling.
+    fn kernel_input_key(&self, kernel: ProgramKernel,lookup_only:bool) -> Result<blake3::Hash>;
     /// A compute kernel with the scene's programs at hits, and its entry.
     fn program_kernel(&self, kernel: ProgramKernel) -> Result<(wgpu::ShaderModule, &'static str)>;
     /// Whether `program_kernel` would compile nothing: shipped, or its code is stored.
     fn kernel_stored(&self, kernel: ProgramKernel) -> Result<bool>;
+    fn detached_request(&self, kernel: ProgramKernel) -> Result<crate::specialization::Source>;
+    /// The prebuilt path engine key that draws `kernel`'s scene, or what in the
+    /// scene the engine cannot draw.
+    fn path_engine(&self, kernel: ProgramKernel) -> std::result::Result<ProgramKernel, &'static str>;
 }
 /// Compute kernels that evaluate surfaces at ray hits. GI, reflections and path
 /// transport specialize over installed capabilities; other kernels compile per
@@ -473,6 +824,8 @@ pub(crate) trait VariantShader: Send + Sync {
 pub(crate) enum ProgramKernel {
     /// Path transport with adaptive or fixed sampling.
     Path { adaptive: bool, catchers: bool, random_walk: bool, features: FeatureMask, boundaries: u32, emitter_profiles: bool, media: Option<u32> },
+    /// Environment radiance at the exact straight path-camera sample.
+    PathEnvironment { adaptive: bool },
     /// Ray-traced diffuse indirect.
     Gi { features: FeatureMask },
     /// Ray-traced reflections that shade unseen hits.
@@ -483,6 +836,55 @@ pub(crate) enum ProgramKernel {
     Decoupled { stage: ShadeStage, features: FeatureMask, subsurface: bool, emitter_profiles: bool, boundaries: u32 },
 }
 impl ProgramKernel {
+    /// The prebuilt path engine's key for this path kernel: the same family
+    /// (sampling, boundary capacity) with every capability, or why the engine has
+    /// no such family. The engine draws the scene's picture with the scene's
+    /// tables; the kernel's own key is the same engine compiled for what the
+    /// scene installs. Whether a scene's resources fit the engine is the
+    /// shader's question (VariantShader::path_engine).
+    pub(crate) fn path_engine(self) -> std::result::Result<Self, &'static str> {
+        let Self::Path { adaptive, catchers, random_walk, features, boundaries, media, .. } = self else {
+            return Err("not path transport");
+        };
+        if random_walk { return Err("random-walk subsurface is installed"); }
+        if catchers { return Err("a shadow catcher is installed"); }
+        if media.is_some() { return Err("a participating medium is installed"); }
+        if boundaries > crate::surface_native::PathEngine::BOUNDARIES { return Err("dielectric solids nest or overlap"); }
+        // An engine key has no specialised bit, so it carries no geometry union.
+        if features & crate::forward_variant::FEATURE_SPECIALIZED != 0
+            && features & crate::forward_variant::FEATURE_IMPLICIT_GEOMETRY != 0 { return Err("implicit geometry is installed"); }
+        let all = (crate::forward_variant::SHADING_LAYERS | crate::forward_variant::SHADING_METAL) as FeatureMask;
+        Ok(Self::Path { adaptive, catchers, random_walk, features: all, boundaries, emitter_profiles: true, media })
+    }
+    /// The keys a release bundle holds for one prepared path scene: the scene's
+    /// materials, programs and resources at each covered case of the two key
+    /// facts that come from elsewhere in a scene.
+    /// - Lights: a single sun, area lights only, and every kind (which is also the
+    ///   key of a scene with no analytic light or with several kinds). A scene lit
+    ///   by points or spots alone compiles its kernel on first use.
+    /// - Camera: with solids installed, both the proof that no camera starts
+    ///   inside one and its absence. Without solids the proof always holds
+    ///   (passes::path::camera_exterior), so the scene's own value is the only one.
+    /// A key that is not a scene union has neither fact and is its only case.
+    pub(crate) fn release_cases(self) -> Vec<Self> {
+        use crate::forward_variant::{FEATURE_CAMERA_EXTERIOR, FEATURE_INSTALLED, FEATURE_LIGHT_SHIFT, FEATURE_LIGHT_TYPES};
+        let Self::Path { features, boundaries, .. } = self else { return vec![self] };
+        if features & FEATURE_INSTALLED == 0 { return vec![self]; }
+        let sun: FeatureMask = 1 << FEATURE_LIGHT_SHIFT;
+        let area: FeatureMask = 1 << (FEATURE_LIGHT_SHIFT + 3);
+        let cameras = if boundaries > 0 { vec![FEATURE_CAMERA_EXTERIOR, 0] } else { vec![features & FEATURE_CAMERA_EXTERIOR] };
+        let mut cases = Vec::new();
+        for lights in [sun, area, FEATURE_LIGHT_TYPES] {
+            for &camera in &cameras {
+                let mut case = self;
+                if let Self::Path { features, .. } = &mut case {
+                    *features = *features & !(FEATURE_LIGHT_TYPES | FEATURE_CAMERA_EXTERIOR) | lights | camera;
+                }
+                cases.push(case);
+            }
+        }
+        cases
+    }
     /// Untextured, unlayered table materials share one hit evaluator across light
     /// mixes. Keep runtime metalness, sidedness and every analytic light kind;
     /// do not turn on unrelated texture/layer/transport capabilities.
@@ -490,7 +892,7 @@ impl ProgramKernel {
         use crate::forward_variant::*;
         let lighting = FEATURE_LIGHT_TYPES | FEATURE_PUNCTUAL | FEATURE_FINITE
             | FEATURE_RECTANGLE | FEATURE_ELLIPSE | FEATURE_SHADOW_RAYS;
-        let allowed = lighting | FEATURE_SPECIALIZED | FEATURE_LIT | FEATURE_SIDED
+        let allowed = lighting | FEATURE_SPECIALIZED | FEATURE_LIT
             | FeatureMask::from(SHADING_METAL);
         match self {
             Self::Gi { features } if features & FEATURE_SPECIALIZED != 0 && features & !allowed == 0 => Some(Self::Gi { features: allowed }),
@@ -660,14 +1062,38 @@ impl Role {
         }
     }
 }
+/// A compute pipeline's identity: its shader inputs and the entries of its bind
+/// groups. Compute pipeline state is fixed: no overrides or immediate data.
+/// Installs and scene-free warming (passes::path::warm_engines) both use it.
+pub(crate) fn compute_pipeline_key<E:std::fmt::Debug>(input:blake3::Hash,groups:&[Option<Vec<E>>])->blake3::Hash {
+    let mut hash=blake3::Hasher::new();
+    hash.update(input.as_bytes());
+    hash.update(format!("{groups:?}").as_bytes());
+    hash.finalize()
+}
+/// The bind groups of a path pipeline, as its identity states them: the path
+/// kernel's own entries, the material table, no group 2, the hit buffers.
+/// Greenlight's cache probe compiles this and compute_pipeline_key as written.
+pub(crate) fn path_groups<E>(path:Vec<E>,material:Vec<E>,hits:E)->Vec<Option<Vec<E>>> {
+    vec![Some(path),Some(material),None,Some(vec![hits])]
+}
+fn layout_identity(groups:&[Option<Vec<wgpu::BindGroupLayoutEntry>>])->blake3::Hash {
+    blake3::hash(format!("{groups:?} immediate_size=0").as_bytes())
+}
+
 /// Installed pipelines per (vertex layout, role), shared by every scene on this registry.
 pub(crate) type GeometryKey = (crate::geometry::VertexLayout, Role);
 pub(crate) struct CachedPipelines {
     pub(crate) raster_samples: u32,
     pub(crate) denoise: bool,
-    /// Hash of every source and state input shared by this registry's pipelines.
-    identity: blake3::Hash,
-    kernel_identity: blake3::Hash,
+    /// Fingerprints of the descriptor entries used to construct these layouts.
+    depth_identity: blake3::Hash,
+    fragments_identity: blake3::Hash,
+    fibre_identity: blake3::Hash,
+    shadow_identity: blake3::Hash,
+    resolve_identity: blake3::Hash,
+    material_entries: Vec<wgpu::BindGroupLayoutEntry>,
+    probes: bool,
     /// Camera ray transport: shadows, refraction/thickness, or probes.
     pub(crate) ray_shadows: bool,
     /// Material programs provide procedural coverage to ray transport.
@@ -686,6 +1112,7 @@ pub(crate) struct CachedPipelines {
     pub(crate) fragments_layout: wgpu::BindGroupLayout,
     pub(crate) fragments_geometry_layout: wgpu::BindGroupLayout,
     pub(crate) field_controls: bool,
+    pub(crate) software_raster: bool,
     pub(crate) program_trace: bool,
     fragments_pipeline_layout: wgpu::PipelineLayout,
     fibre_layout: wgpu::PipelineLayout,
@@ -711,55 +1138,38 @@ pub(crate) struct CachedPipelines {
     pub(crate) ao_blur_vertical_pipeline: OnceLock<wgpu::ComputePipeline>,
 }
 impl CachedPipelines {
-    /// Shared registry/ledger identity, including shader inputs and descriptor
-    /// array capacities. Keys remembered by setup must describe the same pipeline
-    /// a later process creates, independently of the installed scene's values.
-    pub(crate) fn identity(source: &str, resolve: &str, raster_samples: u32, ray_shadows: bool,
-        slang: &crate::slang_forward::SlangScene, output_format: wgpu::TextureFormat) -> blake3::Hash {
-        let mut identity = blake3::Hasher::new();
-        identity.update(source.as_bytes());
-        identity.update(resolve.as_bytes());
-        identity.update(&slang.attributes.to_le_bytes());
-        identity.update(&slang.textures.max(1).to_le_bytes());
-        identity.update(&slang.samplers.max(1).to_le_bytes());
-        identity.update(&slang.shadow_capacity.to_le_bytes());
-        identity.update(&slang.aov_count.to_le_bytes());
-        identity.update(&[u8::from(slang.denoise), u8::from(slang.field_controls), u8::from(slang.no_shadow_containment)]);
-        identity.update(&[u8::from(ray_shadows), u8::from(slang.ray_refraction), u8::from(slang.probes), u8::from(slang.connection_transmission)]);
-        // Raster fibre resources change the shadow layout even when the material
-        // program is identical to one installed for a path scene.
-        identity.update(&[u8::from(slang.fibre)]);
-        // Coverage changes fallback admission. Preserve opaque setup identities.
-        if slang.surface_coverage {identity.update(b"surface coverage");}
-        if slang.attribute_coverage {identity.update(b"attribute coverage");}
-        if slang.no_boundary_transactions {identity.update(b"no boundary transactions");}
-        if slang.no_points {identity.update(b"no points");}
-        if slang.bounded_secondary_compilation {identity.update(b"bounded secondary compilation");}
-        if slang.approximate_field_admission() {identity.update(b"approximate field admission");}
-        if let Some(native)=&slang.medium {
-            identity.update(native.point.as_bytes());identity.update(&native.identity);
-
-            for flag in native.defines() { identity.update(flag.as_bytes()); identity.update(&[0]); }
-            // Path compilation specializes homogeneous versus tracked transport.
-            identity.update(&[u8::from(native.mesh_sources),u8::from(native.homogeneous)]);
-            for (name,source) in &native.modules {identity.update(name.as_bytes());identity.update(source.as_bytes());}
-            for path in &native.includes {identity.update(path.to_string_lossy().as_bytes());}
-        }
-        if let Some(p)=&slang.propagation {
-            for (name,source) in &p.modules {identity.update(name.as_bytes());identity.update(source.as_bytes());}
-            for path in &p.include {identity.update(path.to_string_lossy().as_bytes());}
-        }
-        if let Some(camera)=&slang.camera {
-            for (name,source) in &camera.modules {identity.update(name.as_bytes());identity.update(source.as_bytes());}
-            for path in &camera.include {identity.update(path.to_string_lossy().as_bytes());}
-        }
-        if let Some(environment)=&slang.environment {
-            for (name,source) in &environment.modules {identity.update(name.as_bytes());identity.update(source.as_bytes());}
-            for path in &environment.include {identity.update(path.to_string_lossy().as_bytes());}
-        }
-        identity.update(&raster_samples.to_le_bytes());
-        identity.update(format!("{output_format:?}").as_bytes());
-        identity.finalize()
+    /// Identity of the compilation requests, layouts and state this install builds.
+    /// Source planning happens before registry lookup so lazy kernels cannot inherit
+    /// a previous scene's unconsumed policy or omit a newly consumed policy.
+    pub(crate) fn identity(&self,resolve:&str,geometry:&std::collections::HashSet<GeometryKey>,kernels:&[ProgramKernel])->Result<blake3::Hash> {
+        enum Input {Geometry(GeometryKey),Compute(ProgramKernel)}
+        let inputs:Vec<_>=geometry.iter().copied().map(Input::Geometry)
+            .chain(kernels.iter().copied().map(Input::Compute)).collect();
+        // Use the existing bounded compiler worker helper for independent
+        // captures; serial frontends would delay all installation workers.
+        let mut entries=crate::programs::parallel_map(&inputs,|input| {
+            let (program,key)=match *input {
+                Input::Geometry(key)=> {
+                    let program=match key.1 {Role::ProgramControls {program,..}|Role::ProgramCoverage {program,..}=>program,_=>0};
+                    (program,self.geometry_content_key(key,false)?)
+                },
+                Input::Compute(key)=> {
+                    let program=if let ProgramKernel::Decoupled {stage:ShadeStage::EvaluateProgram(id),..}=key {id} else {0};
+                    (program,self.compute_content_key(key,false)?)
+                },
+            };
+            Ok((program,key))
+        })?;
+        entries.sort_by_key(|(program,key)|(*program,*key.as_bytes()));
+        entries.dedup();
+        let mut hash=blake3::Hasher::new();
+        for (program,entry) in entries {hash.update(&program.to_le_bytes());hash.update(entry.as_bytes());}
+        hash.update(resolve.as_bytes());
+        // These layouts/state are constructed for the registry and consumed by
+        // fixed passes and host bindings independently of material entries.
+        for layout in [self.depth_identity,self.fragments_identity,self.fibre_identity,self.shadow_identity,self.resolve_identity] {hash.update(layout.as_bytes());}
+        hash.update(format!("{:?}",self.control_targets).as_bytes());
+        Ok(hash.finalize())
     }
 
     /// The pipeline for one drawn role, compiled once per registry. Different keys
@@ -773,32 +1183,31 @@ impl CachedPipelines {
     pub(crate) fn camera_slot(&self,key:ProgramKernel)->std::sync::Arc<OnceLock<wgpu::ComputePipeline>> {
         self.camera_evaluations.lock().unwrap().entry(key).or_default().clone()
     }
-    pub(crate) fn content_key(&self, key: impl std::fmt::Debug) -> blake3::Hash {
-        let mut hash = blake3::Hasher::new();
-        hash.update(self.identity.as_bytes());
-        hash.update(format!("{key:?}").as_bytes());
-        hash.finalize()
+    pub(crate) fn content_key(&self,key:GeometryKey)->Option<blake3::Hash> {self.geometry_content_key(key,true).ok()}
+    fn geometry_content_key(&self,key:GeometryKey,lookup_only:bool)->Result<blake3::Hash> {
+        let mut hash=blake3::Hasher::new();
+        hash.update(self.shader.geometry_input_key(key,lookup_only)?.as_bytes());
+        hash.update(format!("{:?}",key.0).as_bytes());
+        Ok(self.with_geometry_state(key.1,|_,layout,_,vs,fs,samples,write,targets| {
+            hash.update(layout.as_bytes());
+            hash.update(format!("{vs} {fs} {samples} {write} {targets:?} {:?}",self.shader.constants(key)).as_bytes());
+            hash.finalize()
+        }))
     }
 
-    /// Surface compute kernels do not consume the display/resolve program or
-    /// the raster control pass's denoising attachments. Keep their ledger separate
-    /// from the complete registry identity so setup entries survive those edits.
-    fn kernel_identity(source: &str, raster_samples: u32, ray_shadows: bool,
-        slang: &crate::slang_forward::SlangScene) -> blake3::Hash {
-        let mut slang = slang.clone();
-        slang.denoise = false;
-        // Surface kernels never link camera-ray or path-propagation programs.
-        slang.camera = None;
-        slang.propagation = None;
-        Self::identity(source, "", raster_samples, ray_shadows, &slang, wgpu::TextureFormat::Rgba8Unorm)
-    }
-    pub(crate) fn kernel_content_key(&self, kernel: ProgramKernel) -> blake3::Hash {
-        if matches!(kernel, ProgramKernel::Path {..}) { return self.content_key(kernel); }
-        if let Some(key) = self.shader.shared_kernel_key(kernel) { return key; }
-        let mut hash = blake3::Hasher::new();
-        hash.update(self.kernel_identity.as_bytes());
-        hash.update(format!("{kernel:?}").as_bytes());
-        hash.finalize()
+    pub(crate) fn kernel_content_key(&self,kernel:ProgramKernel)->Option<blake3::Hash> {self.compute_content_key(kernel,true).ok()}
+    fn compute_content_key(&self,kernel:ProgramKernel,lookup_only:bool)->Result<blake3::Hash> {
+        let input=self.shader.kernel_input_key(kernel,lookup_only)?;
+        let hits=||vec![crate::rt::hit_buffers_entry(0,wgpu::ShaderStages::COMPUTE)];
+        let probes=||crate::probes::read_entries(0,wgpu::ShaderStages::COMPUTE).to_vec();
+        let groups=match kernel {
+            ProgramKernel::Path {adaptive,..}|ProgramKernel::PathEnvironment {adaptive}=>path_groups(passes::path::layout_entries(adaptive),self.material_entries.clone(),crate::rt::hit_buffers_entry(0,wgpu::ShaderStages::COMPUTE)),
+            ProgramKernel::Gi {..}=>vec![Some(crate::rt::gi_entries()),Some(self.material_entries.clone()),self.probes.then(probes),Some(crate::rt::gi_read_entries())],
+            ProgramKernel::Reflections {..}=>vec![Some(crate::rt::reflections_hits_entries()),Some(self.material_entries.clone()),self.probes.then(probes),Some(crate::rt::reflection_read_entries())],
+            ProgramKernel::Probes {..}=>vec![Some(crate::probes::update_entries()),Some(self.material_entries.clone()),Some(probes()),Some(hits())],
+            ProgramKernel::Decoupled {..}=>vec![Some(raster_global_entries()),Some(self.material_entries.clone()),Some(camera_shadow_entries_for(self.ray_shadows,self.program_trace)),Some(passes::decoupled::camera_geometry_entries_for(self.camera_pages)),Some(passes::decoupled::camera_entries(self.raster_samples))],
+        };
+        Ok(compute_pipeline_key(input,&groups))
     }
 
     /// Install the drawn keys. Warm variants (in the persistent cache) compile inline;
@@ -811,7 +1220,7 @@ impl CachedPipelines {
     ) -> Result<std::collections::HashMap<GeometryKey, Drawn>> {
         let c = &r.compiler;
         let warm =
-            |key: GeometryKey| self.slot(key).get().is_some() || c.is_known(&self.content_key(key));
+            |key: GeometryKey| self.slot(key).get().is_some() || c.is_known_input(self.content_key(key));
         // The shipped generic needs no Slang compilation. Even one cold key
         // starts behind it; compiling a scene-union fallback would block frame 1.
         let plan: Vec<_> = keys.iter().map(|&key| {
@@ -855,7 +1264,7 @@ impl CachedPipelines {
         Ok(pipeline)
     }
 
-    fn build_role(&self, c: &Compiler, (packed, role): GeometryKey) -> Result<wgpu::RenderPipeline> {
+    fn with_geometry_state<T>(&self,role:Role,consume:impl FnOnce(&wgpu::PipelineLayout,blake3::Hash,&str,&str,&str,u32,bool,&[Option<wgpu::ColorTargetState>])->T)->T {
         let fibre_near_targets=[Some(wgpu::ColorTargetState {format:wgpu::TextureFormat::Rg32Uint,blend:None,write_mask:wgpu::ColorWrites::ALL})];
         let fibre_targets=vec![Some(wgpu::ColorTargetState {format:wgpu::TextureFormat::Rgba16Float,
             blend:Some(wgpu::BlendState {color:wgpu::BlendComponent {src_factor:wgpu::BlendFactor::One,dst_factor:wgpu::BlendFactor::One,operation:wgpu::BlendOperation::Add},alpha:wgpu::BlendComponent {src_factor:wgpu::BlendFactor::One,dst_factor:wgpu::BlendFactor::One,operation:wgpu::BlendOperation::Add}}),write_mask:wgpu::ColorWrites::ALL});1];
@@ -865,7 +1274,7 @@ impl CachedPipelines {
         let visibility_targets = [Some(wgpu::ColorTargetState {
             format: crate::passes::decoupled::KEY_FORMAT, blend: None, write_mask: wgpu::ColorWrites::ALL,
         })];
-        let depth = &self.depth_layout;
+        let depth = if self.software_raster {(&self.fragments_pipeline_layout,self.fragments_identity)} else {(&self.depth_layout,self.depth_identity)};
         let samples = self.raster_samples;
         let (layout, label, vs, fs, samples, write, targets): (
             _,
@@ -877,7 +1286,7 @@ impl CachedPipelines {
             &[Option<wgpu::ColorTargetState>],
         ) = match role {
             Role::Fibre(stage) => (
-                if stage.additive() {&self.fibre_layout} else {depth},
+                if stage.additive() {(&self.fibre_layout,self.fibre_identity)} else {(&self.depth_layout,self.depth_identity)},
                 "fibre transport capture","shadow_vs",stage.entry(),1,
                 !stage.additive(),
                 if stage.additive() {&fibre_targets} else if stage==crate::fibre_transport::Stage::Near {&fibre_near_targets} else {&[]}
@@ -885,8 +1294,8 @@ impl CachedPipelines {
             Role::OpaqueDepth => (
                 depth,
                 "packed opaque depth",
-                "opaque_depth_vs",
-                "",
+                if self.software_raster {"software_depth_vs"} else {"opaque_depth_vs"},
+                if self.software_raster {"software_depth_fs"} else {""},
                 samples,
                 true,
                 &[],
@@ -894,8 +1303,8 @@ impl CachedPipelines {
             Role::OpaqueSingleDepth => (
                 depth,
                 "packed single-sided opaque depth",
-                "opaque_single_depth_vs",
-                "opaque_single_depth_fs",
+                if self.software_raster {"software_depth_vs"} else {"opaque_single_depth_vs"},
+                if self.software_raster {"software_single_depth_fs"} else {"opaque_single_depth_fs"},
                 samples,
                 true,
                 &[],
@@ -910,7 +1319,7 @@ impl CachedPipelines {
                 &[],
             ),
             Role::Visibility | Role::VisibilitySingle | Role::VisibilityMasked | Role::ProgramCoverage {stage:CoverageStage::Visibility,..} => (
-                &self.fragments_pipeline_layout,
+                (&self.fragments_pipeline_layout,self.fragments_identity),
                 "decoupled visibility",
                 if matches!(role,Role::VisibilityMasked | Role::ProgramCoverage {stage:CoverageStage::Visibility,..}) { "masked_vs" } else { "vs" },
                 match role { Role::Visibility => "fs", Role::VisibilitySingle => "single_fs", _ => "masked_fs" },
@@ -920,16 +1329,16 @@ impl CachedPipelines {
             ),
             // In the visibility pass after its opaque keys, writing no key.
             Role::TransparentFragments => (
-                &self.fragments_pipeline_layout,
+                (&self.fragments_pipeline_layout,self.fragments_identity),
                 "decoupled transparent fragments",
                 "masked_vs",
-                if self.field_controls {"transparent_fragments_fs"} else {"transparent_triangles_fs"},
+                if self.field_controls || self.software_raster {"transparent_fragments_fs"} else {"transparent_triangles_fs"},
                 1,
                 false,
                 &fragment_targets,
             ),
             Role::Controls(_) | Role::ProgramControls {transparent:false,..} => (
-                if self.field_controls {&self.fragments_pipeline_layout} else {depth},
+                if self.field_controls || self.software_raster {(&self.fragments_pipeline_layout,self.fragments_identity)} else {depth},
                 "packed opaque controls",
                 "main_vs",
                 "controls_fs",
@@ -938,7 +1347,7 @@ impl CachedPipelines {
                 &self.control_targets,
             ),
             Role::TransparentControls(_) | Role::ProgramControls {transparent:true,..} => (
-                if self.field_controls {&self.fragments_pipeline_layout} else {depth},
+                if self.field_controls || self.software_raster {(&self.fragments_pipeline_layout,self.fragments_identity)} else {depth},
                 "packed controls",
                 "main_vs",
                 "transparent_controls_fs",
@@ -947,6 +1356,11 @@ impl CachedPipelines {
                 &self.control_targets,
             ),
         };
+        consume(layout.0,layout.1,label,vs,fs,samples,write,targets)
+    }
+
+    fn build_role(&self,c:&Compiler,(packed,role):GeometryKey)->Result<wgpu::RenderPipeline> {
+        self.with_geometry_state(role,|layout,_,label,vs,fs,samples,write,targets| {
         let shading = role.shading();
         let variant_label = if shading & crate::materials::FEATURE_SPECIALIZED != 0 {
             format!("{label} key={shading:016x}")
@@ -966,6 +1380,7 @@ impl CachedPipelines {
             targets,
             packed,
         ))
+        })
     }
 
     // Slang registration: ("clusters", "main", "compute"). Per-file discovery
@@ -1034,11 +1449,28 @@ impl CachedPipelines {
     /// prefer a remembered device superset before consulting artifact presence.
     /// Hit consumers retain a Drawn slot so multi-frame installs can promote
     /// this fallback after their exact pipeline compiles in the background.
+    /// Path transport has a prebuilt engine instead of a superset to compile: it
+    /// needs no Slang, and its driver pipeline is the same for every scene, so
+    /// setup and earlier renders leave it warm. A path kernel whose own pipeline
+    /// is not warm draws the engine when the engine's is, and compiles behind it
+    /// (install_behind_engine); a longer render takes its kernel at an exposure
+    /// boundary. A cold engine is never waited for: building its driver pipeline
+    /// costs as much as the scene's own kernel, so the scene compiles that, as it
+    /// always did. Setup is what builds the engine.
     pub(crate) fn drawn_kernel(&self, kernel: ProgramKernel, mode: &VariantCompile, compiler: &Compiler) -> ProgramKernel {
+        if let Ok(engine) = self.shader.path_engine(kernel) {
+            let warm = |kernel| compiler.is_known_input(self.kernel_content_key(kernel));
+            return match mode {
+                VariantCompile::Inline => kernel,
+                VariantCompile::Setup | VariantCompile::SetupPlain | VariantCompile::Gated(_) => engine,
+                VariantCompile::Background | VariantCompile::Fallback =>
+                    if !warm(kernel) && warm(engine) { engine } else { kernel },
+            };
+        }
         if matches!(mode, VariantCompile::Background | VariantCompile::Fallback | VariantCompile::Gated(_))
-            && !compiler.is_known(&self.kernel_content_key(kernel))
+            && !compiler.is_known_input(self.kernel_content_key(kernel))
         {
-            if let Some(plain) = kernel.plain_hit().filter(|plain| compiler.is_known(&self.kernel_content_key(*plain))) {
+            if let Some(plain) = kernel.plain_hit().filter(|plain| compiler.is_known_input(self.kernel_content_key(*plain))) {
                 return plain;
             }
         }
@@ -1047,18 +1479,66 @@ impl CachedPipelines {
         match mode {
             VariantCompile::Setup => superset,
             VariantCompile::SetupPlain => kernel.plain_hit().unwrap_or(superset),
-            VariantCompile::Fallback if !compiler.is_known(&self.kernel_content_key(kernel))
-                && compiler.is_known(&self.kernel_content_key(superset)) => superset,
+            VariantCompile::Fallback if !compiler.is_known_input(self.kernel_content_key(kernel))
+                && compiler.is_known_input(self.kernel_content_key(superset)) => superset,
             VariantCompile::Fallback if !stored(kernel) && stored(superset) => superset,
             _ => kernel,
         }
     }
-    /// Hit keys use the existing deferred compiler and retained compute slots.
+    /// Hit keys, path transport included, use the existing deferred compiler and
+    /// retained compute slots.
     /// A warm setup fallback must not permanently select the movie's evaluator.
     pub(crate) fn install_hit(
         self: &std::sync::Arc<Self>, r: &Renderer, requested: ProgramKernel,
         mode: &VariantCompile, layout: wgpu::PipelineLayout, label: &'static str,
     ) -> Result<Drawn<wgpu::ComputePipeline>> {
+        Ok(self.install_hit_selected(r, requested, mode, layout, label)?.0)
+    }
+    /// `install_hit`, with the kernel it chose to draw first. The choice reads the
+    /// known-pipeline ledger, which background workers write, so it is made once
+    /// here: what is installed and what a caller reports cannot disagree.
+    pub(crate) fn install_hit_selected(
+        self: &std::sync::Arc<Self>, r: &Renderer, requested: ProgramKernel,
+        mode: &VariantCompile, layout: wgpu::PipelineLayout, label: &'static str,
+    ) -> Result<(Drawn<wgpu::ComputePipeline>, ProgramKernel)> {
+        if crate::specialization::enabled() && r.cache.is_some()
+            && matches!(mode, VariantCompile::Background | VariantCompile::Fallback)
+            && self.shader.path_engine(requested).is_ok()
+        {
+            let key = self.compute_content_key(requested, false)?;
+            let path = r.disk_cache.path("specialization", 1, key);
+            if let Some(cache) = crate::specialization::load(&r.device, &path) {
+                let (module, entry) = self.program_kernel(requested)?;
+                let pipeline = r.compiler.compute(&wgpu::ComputePipelineDescriptor {
+                    label: Some(label), layout: Some(&layout), module: &module, entry_point: Some(entry),
+                    compilation_options: Default::default(), cache: Some(&cache),
+                });
+                return Ok((Drawn::inline(pipeline), requested));
+            }
+            let selected = self.drawn_kernel(requested, mode, &r.compiler);
+            if selected != requested {
+                let ProgramKernel::Path {adaptive,..} = requested else {unreachable!()};
+                let source = self.shader.detached_request(requested)?;
+                let groups = path_groups(passes::path::layout_entries(adaptive), self.material_entries.clone(), crate::rt::hit_buffers_entry(0,wgpu::ShaderStages::COMPUTE));
+                if let Some(ended) = crate::specialization::start(key, path.clone(), source, groups)? {
+                    let (module, entry) = self.program_kernel(selected)?;
+                    let engine = r.compiler.compute(&wgpu::ComputePipelineDescriptor {
+                        label: Some(label), layout: Some(&layout), module: &module, entry_point: Some(entry),
+                        compilation_options: Default::default(), cache: r.compiler.cache.as_ref(),
+                    });
+                    let pipelines = self.clone();
+                    let drawn = r.compiler.install_behind_engine(mode, self.camera_slot(requested), engine, move |compiler| {
+                        let cache = crate::specialization::wait(&compiler.device, &path, &ended)?;
+                        let (module, entry) = pipelines.program_kernel(requested)?;
+                        Ok(compiler.compute(&wgpu::ComputePipelineDescriptor {
+                            label: Some(label), layout: Some(&layout), module: &module, entry_point: Some(entry),
+                            compilation_options: Default::default(), cache: Some(&cache),
+                        }))
+                    });
+                    return Ok((drawn, selected));
+                }
+            }
+        }
         let selected = self.drawn_kernel(requested, mode, &r.compiler);
         #[cfg(test)]
         r.compiler.hit_selections.lock().unwrap().push((requested, selected));
@@ -1074,7 +1554,7 @@ impl CachedPipelines {
         };
         let fallback = (selected != requested).then(|| build(&r.compiler, selected)).transpose()?;
         let pipelines = self.clone();
-        r.compiler.install_variant(mode, self.camera_slot(requested), fallback, move |compiler| {
+        let own = move |compiler: &Compiler| -> Result<wgpu::ComputePipeline> {
             let (module, entry) = pipelines.program_kernel(requested)?;
             let pipeline = compiler.compute(&wgpu::ComputePipelineDescriptor {
                 label: Some(label), layout: Some(&layout), module: &module,
@@ -1083,7 +1563,17 @@ impl CachedPipelines {
             });
             compiler.remember(pipelines.kernel_content_key(requested));
             Ok(pipeline)
-        })
+        };
+        // A render's kernel behind its prebuilt engine always compiles, a still's
+        // too: otherwise repeats of the scene would stay at the engine's speed.
+        // Setup keeps the engine alone; it has no scene to come back to.
+        let behind_engine = selected != requested && !matches!(mode, VariantCompile::Setup | VariantCompile::SetupPlain)
+            && self.shader.path_engine(requested).ok() == Some(selected);
+        let drawn = match fallback {
+            Some(engine) if behind_engine => r.compiler.install_behind_engine(mode, self.camera_slot(requested), engine, own),
+            fallback => r.compiler.install_variant(mode, self.camera_slot(requested), fallback, own)?,
+        };
+        Ok((drawn, selected))
     }
     /// The output layout and dispatch must use the same planned resolve, including
     /// encoder surfaces attached after frame-slot creation.
@@ -1234,7 +1724,6 @@ impl CachedPipelines {
     }
     pub(crate) fn with_sources(
         r: &Renderer,
-        source: &str,
         resolve: &str,
         raster_samples: u32,
         ray_shadows: bool,
@@ -1242,20 +1731,24 @@ impl CachedPipelines {
     ) -> Self {
         let d = &r.device;
         let globals=raster_global_entries();
+        let material_entries=material_entries_for(slang.textures,slang.samplers);
+        let capture_entries=crate::fibre_transport::capture_entries().to_vec();
+        let fragments_entries=crate::passes::decoupled::fragments_entries();
+        let fragments_geometry_entries=crate::passes::decoupled::fragments_geometry_entries();
         let global_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("frame + objects"),
             entries: &globals,
         });
         let mat_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("material"),
-            entries: &material_entries_for(slang.textures.max(1),slang.samplers.max(1)),
+            entries: &material_entries,
         });
         let shadow_entries = camera_shadow_entries_for(ray_shadows,slang.program_trace);
         let shadow_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shadow read"),
             entries: &shadow_entries,
         });
-        let fibre_capture_layout=d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:Some("fibre capture inputs"),entries:&crate::fibre_transport::capture_entries()});
+        let fibre_capture_layout=d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:Some("fibre capture inputs"),entries:&capture_entries});
         let fibre_layout=d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {label:Some("fibre transport capture"),bind_group_layouts:&[Some(&global_layout),Some(&mat_layout),Some(&fibre_capture_layout)],immediate_size:0});
         // Depth and controls read only frame/object + material tables.
         let depth_layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1265,9 +1758,9 @@ impl CachedPipelines {
         });
         let fragments_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("transparent fragments"),
-            entries: &crate::passes::decoupled::fragments_entries(),
+            entries: &fragments_entries,
         });
-        let fragments_geometry_layout=crate::passes::decoupled::fragments_geometry_layout(d);
+        let fragments_geometry_layout=d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:Some("transparent opacity geometry"),entries:&fragments_geometry_entries});
         let fragments_pipeline_layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("decoupled transparent fragments"),
             bind_group_layouts: &if slang.program_trace {vec![Some(&global_layout),Some(&mat_layout),Some(&fragments_layout),Some(&fragments_geometry_layout),Some(&shadow_layout)]} else {vec![Some(&global_layout),Some(&mat_layout),Some(&fragments_layout),Some(&fragments_geometry_layout)]},
@@ -1294,9 +1787,10 @@ impl CachedPipelines {
             },
             count: None,
         };
+        let output_entries=vec![output_entry];
         let output_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("encoder surface"),
-            entries: &[output_entry],
+            entries: &output_entries,
         });
         let resolve_bind_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("resolve and motion resources"),
@@ -1308,16 +1802,28 @@ impl CachedPipelines {
             immediate_size: 0,
         });
 
-        let identity = Self::identity(source, resolve, raster_samples, ray_shadows, &slang, r.output_format());
-        let kernel_identity = Self::kernel_identity(source, raster_samples, ray_shadows, &slang);
+        let scene_groups=vec![Some(globals),Some(material_entries.clone())];
+        let mut depth_groups=scene_groups.clone();
+        if slang.program_trace {depth_groups.push(Some(shadow_entries.clone()));}
+        let mut fragment_groups=scene_groups.clone();
+        fragment_groups.extend([Some(fragments_entries),Some(fragments_geometry_entries)]);
+        if slang.program_trace {fragment_groups.push(Some(shadow_entries.clone()));}
+        let mut fibre_groups=scene_groups;
+        fibre_groups.push(Some(capture_entries));
         Self {
-            kernel_identity,
+            material_entries,
+            probes: slang.probes,
             decoupled_merge: OnceLock::new(),
             raster_samples,
             denoise,
-            identity,
+            depth_identity: layout_identity(&depth_groups),
+            fragments_identity: layout_identity(&fragment_groups),
+            fibre_identity: layout_identity(&fibre_groups),
+            shadow_identity: layout_identity(&[Some(shadow_entries)]),
+            resolve_identity: layout_identity(&[Some(resolve_entries),Some(output_entries)]),
             ray_shadows,
             field_controls: slang.field_controls,
+            software_raster: slang.software_raster,
             program_trace: slang.program_trace,
             // Every raster role uses native Slang.
             shader: Box::new(crate::slang_forward::SlangForward::new(
@@ -1362,7 +1868,7 @@ impl CachedPipelines {
 /// Scene globals (frame.slang), read by raster stages and the compute kernels that shade surfaces.
 pub(crate) fn raster_global_entries()->Vec<wgpu::BindGroupLayoutEntry> {
     let mut entries=global_entries();
-    entries.push(buffer_entry(10,wgpu::ShaderStages::VERTEX,wgpu::BufferBindingType::Storage {read_only:true}));
+    entries.push(buffer_entry(11,wgpu::ShaderStages::VERTEX,wgpu::BufferBindingType::Storage {read_only:true}));
     entries
 }
 pub(crate) fn global_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
@@ -1414,6 +1920,7 @@ pub(crate) fn global_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
                     false,
                 ),
             ];
+    entries.push(buffer_entry(10, wgpu::ShaderStages::FRAGMENT, wgpu::BufferBindingType::Storage {read_only:true}));
     for e in &mut entries {e.visibility |= wgpu::ShaderStages::COMPUTE;}
     entries
 }
@@ -1421,30 +1928,35 @@ pub(crate) fn global_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
 pub(crate) fn material_entries(_rays: bool) -> Vec<wgpu::BindGroupLayoutEntry> {material_entries_for(1,1)}
 /// Per-stage resource slots a pipeline layout binds, as Metal counts them
 /// (binding arrays use one buffer slot for their argument table).
-#[cfg(test)]
 #[derive(Clone,Copy,Debug,PartialEq,Eq)]
 pub(crate) struct StageResources {pub buffers:u32,pub textures:u32,pub samplers:u32}
 /// The tightest per-stage limits of the backends we ship: Metal.
-#[cfg(test)]
 pub(crate) const METAL_STAGE_LIMITS:StageResources=StageResources {buffers:31,textures:128,samplers:16};
-#[cfg(test)]
 pub(crate) fn stage_resources(groups:&[&[wgpu::BindGroupLayoutEntry]],stage:wgpu::ShaderStages)->StageResources {
     let mut r=StageResources {buffers:0,textures:0,samplers:0};
+    let mut sizes = stage == wgpu::ShaderStages::VERTEX;
     for e in groups.iter().flat_map(|g|g.iter()).filter(|e|e.visibility.contains(stage)) {
+        sizes |= matches!(e.ty,wgpu::BindingType::Buffer {ty:wgpu::BufferBindingType::Storage {..},..});
         let [buffers,textures,samplers]=e.ty.metal_resource_slots(e.count);
         r.buffers+=u32::from(buffers);
         r.textures+=u32::from(textures);
         r.samplers+=u32::from(samplers);
     }
+    r.buffers += u32::from(sizes);
     r
 }
 /// Fails when a pipeline layout would exceed a shipped backend's per-stage limits, on any host.
-#[cfg(test)]
 pub(crate) fn check_stage_limits(label:&str,groups:&[&[wgpu::BindGroupLayoutEntry]],stage:wgpu::ShaderStages)->anyhow::Result<()> {
     let r=stage_resources(groups,stage);let m=METAL_STAGE_LIMITS;
     anyhow::ensure!(r.buffers<=m.buffers && r.textures<=m.textures && r.samplers<=m.samplers,
-        "pipeline layout {label} binds {} buffers, {} textures and {} samplers to one stage; Metal allows {}, {} and {}",r.buffers,r.textures,r.samplers,m.buffers,m.textures,m.samplers);
+        crate::gpu_memory::DeviceLimit(format!("pipeline layout {label} binds {} buffers, {} textures and {} samplers to one stage; Metal allows {}, {} and {}",r.buffers,r.textures,r.samplers,m.buffers,m.textures,m.samplers)));
     Ok(())
+}
+/// Scene-sized scalar storage layouts must leave room for uniforms and Metal's
+/// implicit sizes buffer, in addition to the device's storage-only limit.
+pub(crate) fn scalar_storage_limit(limits:&wgpu::Limits,metal:bool,uniforms:u32)->u32 {
+    let native=if metal {METAL_STAGE_LIMITS.buffers.saturating_sub(uniforms+1)} else {u32::MAX};
+    limits.max_storage_buffers_per_shader_stage.min(native)
 }
 pub(crate) fn material_entries_for(textures:u32,samplers:u32) -> Vec<wgpu::BindGroupLayoutEntry> {
     let textures=textures.max(vork_slang::registry::MATERIAL_TEXTURE_CAPACITY);
@@ -1641,8 +2153,9 @@ mod control_resolve_tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn composited_previs_subsurface_installs_control_resolve() -> Result<()> {
-        let Some(renderer) = crate::test_renderer()? else { return Ok(()); };
+        let renderer = crate::test_renderer()?;
         let features = EffectPlan {
             compositor: true, subsurface: true,
             outputs: Some(crate::compositor::Dependencies {
@@ -1738,8 +2251,9 @@ pub(crate) fn control_resolve_entries(samples: u32, denoise: bool) -> Vec<wgpu::
 #[cfg(test)]
 mod raster_control_tests {
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn raster_coverage_counts_have_distinct_shared_registry_entries() -> anyhow::Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let single = r.cached_pipelines(1);
         let msaa = r.cached_pipelines(crate::constants::RASTER_MSAA_SAMPLES);
         assert!(!std::sync::Arc::ptr_eq(&single, &msaa));
@@ -1763,8 +2277,8 @@ pub(crate) fn cluster_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
 }
 
 /// The same scene globals for ray kernels, independent of their image bindings.
-pub(crate) fn ray_globals<'a>(s: &'a InstalledScene, uniform: &'a wgpu::Buffer, objects: &'a wgpu::Buffer, lights: &'a wgpu::Buffer, clusters: &'a wgpu::Buffer, cluster_lights: &'a wgpu::Buffer) -> Vec<wgpu::BindGroupEntry<'a>> {
-    vec![entry(0,uniform.as_entire_binding()),entry(1,objects.as_entire_binding()),entry(2,lights.as_entire_binding()),
+pub(crate) fn ray_globals<'a>(s: &'a InstalledScene, uniform: &'a wgpu::Buffer, objects: &'a wgpu::Buffer, lights: &'a wgpu::Buffer, clusters: &'a wgpu::Buffer, cluster_lights: &'a wgpu::Buffer, light_tree: &'a wgpu::Buffer) -> Vec<wgpu::BindGroupEntry<'a>> {
+    vec![entry(10,light_tree.as_entire_binding()),entry(0,uniform.as_entire_binding()),entry(1,objects.as_entire_binding()),entry(2,lights.as_entire_binding()),
         entry(3,wgpu::BindingResource::TextureView(&s.environment.specular)),entry(4,wgpu::BindingResource::Sampler(&s.environment.sampler)),
         entry(5,wgpu::BindingResource::TextureView(&s.environment.diffuse)),entry(6,wgpu::BindingResource::TextureView(&s.environment.brdf)),
         entry(7,clusters.as_entire_binding()),entry(8,cluster_lights.as_entire_binding()),entry(9,wgpu::BindingResource::TextureView(&s.environment.ltc))]
@@ -1796,10 +2310,11 @@ mod foreground_admission_tests {
         });
     }
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn panicked_variant_worker_fails_settle_instead_of_hanging() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         // A standalone compiler: the renderer's own drop also settles its workers.
-        let compiler = Compiler::new(&r.device, None, Known::default());
+        let compiler = Compiler::new(&r.device, None, Known::default(), Blob::ledger_only());
         compiler.spawn_variant(VariantCompile::Background, || panic!("injected variant failure"));
         compiler.spawn_variant(VariantCompile::Background, || Err(anyhow::anyhow!("injected compile failure")));
         let (settled_tx, settled) = std::sync::mpsc::channel();
@@ -1828,7 +2343,7 @@ pub(crate) fn warm_builtin(r: &Renderer) -> Result<()> {
         for attributes in 0..=crate::constants::PRECOMPILED_ATTRIBUTE_SLOTS as u32 {
             for denoise in [false, true] {
                 let p = if denoise || attributes>0 {
-                    std::sync::Arc::new(CachedPipelines::with_sources(r, "", RESOLVE,
+                    std::sync::Arc::new(CachedPipelines::with_sources(r, RESOLVE,
                         samples, false, crate::slang_forward::SlangScene { denoise, attributes, ..Default::default() }))
                 } else { r.cached_pipelines(samples) };
                 if attributes == 0 {
@@ -1903,7 +2418,7 @@ mod registry_identity_tests {
     fn plain_hit_preserves_capabilities_and_rejects_complex_materials() {
         use crate::forward_variant::*;
         for features in [FEATURE_SPECIALIZED, FEATURE_SPECIALIZED | FeatureMask::from(SHADING_METAL)
-            | FEATURE_SIDED | FEATURE_LIGHT_TYPES | FEATURE_FINITE | FEATURE_RECTANGLE] {
+            | FEATURE_LIGHT_TYPES | FEATURE_FINITE | FEATURE_RECTANGLE] {
             let ProgramKernel::Gi { features: plain } = (ProgramKernel::Gi { features }).plain_hit().unwrap() else { unreachable!() };
             assert_eq!(features & !plain, 0, "a plain hit key may only add capabilities");
             assert_eq!(plain & ((1 << (TEXTURE_FEATURES + 2)) - 4), 0, "no texture lookups");
@@ -1916,29 +2431,33 @@ mod registry_identity_tests {
         }
     }
     #[test]
-    fn surface_warm_keys_ignore_display_denoise_and_camera_programs() {
-        let base=crate::slang_forward::SlangScene::default();
-        let mut changed=base.clone();
-        changed.denoise=true;
-        changed.camera=Some(std::sync::Arc::new(crate::camera_program::Native {
-            modules:vec![("camera".into(),"different camera rays".into())],include:vec![],
-        }));
-        changed.propagation=Some(crate::propagation::Native {
-            modules:vec![("propagation".into(),"path-only segment hook".into())],include:vec![],words:vec![],
-        });
-        assert_eq!(CachedPipelines::kernel_identity("",1,true,&base),CachedPipelines::kernel_identity("",1,true,&changed));
-        // The complete registry still distinguishes those consumers and output state.
-        assert_ne!(CachedPipelines::identity("","standard",1,true,&base,wgpu::TextureFormat::Rgba8Unorm),
-            CachedPipelines::identity("","agx",1,true,&changed,wgpu::TextureFormat::Rgba16Float));
-        changed.connection_transmission=true;
-        assert_ne!(CachedPipelines::kernel_identity("",1,true,&base),CachedPipelines::kernel_identity("",1,true,&changed));
-        changed=base.clone();changed.textures=8;
-        assert_ne!(CachedPipelines::kernel_identity("",1,true,&base),CachedPipelines::kernel_identity("",1,true,&changed));
+    fn a_path_kernel_names_one_prebuilt_engine_per_family() {
+        use crate::forward_variant::*;
+        let path = |features, boundaries| ProgramKernel::Path { adaptive: true, catchers: false, random_walk: false,
+            features, boundaries, emitter_profiles: false, media: None };
+        let engine = path(FEATURE_SPECIALIZED | FEATURE_COAT | FEATURE_TRANSMISSION, 1).path_engine().unwrap();
+        assert_eq!(path(FEATURE_SPECIALIZED, 1).path_engine(), Ok(engine), "the material mix does not select an engine");
+        assert_eq!(engine.path_engine(), Ok(engine), "an engine key is its own engine");
+        assert_ne!(path(FEATURE_SPECIALIZED, 0).path_engine(), Ok(engine), "boundary capacity is a family");
+        let ProgramKernel::Path { features, emitter_profiles, .. } = engine else { unreachable!() };
+        assert!(features & FEATURE_SPECIALIZED == 0 && emitter_profiles, "every capability, as Unspecialized states them");
+        assert!(crate::surface_native::PathEngine::ALL.contains(&crate::surface_native::PathEngine { adaptive: true, boundaries: 1 }));
+        // What a capability cannot express has no family: the scene compiles its own kernel.
+        assert!(path(FEATURE_SPECIALIZED, crate::surface_native::PathEngine::BOUNDARIES + 1).path_engine().is_err());
+        assert!(path(FEATURE_SPECIALIZED | FEATURE_IMPLICIT_GEOMETRY, 0).path_engine().is_err());
+        for kernel in [
+            ProgramKernel::Path { adaptive: true, catchers: true, random_walk: false, features: FEATURE_SPECIALIZED, boundaries: 0, emitter_profiles: false, media: None },
+            ProgramKernel::Path { adaptive: true, catchers: false, random_walk: true, features: FEATURE_SPECIALIZED, boundaries: 0, emitter_profiles: false, media: None },
+            ProgramKernel::Path { adaptive: true, catchers: false, random_walk: false, features: FEATURE_SPECIALIZED, boundaries: 0, emitter_profiles: false, media: Some(1) },
+            ProgramKernel::Gi { features: FEATURE_SPECIALIZED },
+        ] {
+            assert!(kernel.path_engine().is_err(), "{kernel:?}");
+        }
     }
-
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn mesh_edit_reuses_pipelines_across_field_policy() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let root=std::path::Path::new(".");
         let document=serde_json::json!({"version":2,"nodes":[
             {"type":"mesh","geometry":{
@@ -1981,50 +2500,333 @@ mod registry_identity_tests {
     }
 
     #[test]
-    fn mesh_keys_ignore_field_admission_policy() {
-        let mesh=crate::slang_forward::SlangScene::default();
-        let policy=crate::slang_forward::SlangScene {approximate_field_boundaries:true,..mesh.clone()};
-        assert!(!policy.approximate_field_admission(), "mesh variants must omit the field define");
-        assert_eq!(CachedPipelines::kernel_identity("",1,false,&mesh),
-            CachedPipelines::kernel_identity("",1,false,&policy));
-        assert_eq!(CachedPipelines::identity("",RESOLVE,1,false,&mesh,wgpu::TextureFormat::Rgba8Unorm),
-            CachedPipelines::identity("",RESOLVE,1,false,&policy,wgpu::TextureFormat::Rgba8Unorm));
-        let exact=crate::slang_forward::SlangScene {field_controls:true,..mesh};
-        let approximate=crate::slang_forward::SlangScene {field_controls:true,..policy};
-        assert!(approximate.approximate_field_admission());
-        assert_ne!(CachedPipelines::kernel_identity("",1,false,&exact),
-            CachedPipelines::kernel_identity("",1,false,&approximate));
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+    fn first_opaque_gltf_insertion_reuses_scene_shaders() -> Result<()> {
+        let r = crate::test_renderer()?;
+        let root=std::env::temp_dir().join(format!("vork-gltf-insertion-{}",std::process::id()));
+        std::fs::create_dir_all(&root)?;
+        let positions=[[-1f32,-1.,0.],[1.,-1.,0.],[0.,1.,0.]];
+        let normals=[[0f32,0.,1.];3];
+        let bytes:Vec<u8>=positions.iter().chain(&normals).flatten().flat_map(|v|v.to_le_bytes()).collect();
+        std::fs::write(root.join("triangle.bin"),bytes)?;
+        std::fs::write(root.join("triangle.gltf"),serde_json::to_vec(&serde_json::json!({
+            "asset":{"version":"2.0"},"scene":0,"scenes":[{"nodes":[0]}],"nodes":[{"mesh":0}],
+            "meshes":[{"primitives":[{"attributes":{"POSITION":0,"NORMAL":1}}]}],
+            "buffers":[{"uri":"triangle.bin","byteLength":72}],
+            "bufferViews":[{"buffer":0,"byteLength":36},{"buffer":0,"byteOffset":36,"byteLength":36}],
+            "accessors":[{"bufferView":0,"componentType":5126,"count":3,"type":"VEC3","min":[-1,-1,0],"max":[1,1,0]},
+                {"bufferView":1,"componentType":5126,"count":3,"type":"VEC3"}]
+        }))?)?;
+        let geometry=serde_json::json!({"attributes":{
+            "POSITION":{"type":"vec3","data":positions},"NORMAL":{"type":"vec3","data":normals}},
+            "indices":{"type":"u32","data":[0,1,2]}});
+        // Match the imported default's response and vertex layout: insertion adds
+        // geometry, not a new material capability. Also retain an authored program
+        // to catch invalidation of unrelated program shaders.
+        for programmed in [false,true] {
+            let mut document=serde_json::json!({"version":2,"nodes":[
+                {"type":"mesh","geometry":geometry,"materials":[{"double_sided":false,
+                    "inputs":{"base_color":[1,1,1],"base_metalness":1,"specular_roughness":1}}]},
+                {"type":"camera","translation":[0,0,4],"target":[0,0,0]},
+                {"type":"light","shape":"environment","color":[0.2,0.2,0.2]}]});
+            if programmed {
+                document["programs"]=serde_json::json!({"paint":{"source":"import vork; struct Inputs {}; Closure surface(ShadingContext ctx, Inputs i) { Closure c={}; c.base_color=float3(.4,.2,.1); return c; }"}});
+                document["materials"]=serde_json::json!({"paint":{"program":"paint"}});
+                document["nodes"].as_array_mut().unwrap().push(serde_json::json!({
+                    "type":"mesh","geometry":geometry,"materials":["paint"],"translation":[-2,0,0]}));
+            }
+            let mut scene=crate::test_scene(document,&root)?;
+            scene.render.resolution=[64,36];
+            let intent=serde_json::from_value(serde_json::json!({"samples":1,"denoise":false}))?;
+            scene.render.settings=vork_scene::Profile::load("std/draft")?.resolve(&intent)?;
+            let options=||InstallOptions {variants:VariantCompile::Inline,..Default::default()};
+            let first=r.install_with_options(scene.clone(),&root,options())?;
+            r.compiler.settle()?;
+            let known=r.compiler.known.lock().unwrap().keys.clone();
+            let creation_start=crate::timing::creations(&r.device).len();
+            scene.nodes.push(serde_json::from_value(serde_json::json!({
+                "type":"asset","file":"triangle.gltf","translation":[2,0,0]}))?);
+            let edited=r.install_with_options(scene,&root,options())?;
+            r.compiler.settle()?;
+            assert!(std::sync::Arc::ptr_eq(&first.pipelines,&edited.pipelines),
+                "first opaque glTF invalidated scene shaders (programmed={programmed})");
+            assert_eq!(r.compiler.known.lock().unwrap().keys,known,
+                "first opaque glTF admitted new shader keys (programmed={programmed})");
+            let creations=crate::timing::creations(&r.device);
+            assert!(creations[creation_start..].iter().all(|c|c.kind!="Slang"),
+                "first opaque glTF recompiled shaders: {:?}",creations[creation_start..].iter().map(|c|(&c.kind,&c.label)).collect::<Vec<_>>());
+        }
+        std::fs::remove_dir_all(root)?;
+        r.errors.check()?;
+        Ok(())
+    }
+
+    fn identity_store_entries(root:&std::path::Path)->std::collections::BTreeSet<std::ffi::OsString> {
+        std::fs::read_dir(root).unwrap().map(|entry|entry.unwrap().file_name()).filter(|name| {
+            let name=name.to_string_lossy();name.contains(".slang-variant-") || name.contains(".slang-input-")
+        }).collect()
+    }
+    fn identity_geometry(attributes:u32)->GeometryKey {
+        (crate::geometry::VertexLayout {points:false,deform:false,tangent:false,uv:[crate::constants::VERTEX_DEFAULT_UV;2],color:false,custom:attributes as u8},Role::Controls(0))
+    }
+    #[test]
+    fn release_inline_preparation_keeps_exact_movie_variants() -> Result<()> {
+        use crate::forward_variant::FEATURE_SPECIALIZED;
+        let r=pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        let registry=std::sync::Arc::new(CachedPipelines::with_sources(
+            &r,RESOLVE,1,false,crate::slang_forward::SlangScene {no_shadow_containment:true,..Default::default()}));
+        for kernel in [ProgramKernel::Gi {features:FEATURE_SPECIALIZED},ProgramKernel::Reflections {features:FEATURE_SPECIALIZED}] {
+            let install=|mode:&VariantCompile|match kernel {
+                ProgramKernel::Gi {features}=>passes::ao::ray_pipeline(&r,&registry,features,false,mode),
+                ProgramKernel::Reflections {features}=>passes::reflections::pipeline(&r,&registry,features,false,mode),
+                _=>unreachable!(),
+            };
+            assert_eq!(registry.drawn_kernel(kernel,&VariantCompile::Setup,&r.compiler),kernel.superset().unwrap());
+            install(&VariantCompile::Setup)?;
+            assert!(registry.camera_slot(kernel).get().is_none(),"setup must not masquerade as exact coverage");
+            assert_eq!(registry.drawn_kernel(kernel,&VariantCompile::Inline,&r.compiler),kernel);
+            let exact=install(&VariantCompile::Inline)?;
+            assert!(exact.ready() && !exact.deferred());
+            assert!(registry.camera_slot(kernel).get().is_some());
+            assert_eq!(registry.drawn_kernel(kernel,&VariantCompile::Background,&r.compiler),kernel);
+            let created=r.compiler.created();
+            let movie=install(&VariantCompile::Background)?;
+            assert!(movie.ready() && !movie.deferred());
+            assert_eq!(r.compiler.created(),created,"movie recreated its prepared exact pipeline");
+        }
+        r.finish_shader_warmup()?;
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+    fn background_compilation_reuses_requested_registry() -> Result<()> {
+        use crate::forward_variant::FEATURE_SPECIALIZED;
+        use crate::slang_forward::SlangScene;
+        let mut r = crate::test_renderer()?;
+        let root=std::env::temp_dir().join(format!("vork-background-identity-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+        std::fs::create_dir(&root)?;
+        r.disk_cache=crate::disk_cache::Store::for_test(root.clone());
+        r.compiler=Compiler::new(&r.device,r.cache.as_ref(),Known::load(root.join("known.entry"),false),r.compiler.blob());
+        let scene=SlangScene {no_shadow_containment:true,..Default::default()};
+        let kernels=[ProgramKernel::Gi {features:FEATURE_SPECIALIZED},ProgramKernel::Reflections {features:FEATURE_SPECIALIZED}];
+        let geometry=std::collections::HashSet::new();
+        let install=|registry:&std::sync::Arc<CachedPipelines>,kernel,mode|match kernel {
+            ProgramKernel::Gi {features}=>passes::ao::ray_pipeline(&r,registry,features,false,mode),
+            ProgramKernel::Reflections {features}=>passes::reflections::pipeline(&r,registry,features,false,mode),
+            _=>unreachable!(),
+        };
+        // Setup has remembered only the plain hit families. Neither exact
+        // specialization is warm when the first scene registry is requested.
+        let setup=std::sync::Arc::new(CachedPipelines::with_sources(&r,RESOLVE,1,false,scene.clone()));
+        for kernel in kernels {install(&setup,kernel.plain_hit().unwrap(),&VariantCompile::Inline)?;}
+        let first=r.program_pipelines(RESOLVE,1,false,scene.clone(),&geometry,&kernels)?;
+        let foreground=r.compiler.foreground_preparation();
+        let mut drawn=Vec::new();
+        for kernel in kernels {
+            assert_eq!(first.drawn_kernel(kernel,&VariantCompile::Background,&r.compiler),kernel.plain_hit().unwrap());
+            let pipeline=install(&first,kernel,&VariantCompile::Background)?;
+            assert!(pipeline.deferred());
+            assert!(!pipeline.ready());
+            drawn.push(pipeline);
+        }
+        drop(foreground);
+        r.compiler.settle()?;
+        assert!(drawn.iter().all(Drawn::ready));
+        for kernel in kernels {
+            assert_eq!(first.drawn_kernel(kernel,&VariantCompile::Background,&r.compiler),kernel);
+        }
+        let created=r.compiler.created();
+        let second=r.program_pipelines(RESOLVE,1,false,scene,&geometry,&kernels)?;
+        assert!(std::sync::Arc::ptr_eq(&first,&second),"background warmth split the requested registry");
+        assert_eq!(r.program_pipelines.lock().unwrap().len(),1);
+        for kernel in kernels {
+            assert!(std::sync::Arc::ptr_eq(&first.camera_slot(kernel),&second.camera_slot(kernel)));
+            let pipeline=install(&second,kernel,&VariantCompile::Background)?;
+            assert!(pipeline.ready());
+            assert!(!pipeline.deferred());
+        }
+        r.compiler.settle()?;
+        assert_eq!(r.compiler.created(),created,"second install recreated an exact pipeline");
+        r.errors.check()?;
+        drop(r);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    fn check_only_does_not_capture_native_pipeline_inputs() -> Result<()> {
+        use crate::slang_forward::SlangScene;
+        let mut r=pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        r.check_only=true;
+        let root=std::env::temp_dir().join(format!("vork-check-identity-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+        std::fs::create_dir(&root)?;
+        r.disk_cache=crate::disk_cache::Store::for_test(root.clone());
+        let attributes=crate::constants::PRECOMPILED_ATTRIBUTE_SLOTS as u32+1;
+        let key=identity_geometry(attributes);
+        let keys=std::collections::HashSet::from([key]);
+        let kernels=[ProgramKernel::Gi {features:0}];
+        let registry=r.program_pipelines(RESOLVE,1,false,SlangScene {attributes,field_controls:true,..Default::default()},&keys,&kernels)?;
+        registry.geometry(&r.compiler,key)?;
+        passes::ao::ray_pipeline(&r,&registry,0,false,&VariantCompile::Setup)?;
+        r.compiler.settle()?;
+        assert!(r.program_pipelines.lock().unwrap().is_empty(),"checks do not retain executable registries");
+        assert!(identity_store_entries(&root).is_empty(),"check captured native inputs or compiled an artifact");
+        r.errors.check()?;
+        drop(r);
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
+    fn unconsumed_flags_reuse_registry_and_pipeline_slots() -> Result<()> {
+        use crate::slang_forward::SlangScene;
+        let mut r = crate::test_renderer()?;
+        let root=std::env::temp_dir().join(format!("vork-identity-{}-{}",std::process::id(),std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_nanos()));
+        std::fs::create_dir(&root)?;
+        r.disk_cache=crate::disk_cache::Store::for_test(root.clone());
+        r.compiler=Compiler::new(&r.device,r.cache.as_ref(),Known::load(root.join("known.entry"),false),r.compiler.blob());
+        let mut expected=Vec::new();
+        for attributes in [0,crate::constants::PRECOMPILED_ATTRIBUTE_SLOTS as u32+1] {
+            let base=SlangScene {attributes,..Default::default()};
+            let key=identity_geometry(attributes);
+            let keys=std::collections::HashSet::from([key]);
+            let registry=r.program_pipelines(RESOLVE,1,false,base.clone(),&keys,&[])?;
+            registry.geometry(&r.compiler,key)?;
+            let remembered=registry.content_key(key).expect("compiled entry has a captured input receipt");
+            expected.push((attributes,remembered.to_hex().to_string()));
+            assert!(r.compiler.is_known(&remembered));
+            let start=crate::timing::creations(&r.device).len();
+            let pipeline_start=r.compiler.created();
+            for (boundary,probes) in [(true,false),(false,true),(true,true)] {
+                let edited=r.program_pipelines(RESOLVE,1,false,SlangScene {no_boundary_transactions:boundary,probes,..base.clone()},&keys,&[])?;
+                assert!(std::sync::Arc::ptr_eq(&registry,&edited),"irrelevant flags split the planned registry");
+                edited.geometry(&r.compiler,key)?;
+                assert_eq!(edited.content_key(key),Some(remembered));
+            }
+            let creations=crate::timing::creations(&r.device);
+            assert_eq!(r.compiler.created(),pipeline_start,"irrelevant flags created a pipeline");
+            assert!(creations[start..].iter().all(|c|c.kind=="shader module"),"irrelevant flags compiled code");
+            eprintln!("identity proof: attributes={attributes}, three non-consumed edits: zero pipelines and zero recompiles; remembered={remembered}");
+            let consumed=r.program_pipelines(RESOLVE,1,false,SlangScene {field_controls:true,..base},&keys,&[])?;
+            assert!(!std::sync::Arc::ptr_eq(&registry,&consumed),"a consumed define/layout must split the registry");
+            consumed.geometry(&r.compiler,key)?;
+            assert_ne!(consumed.content_key(key),Some(remembered));
+            assert!(r.compiler.created()>pipeline_start);
+        }
+        r.settle_pipelines()?;
+        std::fs::write(root.join("expected.json"),serde_json::to_vec(&expected)?)?;
+        r.errors.check()?;
+        drop(r);
+        let status=std::process::Command::new(std::env::current_exe()?)
+            .args(["--ignored","--exact","pipelines::registry_identity_tests::persistent_keys_reuse_unconsumed_flags","--nocapture","--test-threads=1"])
+            .env("VORK_IDENTITY_TEST_STORE",&root).status()?;
+        assert!(status.success(),"fresh-process reuse failed");
+        std::fs::remove_dir_all(root)?;
+        Ok(())
+    }
+    #[test]
+    #[ignore="spawned by the registry test with its isolated persisted cache"]
+    fn persistent_keys_reuse_unconsumed_flags() -> Result<()> {
+        use crate::slang_forward::SlangScene;
+        let root=std::path::PathBuf::from(std::env::var_os("VORK_IDENTITY_TEST_STORE").expect("parent supplies persisted test store"));
+        let expected:Vec<(u32,String)>=serde_json::from_slice(&std::fs::read(root.join("expected.json"))?)?;
+        let mut r = crate::test_renderer()?;
+        r.disk_cache=crate::disk_cache::Store::for_test(root.clone());
+        r.compiler=Compiler::new(&r.device,r.cache.as_ref(),Known::load(root.join("known.entry"),true),r.compiler.blob());
+        let entries=identity_store_entries(&root);
+        let start=crate::timing::creations(&r.device).len();
+        for (attributes,expected) in expected {
+            let key=identity_geometry(attributes);
+            let keys=std::collections::HashSet::from([key]);
+            let registry=r.program_pipelines(RESOLVE,1,false,SlangScene {attributes,no_boundary_transactions:true,probes:true,..Default::default()},&keys,&[])?;
+            let remembered=registry.content_key(key).expect("persisted compiler receipt");
+            assert_eq!(remembered.to_hex().as_str(),expected);
+            assert!(r.compiler.is_known(&remembered),"fresh process missed remembered key");
+            registry.geometry(&r.compiler,key)?;
+        }
+        assert!(crate::timing::creations(&r.device)[start..].iter().all(|c|c.kind!="Slang" && c.kind!="SPIR-V optimization"));
+        assert_eq!(identity_store_entries(&root),entries,"non-consumed flags created cache entries");
+        eprintln!("identity proof: fresh process: zero recompiles, identical remembered keys and native cache entries");
+        r.errors.check()
     }
 
     #[test]
     fn remembered_keys_cover_shader_inputs_and_descriptor_capacities() {
-        let base=crate::slang_forward::SlangScene::default();
-        let key=|s:&crate::slang_forward::SlangScene|CachedPipelines::identity("",RESOLVE,1,false,s,wgpu::TextureFormat::Rgba8Unorm);
-        let mut sentinel=base.clone();sentinel.textures=1;sentinel.samplers=1;
-        assert_eq!(key(&base),key(&sentinel),"zero counts create the same one-element sentinel tables");
-        for changed in [
-            crate::slang_forward::SlangScene {attributes:1,..base.clone()},
-            crate::slang_forward::SlangScene {textures:2,..base.clone()},
-            crate::slang_forward::SlangScene {samplers:2,..base.clone()},
-            crate::slang_forward::SlangScene {aov_count:1,..base.clone()},
-            crate::slang_forward::SlangScene {surface_coverage:true,..base.clone()},
-            crate::slang_forward::SlangScene {field_controls:true,..base.clone()},
-            crate::slang_forward::SlangScene {bounded_secondary_compilation:true,..base.clone()},
-            crate::slang_forward::SlangScene {field_controls:true,approximate_field_boundaries:true,..base.clone()},
-            crate::slang_forward::SlangScene {no_points:true,..base.clone()},
-            crate::slang_forward::SlangScene {no_shadow_containment:true,..base.clone()},
-            crate::slang_forward::SlangScene {probes:true,..base.clone()},
-        ] {assert_ne!(key(&base),key(&changed));}
-        let medium=|homogeneous|crate::slang_forward::SlangScene {
-            medium:Some(std::sync::Arc::new(medium::Native {homogeneous,..Default::default()})),..base.clone()
-        };
-        assert_ne!(key(&medium(true)),key(&medium(false)));
+        use crate::slang_forward::SlangScene;
+        let base=SlangScene::default();
+        let request=|scene:&SlangScene|scene.test_entry_inputs("scene_controls",("controls_fs","fragment"),None);
+        let (args,key)=request(&base);
+        assert!(args.iter().any(|arg|arg=="-DVORK_NO_IMPLICIT"));
+        assert!(args.iter().any(|arg|arg=="-DVORK_NO_CONNECTION_TRANSMISSION"));
+        assert!(args.iter().any(|arg|arg=="-DVORK_NO_GAUSSIANS"));
+        for (changed,define,present) in [
+            (SlangScene {aov_count:1,..base.clone()},"-DVORK_AOV_COUNT=1",true),
+            (SlangScene {field_controls:true,..base.clone()},"-DVORK_NO_IMPLICIT",false),
+            (SlangScene {software_raster:true,..base.clone()},"-DVORK_SOFTWARE_RASTER",true),
+            (SlangScene {connection_transmission:true,..base.clone()},"-DVORK_NO_CONNECTION_TRANSMISSION",false),
+            (SlangScene {no_points:true,..base.clone()},"-DVORK_NO_POINTS",true),
+            (SlangScene {gaussians:true,..base.clone()},"-DVORK_NO_GAUSSIANS",false),
+            (SlangScene {no_shadow_containment:true,..base.clone()},"-DVORK_NO_SHADOW_CONTAINMENT",true),
+            (SlangScene {program_trace:true,..base.clone()},"-DVORK_PROGRAM_TRACE",true),
+            (SlangScene {field_controls:true,approximate_field_boundaries:true,..base.clone()},"-DVORK_APPROXIMATE_FIELD_ADMISSION",true),
+        ] {
+            let (emitted,changed_key)=request(&changed);
+            assert_eq!(emitted.iter().any(|arg|arg==define),present,"{define}");
+            assert_ne!(key,changed_key,"emitted compiler input {define} must change identity");
+        }
+        assert_eq!(material_entries_for(0,0),material_entries_for(1,1));
+        assert_eq!(material_entries_for(1,1),material_entries_for(vork_slang::registry::MATERIAL_TEXTURE_CAPACITY,vork_slang::registry::MATERIAL_SAMPLER_CAPACITY));
+        for entries in [material_entries_for(vork_slang::registry::MATERIAL_TEXTURE_CAPACITY+1,1),material_entries_for(1,vork_slang::registry::MATERIAL_SAMPLER_CAPACITY+1)] {
+            assert_ne!(layout_identity(&[Some(material_entries_for(1,1))]),layout_identity(&[Some(entries)]));
+        }
     }
+
 }
 
 #[cfg(test)]
 mod stage_limit_tests {
     use super::*;
+    #[test]
+    fn metal_reserves_sizes_once_per_stage_and_for_vertex_pulling() {
+        let storage=buffer_entry(0,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:true});
+        let uniform=buffer_entry(1,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Uniform);
+        assert_eq!(stage_resources(&[&[uniform]],wgpu::ShaderStages::COMPUTE).buffers,1);
+        assert_eq!(stage_resources(&[&[storage],&[storage,uniform]],wgpu::ShaderStages::COMPUTE).buffers,4);
+        assert_eq!(stage_resources(&[&[storage]],wgpu::ShaderStages::FRAGMENT).buffers,0);
+        assert_eq!(stage_resources(&[],wgpu::ShaderStages::VERTEX).buffers,1);
+    }
+
+    #[test]
+    fn scalar_admission_includes_uniforms_and_native_sizes() {
+        let limits=wgpu::Limits {max_storage_buffers_per_shader_stage:31,..Default::default()};
+        for uniforms in [0,1,2] {
+            let allowed=scalar_storage_limit(&limits,true,uniforms);
+            let mut entries=(0..uniforms).map(|i|buffer_entry(i,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Uniform)).collect::<Vec<_>>();
+            entries.extend((0..allowed).map(|i|buffer_entry(i+uniforms,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:true})));
+            check_stage_limits("dynamic scalar layout",&[&entries],wgpu::ShaderStages::COMPUTE).unwrap();
+            entries.push(buffer_entry(allowed+uniforms,wgpu::ShaderStages::COMPUTE,wgpu::BufferBindingType::Storage {read_only:false}));
+            assert!(check_stage_limits("dynamic scalar overflow",&[&entries],wgpu::ShaderStages::COMPUTE).is_err());
+            assert_eq!(scalar_storage_limit(&limits,false,uniforms),31);
+        }
+    }
+
+    #[test]
+    fn scene_sized_camera_layouts_fit_metal() {
+        // Array capacities vary with allowed scene content. Each table takes
+        // one Metal argument-buffer slot, including arrays of textures/samplers.
+        for (textures,samplers,pages) in [(1,1,1),(4096,128,1024)] {
+            for rays in [false,true] {for trace in [false,true] {for samples in [1,4,32] {
+                let owned=[raster_global_entries(),material_entries_for(textures,samplers),
+                    camera_shadow_entries_for(rays,trace),passes::decoupled::camera_geometry_entries_for(pages),
+                    passes::decoupled::camera_entries(samples)];
+                let groups=owned.iter().map(Vec::as_slice).collect::<Vec<_>>();
+                for stage in [wgpu::ShaderStages::VERTEX,wgpu::ShaderStages::FRAGMENT,wgpu::ShaderStages::COMPUTE] {
+                    check_stage_limits("decoupled shade",&groups,stage).unwrap();
+                }
+            }}}
+        }
+    }
+
     #[test]
     fn stage_limits_use_executor_slots_for_mixed_resource_arrays() {
         let stage=wgpu::ShaderStages::COMPUTE;
@@ -2032,7 +2834,7 @@ mod stage_limit_tests {
         let texture=wgpu::BindGroupLayoutEntry {visibility:stage,..texture_entry(1,wgpu::TextureSampleType::Float {filterable:true},false)};
         let sampler=wgpu::BindGroupLayoutEntry {visibility:stage,..sampler_entry(2,false)};
         let array=|entry:wgpu::BindGroupLayoutEntry|wgpu::BindGroupLayoutEntry {count:std::num::NonZeroU32::new(64),..entry};
-        let scalars=(0..31).map(|binding|wgpu::BindGroupLayoutEntry {binding,..scalar}).collect::<Vec<_>>();
+        let scalars=(0..30).map(|binding|wgpu::BindGroupLayoutEntry {binding,..scalar}).collect::<Vec<_>>();
         let texture_array=[array(texture)];
         assert!(check_stage_limits("scalar buffers plus texture array",&[&scalars,&texture_array],stage)
             .unwrap_err().to_string().contains("32 buffers"));
@@ -2043,10 +2845,10 @@ mod stage_limit_tests {
         let mixed=[array(scalar),array(texture),array(sampler),array(storage),texture,sampler,storage,
             wgpu::BindGroupLayoutEntry {binding:3,visibility:stage,ty:wgpu::BindingType::AccelerationStructure {vertex_return:false},count:None},
             wgpu::BindGroupLayoutEntry {visibility:wgpu::ShaderStages::FRAGMENT,..array(texture)}];
-        assert_eq!(stage_resources(&[&scalars[..26],&mixed],stage),
+        assert_eq!(stage_resources(&[&scalars[..25],&mixed],stage),
             StageResources {buffers:31,textures:2,samplers:1});
-        check_stage_limits("mixed arrays at limit",&[&scalars[..26],&mixed],stage).unwrap();
-        assert!(check_stage_limits("mixed arrays overflow",&[&scalars[..27],&mixed],stage).is_err());
+        check_stage_limits("mixed arrays at limit",&[&scalars[..25],&mixed],stage).unwrap();
+        assert!(check_stage_limits("mixed arrays overflow",&[&scalars[..26],&mixed],stage).is_err());
 
         // Composite resource kinds must also retain every executor slot.
         let external=[wgpu::BindGroupLayoutEntry {binding:0,visibility:stage,ty:wgpu::BindingType::ExternalTexture,count:None}];
@@ -2060,11 +2862,11 @@ mod stage_limit_tests {
             ty: wgpu::BindingType::Buffer {ty: wgpu::BufferBindingType::Storage {read_only:true}, has_dynamic_offset:false, min_binding_size:None},
             count: std::num::NonZeroU32::new(8),
         };
-        let mut entries = (0..31).map(|i| buffer(i, wgpu::ShaderStages::COMPUTE)).collect::<Vec<_>>();
-        entries.push(buffer(31, wgpu::ShaderStages::FRAGMENT));
+        let mut entries = (0..30).map(|i| buffer(i, wgpu::ShaderStages::COMPUTE)).collect::<Vec<_>>();
+        entries.push(buffer(30, wgpu::ShaderStages::FRAGMENT));
         assert_eq!(stage_resources(&[&entries], wgpu::ShaderStages::COMPUTE).buffers, 31);
         check_stage_limits("at limit", &[&entries], wgpu::ShaderStages::COMPUTE).unwrap();
-        entries[31].visibility = wgpu::ShaderStages::COMPUTE;
+        entries[30].visibility = wgpu::ShaderStages::COMPUTE;
         assert!(check_stage_limits("overflow", &[&entries], wgpu::ShaderStages::COMPUTE).unwrap_err().to_string().contains("32 buffers"));
         for (ty, limit) in [(wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering), 16),
             (wgpu::BindingType::Texture {sample_type:wgpu::TextureSampleType::Float {filterable:true}, view_dimension:wgpu::TextureViewDimension::D2, multisampled:false},128)] {

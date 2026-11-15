@@ -47,6 +47,7 @@ impl State {
 }
 
 pub(crate) struct Instance {
+    pub standard_camera: bool,
     pub node: usize,
     pub material: String,
     pub id: u32,
@@ -57,11 +58,7 @@ pub(crate) struct Instance {
     pub words: Vec<u32>,
     pub program: std::sync::Arc<vork_slang::CameraProgram>,
 }
-#[derive(Clone, Default)]
-pub(crate) struct Native {
-    pub modules: Vec<(String,String)>,
-    pub include: Vec<PathBuf>,
-}
+pub(crate) use crate::camera_dispatch_native::Native;
 
 /// Resolve all possible view cameras once with the same default and cut semantics.
 /// Aspects belong to views, not to the camera's position in the node list.
@@ -112,40 +109,60 @@ pub(crate) fn install(r: &Renderer, scene: &v2::Scene, nodes: &mut [EvalNode], b
         for &[w,h] in &views[&n.node.name] {
             n.camera.as_ref().unwrap().calibration(w as f32/h as f32)?;
         }
-        result.push(Instance {node,material:name.clone(),id:result.len() as u32+1,offset:0,spectral,unit_weight,uses_time,words,program});
+        result.push(Instance {standard_camera:material.program=="std/camera",node,material:name.clone(),id:result.len() as u32+1,offset:0,spectral,unit_weight,uses_time,words,program});
     }
     Ok(result)
 }
 
-pub(crate) fn native(instances: &[Instance]) -> Native {
-    use std::fmt::Write;
-    let mut native=Native {modules:programs::abi().native_modules(),include:Vec::new()};
-    let mut imports="import vork;\n".to_owned();
-    let mut cameras=String::new();let mut sensors=String::new();
-    for instance in instances {
-        let id=instance.id;
-        let name=format!("camera_program_{}",instance.program.camera_entry.as_ref().or(instance.program.sensor_entry.as_ref()).unwrap());
-        if !native.modules.iter().any(|(module,_)|module==&name) {
-            writeln!(imports,"import {name};").unwrap();
-            let mut source=instance.program.native.clone();
-            for dependency in &instance.program.dependencies {
-                if let Ok(bytes)=std::fs::read(dependency) {writeln!(source,"// dependency {}",blake3::hash(&bytes)).unwrap();}
-            }
-            native.modules.push((name,source));
-            native.include.extend(instance.program.include.clone());
+/// The radius about the camera position that holds every ray origin std/camera
+/// (libraries/std/camera.slang) produces under certificate `c` at `resolution`,
+/// in camera-axis units. A ray starts at its near-plane point: the position,
+/// plus the lens point, plus clip_start times (forward + aim); an orthographic
+/// ray starts at the film point pushed clip_start forward. Film coordinates
+/// reach the screen edge plus the path film filter's 1.5 pixel support.
+/// Propagated rays start at the lens or film point itself, inside the same ball.
+fn origin_radius(c: &[[f32;4];4], resolution: [u32;2]) -> f32 {
+    let [screen, clip, aperture, _] = c;
+    let film = |axis: usize| (1. + 3. / resolution[axis] as f32 + screen[2 + axis].abs()) / screen[axis];
+    let film = film(0).hypot(film(1));
+    // The shared raster lens point and this sample's own are each within the aperture.
+    let lens = 2. * aperture[0];
+    if clip[2] != 0. {lens + film + clip[0]} else {lens + clip[0] * (1. + film + if aperture[0] > 0. {aperture[0] / aperture[1]} else {0.})}
+}
+/// Balls holding every origin that any sample of any reachable camera can
+/// start from, for the life of the install; None when some camera's are not
+/// known. A camera is known when it is std/camera with constant inputs, its
+/// position is at rest, and an open aperture does not focus on an object (the
+/// aim then scales with a distance evaluated each frame). `resolutions` are
+/// all view sizes: every camera is bounded at each.
+pub(crate) fn origin_balls(instances: &[Instance], nodes: &[EvalNode], animated: &BTreeMap<String,BTreeSet<String>>, resolutions: &[[u32;2]], at_rest: impl Fn(usize)->bool) -> Result<Option<Vec<(Vec3,f32)>>> {
+    if instances.is_empty() || resolutions.is_empty() {return Ok(None);}
+    let mut balls=Vec::new();
+    for p in instances {
+        let node=&nodes[p.node];
+        if !p.standard_camera || animated.contains_key(&p.material) || !at_rest(p.node) {return Ok(None);}
+        let state=node.camera.as_ref().context("camera program installed")?;
+        let focus_object=matches!(node.node.kind,NodeKind::Camera {focus_object:Some(_),..});
+        let mut radius=0_f32;
+        for &[w,h] in resolutions {
+            let Some(c)=state.calibration(w as f32/h as f32)? else {return Ok(None);};
+            if c[2][0]>0. && focus_object {return Ok(None);}
+            radius=radius.max(origin_radius(&c,[w,h]));
         }
-        if let Some(entry)=&instance.program.camera_entry {
-            let entry=entry.split("_0_").next().unwrap();
-            writeln!(cameras,"case {id}u: {{float4 r[3];{entry}(ctx,base,r);ray.origin=r[0].xyz;ray.wavelength_scale=r[0].w;ray.direction=r[1].xyz;ray.t_min=r[1].w;ray.weight=r[2].xyz;ray.t_max=r[2].w;break;}}").unwrap();
-        }
-        if let Some(entry)=&instance.program.sensor_entry {
-            let entry=entry.split("_0_").next().unwrap();
-            writeln!(sensors,"case {id}u: {{float4 r[1];{entry}(ctx,base,r);return r[0].xyz;}}").unwrap();
-        }
+        // The view frame is orthonormal about the node's world position
+        // (values::node_view), so camera-axis units are world units.
+        let centre=node.world.w_axis.truncate();
+        // f32 evaluation of the origin in the kernel stays far inside this slack.
+        let radius=radius*1.001+1e-5*(centre.abs().max_element()+radius);
+        if !centre.is_finite() || !radius.is_finite() {return Ok(None);}
+        balls.push((centre,radius));
     }
-    let contexts=include_str!("../../vork-slang/src/camera_context.slang")
-        .replace("CameraContext","PathCameraContext").replace("CameraRay","PathCameraRay").replace("SensorContext","PathSensorContext");
-    native.modules.push(("camera_dispatch".into(),format!("{imports}\n{contexts}\npublic PathCameraRay camera_dispatch(uint id,uint base,PathCameraContext p) {{CameraContext ctx=CameraContext(p.film_size,p.uv,p.lens_sample,p.time,p.focus_distance,p.origin,p.right,p.up,p.forward);PathCameraRay ray;ray.origin=ctx.origin;ray.direction=ctx.forward;switch(id) {{{cameras}}}return ray;}}\npublic float3 sensor_dispatch(uint id,uint base,PathSensorContext p) {{SensorContext ctx=SensorContext(p.path_length,p.wavelength,p.uv,p.time);switch(id) {{{sensors}}}return float3(1.);}}")));
+    Ok(Some(balls))
+}
+
+pub(crate) fn native(instances: &[Instance]) -> Native {
+    let mut native=crate::camera_dispatch_native::generate(&programs::abi(),instances.iter().map(|i|(i.id,i.program.as_ref())));
+    native.standard_camera=instances.len()==1 && instances[0].id==1 && instances[0].standard_camera;
     native
 }
 
@@ -158,6 +175,10 @@ pub(crate) fn selection(scene: &InstalledScene, node: usize, state: &EvalNode, a
 /// Views inherit transport settings. Camera cuts and render images keep every
 /// reachable camera in the same traced registry; wavelength mode remains per view.
 pub(crate) fn promote(r: &Renderer, scene: &mut v2::Scene, base: &Path, initial_time: impl Into<vork_time::Request>) -> Result<bool> {
+    promote_in(r, scene, base, initial_time, &Default::default())
+}
+/// [`promote`] within a document open, reading media through the sources that open read.
+pub(crate) fn promote_in(r: &Renderer, scene: &mut v2::Scene, base: &Path, initial_time: impl Into<vork_time::Request>, opened: &crate::footage::Opened) -> Result<bool> {
     fn collect(nodes: &[v2::Node], out: &mut Vec<EvalNode>) {
         for node in nodes {
             if matches!(node.kind,NodeKind::Camera {..}) {out.push(EvalNode {node:node.without_children(),camera:None,parent:None,world:Mat4::IDENTITY,dynamic:false,embedded:None});}
@@ -165,7 +186,7 @@ pub(crate) fn promote(r: &Renderer, scene: &mut v2::Scene, base: &Path, initial_
         }
     }
     let mut nodes=Vec::new();collect(&scene.nodes,&mut nodes);
-    let animation=animation::Plan::compile_with_buffers(scene,base,None)?;
+    let animation=animation::Plan::compile_in(scene,base,None,opened)?;
     let views=views(scene,&nodes,&animation,initial_time);
     let animated=materials::animated_inputs(scene)?;
     let programs=install(r,scene,&mut nodes,base,&views)?;
@@ -255,12 +276,13 @@ mod tests {
     use serde_json::{Value, json};
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn aperture_refinement_respects_views_and_world_transport() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let available=r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY | crate::rt::HIT_BUFFER_FEATURES);
         let base:v2::Scene=v2::from_test_value(json!({"version":2,
             "render":{"camera":"main","resolution":[8,8]},
-            "materials":{"fog":{"program":"std/fog","inputs":{"height_falloff":0.05}}},
+            "materials":{"fog":{"program":{"source":include_str!("../../vork-scene/tests/fixtures/medium.slang")},"inputs":{"height_falloff":0.05}}},
             "nodes":[{"type":"camera","name":"main"},
                 {"type":"camera","name":"lens","material":{"program":"std/camera","inputs":{"use_dof":true}}}]}))?;
         let mut unused=base.clone();promote(&r,&mut unused,Path::new("."),0.)?;
@@ -282,8 +304,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn aperture_refinement_covers_clock_and_capture_aspect() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let available=r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY | crate::rt::HIT_BUFFER_FEATURES);
         for (condition,capture,expected) in [("time>0.5",false,true),("aspect<1.",false,false),("aspect<1.",true,true),("false",true,false)] {
             let source=include_str!("../../../libraries/std/camera.slang")
@@ -301,7 +324,7 @@ mod tests {
 
     fn scene(source: &str, medium: bool) -> Value {
         let mut value=json!({"version":2,
-            "render":{"resolution":[16,16],"background":[0,0,0],"display":{"program":"std/standard","inputs":{"dither_intensity":0}}},
+            "composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[16,16],"background":[0,0,0]},
             "programs":{"test":{"source":source}},
             "materials":{"test":{"program":"test"},"black":{"inputs":{"base_weight":0,"specular_weight":0}}},
             "buffers":{"p":{"type":"vec3","data":[[-10,-10,-2],[10,-10,-2],[0,10,-2]]}},
@@ -352,8 +375,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn only_reachable_camera_programs_admit_transport() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let source="struct Inputs {}; CameraRay camera(CameraContext c,Inputs i){CameraRay r;r.origin=c.origin;r.direction=c.forward;r.t_min=.1;r.t_max=1000.;return r;}";
         let base=json!({"version":2,"render":{"resolution":[8,8],"camera":"ordinary"},
             "programs":{"custom":{"source":source}},"materials":{"custom":{"program":"custom"}},
@@ -374,8 +398,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn installation_validates_only_reachable_camera_aspects() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         let source="struct Inputs {}; CameraRay camera(CameraContext c,Inputs i){CameraRay r;r.origin=c.origin;r.direction=c.forward;r.t_min=.1;r.t_max=1000.;return r;} CameraCalibration camera_calibration(float aspect,float focus,float time,Inputs i){CameraCalibration c;c.screen=float4(aspect==2. && time<1.?1.:-1.,1.,0.,0.);c.clip=float4(.1,1000.,0.,1.);return c;}";
         let base=json!({"version":2,"render":{"resolution":[8,8],"camera":"main"},
             "programs":{"aspect":{"source":source}},"materials":{"aspect":{"program":"aspect"}},
@@ -414,8 +439,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn signed_spectral_samples_preserve_a_white_environment() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         for composite in [false,true] {
             let mut input:crate::Scene=serde_json::from_value(json!({"version":2,
                 "render":{"resolution":[8,8]},
@@ -425,7 +451,7 @@ mod tests {
                 "materials":{"sensor":{"program":"sensor"},"copy":{"program":"copy","inputs":{"source":{"channel":"color"}}}},
                 "nodes":[{"type":"camera","material":"sensor"},
                     {"type":"light","shape":"environment","energy":1,"color":[1,1,1]}]}))?;
-            if composite {input.render.compositor=serde_json::from_value(json!(["copy"]))?;}
+            if composite {*input.compositor_mut()=serde_json::from_value(json!(["copy"]))?;}
             input.render.settings=serde_json::from_value(json!({"integrator":"path","samples":4096,"denoiser":null}))?;
             let installed=r.install(input,Path::new("."))?;
             assert!(installed.camera_programs[0].spectral);
@@ -439,8 +465,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn spectral_emitter_surface_and_medium_receive_path_wavelength() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         // A zero/unset context makes these black. No camera/sensor program is
         // present: the authored output dependency must promote RGB to spectra.
         let sources=[
@@ -469,8 +496,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn unused_emitter_wavelength_keeps_rgb_in_raster_and_path() -> Result<()> {
-        let Some(r)=crate::test_renderer()? else {return Ok(())};
+        let r = crate::test_renderer()?;
         // Both surface and source are constant RGB even though the source reads
         // wavelength. This also compiles emission dispatch outside path kernels.
         let source="struct Inputs {}; Closure surface(ShadingContext c,Inputs i) {float unused=c.wavelength;return unlit(float3(.25));}";

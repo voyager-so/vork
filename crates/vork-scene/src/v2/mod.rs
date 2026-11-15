@@ -1,6 +1,10 @@
 //! Version 2 authoring contract: the one scene model the renderer installs.
+mod output;
+pub use output::{ColorConversion, OutputDestination, OutputDisplay, WorkingColorSpace};
 pub use vork_time::Time;
 pub mod animation;
+pub mod canvas;
+mod compose;
 mod constants;
 pub mod diagnostics;
 pub mod geometry;
@@ -14,9 +18,13 @@ pub mod profile;
 pub mod render;
 mod schema;
 pub mod targets;
+pub mod text;
+pub mod time;
 mod validate;
 pub use animation::*;
-use anyhow::{Context, Result, ensure};
+pub use canvas::{AspectRatio, Composition, DashArray, FillRule, Fit, ImagePaint, LineCap, LineJoin, NoDash, NoPaint, Paint, PaintLayer, PaintOrder, Space};
+pub use text::{Content, Direction, FontFiles, FontStyle, FontWeight, FontWeightKeyword, LineBreak, LineHeight, LineHeightNormal, Run, TextAlign, TextUnit, UnitProperty, WhiteSpace, WordBreak, laid_out_runs, laid_out_text, transform_origin, unit_ranges};
+use anyhow::{Context, Result, bail, ensure};
 pub use constants::OPENPBR;
 pub use geometry::*;
 pub use light::*;
@@ -24,12 +32,13 @@ pub use material::*;
 pub use node::*;
 pub use profile::*;
 pub use render::*;
+pub use time::*;
 pub use schema::{api_field, documents, lookup_only_field, schema};
 pub use validate::validate_openpbr_input;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeMap, path::Path};
-pub use targets::{NodeProperty, Ray, RenderProperty, TrackTarget, TrackValue, display_path};
+pub use targets::{StyleProperty, StyleInterpolation, NodeProperty, Ray, RenderProperty, TrackTarget, TrackValue, display_path};
 
 // Serde buffers untagged/flattened fields through deserialize_any. Restore
 // JSON's exact-number representation before lowering a numeric field to f32/f64.
@@ -74,6 +83,10 @@ pub struct Scene {
     pub delivery: bool,
     #[schemars(extend("x-source" = "vork (explicit contract/technique choice)", "x-help-path" = "scene.version", "x-help" = "2"))]
     pub version: u32,
+    /// `{space: "2d"}`: the document is a 2D canvas. Absent: a 3D world.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(extend("x-source" = "END-STATE-API §7", "x-help-path" = "scene.composition", "x-help" = "composition|null; space 2d = canvas, 3d = world; null = 3D world"))]
+    pub composition: Option<Composition>,
     #[serde(default)]
     #[schemars(extend("x-source" = "vork (explicit contract/technique choice)", "x-help-path" = "scene.render", "x-help" = "render"))]
     pub render: Render,
@@ -126,6 +139,9 @@ pub struct Propagation {
     /// World-space minimum and maximum in metres; rays leaving continue straight.
     pub bounds: [[f32; 3]; 2],
 }
+/// The deepest nesting of arrays and objects a scene document may have (the JSON reader's admission limit).
+pub const MAX_JSON_DEPTH: usize = 127;
+
 impl Scene {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path).with_context(|| format!("read scene {}", path.display()))?;
@@ -145,24 +161,131 @@ impl Scene {
         Self::decode_with_source(bytes,authored,file,false)
     }
     fn decode_with_source(bytes:&[u8],authored:&[u8],file:Option<&Path>,require_camera:bool)->Result<Self> {
+        let scene = Self::parse_json_with_source(bytes, authored, file)?;
+        scene.validate_content(require_camera).map_err(|error| scene.authored_error(error))?;
+        Ok(scene)
+    }
+    /// Decode resource slots and locations before independent admission checks.
+    /// Callers must validate before using references or installing the scene.
+    #[doc(hidden)]
+    pub fn parse_json_with_source(bytes:&[u8],authored:&[u8],file:Option<&Path>)->Result<Self> {
         let bytes = diagnostics::without_bom(bytes);
-        let mut value: serde_json::Value = serde_json::from_slice(bytes)
-            .map_err(|error| diagnostics::decode_error(bytes, error))?;
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| diagnostics::nesting_error(&error, "scene").unwrap_or_else(|| diagnostics::decode_error(bytes, error)))?;
+        Self::parse_value(value, authored, file, |error| diagnostics::decode_error(bytes, error))
+    }
+    /// Admit an expanded document without encoding and parsing it again. The document is consumed. When a
+    /// field fails to decode, `pre_lowering` makes the same document once more, for the diagnostics byte
+    /// admission gives: no copy of it is held for an error that does not happen.
+    #[doc(hidden)]
+    pub fn parse_value_with_source(value: serde_json::Value, authored: &[u8], file: Option<&Path>,
+        pre_lowering: impl FnOnce() -> Result<serde_json::Value>) -> Result<Self> {
+        // serde_json's byte parser rejects the 128th nested array/object. Expansion
+        // can add nesting to otherwise admitted input. Bound this walk and retain
+        // byte admission's exact error and precedence for those exceptional values.
+        fn reaches_input_limit(value: &serde_json::Value, remaining: u8) -> bool {
+            match value {
+                serde_json::Value::Array(values) => remaining == 1
+                    || values.iter().any(|value| reaches_input_limit(value, remaining - 1)),
+                serde_json::Value::Object(values) => remaining == 1
+                    || values.values().any(|value| reaches_input_limit(value, remaining - 1)),
+                _ => false,
+            }
+        }
+        if reaches_input_limit(&value, MAX_JSON_DEPTH as u8 + 1) {
+            return Self::parse_json_with_source(&serde_json::to_vec(&value)?, authored, file);
+        }
+        Self::parse_value(value, authored, file, |error| {
+            match pre_lowering().and_then(|value| Ok(serde_json::to_vec(&value)?)) {
+                Ok(bytes) => diagnostics::decode_error(&bytes, error),
+                Err(_) => error.into(),
+            }
+        })
+    }
+    fn parse_value(mut value: serde_json::Value, authored: &[u8], file: Option<&Path>,
+        decode_error: impl FnOnce(serde_json::Error) -> anyhow::Error) -> Result<Self> {
+        // Inline resource names and admission diagnostics must not depend on map storage.
+        value.sort_all_objects();
         ensure!(value.pointer("/render/settings").is_none(),
             "render.settings: render settings are not scene content; choose them with --profile (vork help profiles)");
+        // Tests switch final dither off on a parsed document (Render::dither); authored scenes cannot.
+        #[cfg(not(any(test, feature = "test-support")))]
+        ensure!(value.pointer("/render/dither").is_none(), "render.dither: output encoding owns dither; it is not scene content");
         ensure!(value.pointer("/render/integrator").is_none() && value.pointer("/render/samples").is_none(),
             "render.integrator and render.samples are render settings, not scene content; choose --profile std/draft, std/final or std/path (vork help profiles)");
+        fn refuse_sound(nodes: Option<&serde_json::Value>) -> Result<()> {
+            if let Some(nodes) = nodes.and_then(serde_json::Value::as_array) {
+                for node in nodes {
+                    ensure!(
+                        node.get("audio").and_then(|a| a.get("program")).is_none(),
+                        "node {}: sound programs are not built yet",
+                        node.get("name")
+                            .and_then(serde_json::Value::as_str)
+                            .unwrap_or("<unnamed>")
+                    );
+                    refuse_sound(node.get("children"))?;
+                }
+            }
+            Ok(())
+        }
+        refuse_sound(value.get("nodes"))?;
+        // The view and the image graph belong to a composition: the scene's, or a rendered image's.
+        // One line names every move, so an old scene is rewritten in one pass. The authored document is walked
+        // before inline resources are hoisted, so each path is the one the author wrote: an image may be inline
+        // in any material input. A scene's own composition must also say its space, which an old scene never
+        // wrote: a scene without a composition is a world.
+        fn moved_fields(value: &serde_json::Value, path: &str, moved: &mut Vec<String>) {
+            match value {
+                serde_json::Value::Object(fields) => {
+                    if let Some(render) = fields.get("render").filter(|render| render.is_object()) {
+                        if path.is_empty() {
+                            if render.get("display").is_some() { moved.push("render.display was removed; use composition.view".into()); }
+                            if render.get("view").is_some() { moved.push("render.view: use composition.view".into()); }
+                        }
+                        if render.get("compositor").is_some() {
+                            let field = |owner: &str| diagnostics::member(&diagnostics::member(path, owner), "compositor");
+                            moved.push(format!("{} was removed; use {}", field("render"), field("composition")));
+                        }
+                    }
+                    for (name, field) in fields { moved_fields(field, &diagnostics::member(path, name), moved); }
+                }
+                serde_json::Value::Array(items) => {
+                    for (index, item) in items.iter().enumerate() { moved_fields(item, &format!("{path}[{index}]"), moved); }
+                }
+                _ => {}
+            }
+        }
+        fn refuse_moved_fields(value: &serde_json::Value) -> Result<()> {
+            let mut moved = Vec::new();
+            moved_fields(value, "", &mut moved);
+            if moved.is_empty() { return Ok(()); }
+            let space = if value.get("render").is_some_and(|render| ["display", "view", "compositor"].iter().any(|field| render.get(field).is_some()))
+                && value.pointer("/composition/space").is_none() {
+                "; composition.space is required too: write \"3d\" (a scene without a composition is a world)"
+            } else { "" };
+            anyhow::bail!("{}{space}; see vork help upgrade", moved.join("; "))
+        }
+        ensure!(value.get("output").is_none() && value.get("outputs").is_none(),
+            "outputs are render-call destinations; use --out with a path or output descriptor");
+        refuse_moved_fields(&value)?;
+        canvas::refuse_unbuilt(&value)?;
         let mut origins = inline::lower(&mut value);
+        render::refuse_node_bindings(&value)?;
         inline::locate(diagnostics::without_bom(authored), &mut origins);
         if let Some(file) = file {
             for path in origins.values_mut().flatten() { *path = format!("{}: {path}", file.display()); }
         }
         let mut scene: Self = serde_json::from_value(value)
-            .map_err(|error| diagnostics::decode_error(bytes, error))?;
+            .map_err(decode_error)?;
         ensure!(!scene.materials.keys().any(|name| name.starts_with("__vork_")),
             "material names starting with __vork_ are reserved for the renderer");
+        for material in scene.materials.values() {
+            ensure!(!matches!(material.program.as_str(), "std/agx" | "std/standard" | "blender/filmic") || !material.inputs.contains_key("dither_intensity"),
+                "{name}: view inputs.dither_intensity was removed; output encoding owns dither: delete the input (1, the default, draws as before; \
+                 0 or more than 1 has no setting: dither scales with the output's bit depth, and grain is a compositor program); see vork help upgrade",
+                name = material.program);
+        }
         scene.origins = origins;
-        scene.validate_content(require_camera).map_err(|error| scene.authored_error(error))?;
         Ok(scene)
     }
     /// Add authored users to errors without changing normalized resource identity.
@@ -175,7 +298,10 @@ impl Scene {
     }
 
     pub fn validate(&self) -> Result<()> { self.validate_content(true) }
-    fn validate_content(&self,require_camera:bool)->Result<()> {
+    /// Validate graph content; sample-only consumers do not require a camera.
+    pub fn validate_content(&self,require_camera:bool)->Result<()> {
+        self.validate_compositions()?;
+        if self.has_composition_parts() { return self.validate_parts(require_camera); }
         if let Some(p) = &self.propagation {
             ensure!(self.programs.contains_key(&p.program), "unknown propagation program {}", p.program);
             ensure!(p.bounds.iter().flatten().all(|v|v.is_finite()) && (0..3).all(|i|p.bounds[0][i]<p.bounds[1][i]), "propagation.bounds must have finite ordered endpoints");
@@ -183,7 +309,7 @@ impl Scene {
 
         ensure!(
             self.version == 2,
-            "version {}: only scene version 2 is supported",
+            "version {}: only scene version 2 is supported; rewrite the scene using version 2 fields (vork help)",
             self.version
         );
         for names in [
@@ -244,7 +370,8 @@ impl Scene {
             Ok(())
         }
         visit(&self.nodes, &mut names, &mut groups, &mut cameras, &mut has_assets)?;
-        ensure!(!require_camera || cameras > 0 || has_assets, "scene requires at least one camera");
+        self.validate_canvas(&names)?;
+        ensure!(!require_camera || cameras > 0 || has_assets || self.is_canvas(), "scene requires at least one camera");
         fn validate_links(nodes: &[Node], groups: &std::collections::HashSet<&str>) -> Result<()> {
             for node in nodes {
                 if let NodeKind::Light {
@@ -266,19 +393,22 @@ impl Scene {
             Ok(())
         }
         validate_links(&self.nodes, &groups)?;
-        for b in self.buffers.values() {
+        let mut errors = Vec::new();
+        errors.extend(self.buffers.values().map(|b| -> Result<()> {
             ensure!(
                 b.dims.is_some() || b.data.is_some() != b.file.is_some(),
                 "buffer requires dims or exactly one of data or file"
             );
-        }
-        for p in self.programs.values() {
+            Ok(())
+        }).filter_map(Result::err));
+        errors.extend(self.programs.values().map(|p| -> Result<()> {
             ensure!(
                 p.source.is_some() != p.file.is_some(),
                 "program requires exactly one of source or file"
             );
-        }
-        for g in self.geometry.values() {
+            Ok(())
+        }).filter_map(Result::err));
+        errors.extend(self.geometry.values().map(|g| -> Result<()> {
             ensure!(
                 matches!(g.topology, Topology::Volume | Topology::Implicit) || g.attributes.contains_key("POSITION"),
                 "geometry requires POSITION"
@@ -290,15 +420,19 @@ impl Scene {
                     diagnostics::unknown("buffer", b, self.buffers.keys().map(String::as_str))
                 );
             }
-        }
-        for l in &self.animation {
+            Ok(())
+        }).filter_map(Result::err));
+        errors.extend(self.animation.iter().map(|l| -> Result<()> {
             ensure!(
                 l.tracks.is_some() != l.clip.is_some(),
                 "layer requires exactly one of tracks or clip"
             );
-        }
-        self.validate_image_sources(&names)?;
-        self.validate_resources(&names,require_camera)
+            Ok(())
+        }).filter_map(Result::err));
+        if let Err(error) = self.validate_image_sources(&names) {errors.push(error);}
+        if let Err(error) = self.validate_media_clocks() {errors.push(error);}
+        if let Err(error) = self.validate_resources(&names,require_camera) {errors.push(error);}
+        diagnostics::joined(errors)
     }
 }
 
@@ -312,6 +446,139 @@ pub(super) fn validate_name(s: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn expanded_value_admission_preserves_numbers_names_and_locations() {
+        let authored = br#"{
+            "version":2,
+            "render":{"duration":1.2300},
+            "nodes":[{"type":"camera","name":"camera","translation":[0.1,-0.0,0.84551240822557006],
+                "material":{"program":"std/camera","inputs":{"lens":35,"exact":9007199254740993,"tiny":1e-1000,"exponent":1.234e+20}}}]
+        }"#;
+        let value: serde_json::Value = serde_json::from_slice(authored).unwrap();
+        let bytes = serde_json::to_vec(&value).unwrap();
+        for file in [None, Some(Path::new("project/scene.json"))] {
+            let from_bytes = Scene::parse_json_with_source(&bytes, authored, file).unwrap();
+            let from_value = Scene::parse_value_with_source(value.clone(), authored, file, || Ok(value.clone())).unwrap();
+            assert_eq!(serde_json::to_vec(&from_value).unwrap(), serde_json::to_vec(&from_bytes).unwrap());
+            assert_eq!(from_value.origins, from_bytes.origins);
+            assert!(!from_value.origins.is_empty());
+        }
+    }
+
+    #[test]
+    fn expanded_value_admission_preserves_input_depth_and_error_precedence() {
+        let authored = br#"{"version":2,"nodes":[]}"#;
+        let file = Some(Path::new("project/scene.json"));
+        for depth in [127, 128, 129, 256] {
+            let mut nested = serde_json::Value::Null;
+            // The scene object contributes the final container level. Alternate
+            // arrays and objects to exercise both branches of the bounded walk.
+            for level in 1..depth {
+                nested = if level % 2 == 0 { serde_json::json!({"nested":nested}) }
+                    else { serde_json::Value::Array(vec![nested]) };
+            }
+            let value = serde_json::json!({"version":2,"render":{"settings":{}},"expanded":nested});
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let expected = Scene::parse_json_with_source(&bytes, authored, file).unwrap_err();
+            let again = value.clone();
+            let actual = Scene::parse_value_with_source(value, authored, file, || Ok(again)).unwrap_err();
+            assert_eq!(format!("{actual:#}"), format!("{expected:#}"), "depth {depth}");
+            assert_eq!(actual.to_string().contains("recursion limit exceeded"), depth >= 128);
+            if depth < 128 { assert!(actual.to_string().contains("render.settings")); }
+        }
+    }
+
+    #[test]
+    fn expanded_value_admission_accepts_deep_nodes_below_input_limit() {
+        let authored = br#"{"version":2,"nodes":[]}"#;
+        // Root object + nodes array + 62 pairs of group/children containers +
+        // the camera object reach depth 127, immediately below the parser limit.
+        let mut node = serde_json::json!({"type":"camera"});
+        for _ in 0..62 { node = serde_json::json!({"type":"node","children":[node]}); }
+        let value = serde_json::json!({"version":2,"nodes":[node]});
+        let bytes = serde_json::to_vec(&value).unwrap();
+        let expected = Scene::parse_json_with_source(&bytes, authored, None).unwrap();
+        let again = value.clone();
+        let actual = Scene::parse_value_with_source(value, authored, None, || Ok(again)).unwrap();
+        assert_eq!(serde_json::to_vec(&actual).unwrap(), serde_json::to_vec(&expected).unwrap());
+        assert_eq!(actual.origins, expected.origins);
+    }
+
+    #[test]
+    fn expanded_value_admission_preserves_pre_lowering_errors() {
+        let authored = br#"{"version":2,"nodes":[{"type":"camera","material":{"program":"std/camera"}}]}"#;
+        for extra in [
+            serde_json::json!({"geometry":{"expanded":{"attributes":{"POSITION":42}}}}),
+            serde_json::json!({"nodes":[{"type":"camera","material":{"program":42}}]}),
+            serde_json::json!({"animation":[{"blend":"add"}]}),
+        ] {
+            let mut value: serde_json::Value = serde_json::from_slice(authored).unwrap();
+            value.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let bytes = serde_json::to_vec(&value).unwrap();
+            let file = Some(Path::new("project/scene.json"));
+            let expected = Scene::parse_json_with_source(&bytes, authored, file).unwrap_err();
+            let again = value.clone();
+            let actual = Scene::parse_value_with_source(value, authored, file, || Ok(again)).unwrap_err();
+            assert_eq!(format!("{actual:#}"), format!("{expected:#}"));
+        }
+    }
+
+    #[test]
+    fn object_key_order_does_not_change_admission_diagnostics() {
+        let first = br#"{"version":2,"nodes":[{"zzz":1,"aaa":2}]}"#;
+        let second = br#"{"nodes":[{"aaa":2,"zzz":1}],"version":2}"#;
+        assert_eq!(
+            format!("{:#}", Scene::from_json(first).unwrap_err()),
+            format!("{:#}", Scene::from_json(second).unwrap_err()),
+        );
+    }
+
+    #[test]
+    fn unbuilt_two_d_fields_are_refused_in_one_line() {
+        let camera = serde_json::json!({"type":"camera"});
+        let text = serde_json::json!({"type":"text","content":"Hi","font":"a.ttf"});
+        for (document, line) in [
+            (serde_json::json!({"version":2,"nodes":[camera,text]}), "scene.nodes[1]: type \"text\": text in a 3D world is not built yet; put it in a canvas (composition {space: \"2d\"})"),
+            (serde_json::json!({"version":2,"nodes":[camera,{"type":"path","d":"M0 0H1"}]}), "scene.nodes[1]: type \"path\": a path in a 3D world is not built yet; put it in a canvas (composition {space: \"2d\"}), or extrude it with std extrude"),
+            (serde_json::json!({"version":2,"nodes":[camera,{"children":[{"opacity":0.5}]}]}), "scene.nodes[1].children[0].opacity: 2D is not built yet in a 3D world; put it in a canvas (composition {space: \"2d\"})"),
+            (serde_json::json!({"version":2,"nodes":[camera,{"clip-path":"shape"}]}), "scene.nodes[1].clip-path: 2D is not built yet in a 3D world; put it in a canvas (composition {space: \"2d\"})"),
+            (serde_json::json!({"version":2,"nodes":[camera,{"mask":"shape"}]}), "scene.nodes[1].mask: 2D is not built yet in a 3D world; put it in a canvas (composition {space: \"2d\"})"),
+            (serde_json::json!({"version":2,"nodes":[camera,{"composition":{"space":"3d"}}]}), "scene.nodes[1].composition: a world inside a 3D world is not built yet; its nodes are already in the world"),
+            (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[camera]}), "scene.nodes[0]: type \"camera\": a 2D canvas holds group, text and path nodes; camera in a canvas is not built yet; put it in a world (composition {space: \"3d\"})"),
+            (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[{"type":"text","content":[{"content":"a","fill":{"program":"p"}}],"font":"a.ttf"}]}), "scene.nodes[0].content[0].fill: a program paint is not built yet; write a CSS colour or gradient, or {\"image\": name}"),
+            (serde_json::json!({"version":2,"composition":{"space":"2d"},"render":{"background":[0,0,0]},"nodes":[text]}), "render.background: a 2D canvas's background is \"transparent\" or a CSS colour"),
+            (serde_json::json!({"version":2,"composition":{"space":"2d"},"render":{"camera":"c"},"nodes":[text]}), "render.camera: not built for a 2D canvas yet; a canvas takes render.resolution, fps, duration and background"),
+            (serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[{"type":"text","content":"a","font":"a.ttf","white-space":"pre"}]}), "node \"\": white-space \"pre\" is not built yet; normal, nowrap and pre-line are"),
+        ] {
+            let error = Scene::from_json(&serde_json::to_vec(&document).unwrap()).unwrap_err().to_string();
+            assert_eq!(error, line);
+        }
+        let canvas = Scene::from_json(&serde_json::to_vec(&serde_json::json!({"version":2,"composition":{"space":"2d"},"nodes":[{"name":"group","children":[text]}]})).unwrap()).unwrap();
+        assert!(canvas.is_canvas());
+    }
+    #[test]
+    fn an_ordinary_node_serializes_without_node_time() {
+        // The release refuses `active` at parse, so a written scene must not gain a default one.
+        let scene = Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera","name":"cam"},{"name":"n"}]}"#).unwrap();
+        let written = serde_json::to_value(&scene).unwrap();
+        assert!(written["nodes"].as_array().unwrap().iter().all(|node| node.get("active").is_none()), "{written}");
+        let window: Node = serde_json::from_value(serde_json::json!({"name": "n", "active": [0, 2]})).unwrap();
+        assert_eq!(serde_json::to_value(&window).unwrap()["active"], serde_json::json!([0, 2]));
+    }
+    #[test]
+    fn node_time_is_read_from_the_document() {
+        // Section 3's `active`, `time` and node `animation`, and scene tracks keying a node's clock (rule 8).
+        let scene = Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera","name":"cam"},
+            {"name":"shot","active":[1,3],"time":{"offset":2,"speed":2},"animation":[{"tracks":[{"path":["translation"],"keys":[[0,[0,0,0]],[1,[1,0,0]]]}]}]},
+            {"name":"n","time":{}}],
+            "animation":[{"tracks":[{"path":["nodes","n","active"],"keys":[[0,true],[1,false]]},{"path":["nodes","n","time","speed"],"keys":[[0,1],[2,3]]}]}]}"#).unwrap();
+        let shot = scene.nodes.iter().find(|node| node.name == "shot").unwrap();
+        assert!(shot.has_clock() && shot.time.is_some() && shot.animation.len() == 1);
+        let schema = crate::v2::schema().to_value().to_string();
+        for field in ["active", "time", "animation"] {
+            assert!(schema.contains(&format!("node.{field}")), "{field} is in the schema");
+        }
+    }
     #[test]
     fn editor_schema_is_optional_metadata() {
         for url in [crate::SCHEMA_URL, "https://voyager.so/vork/schema/scene.schema.json", "custom editor metadata"] {
@@ -463,15 +730,15 @@ mod tests {
     }
     #[test]
     fn removed_program_diagnostics_route_to_upgrade() {
-        for program in ["std/fog", "post/vignette", "post/lens_distortion", "post/glare"] {
+        for program in ["std/fog", "blender/principled_volume", "post/vignette", "post/lens_distortion", "post/glare"] {
             // Public builds reject removed programs even in unused definitions.
-            if crate::libraries::module_source(program).is_some() { continue; }
+            assert!(crate::libraries::module_source(program).is_none());
             for field in ["materials", "display"] {
                 let mut value = serde_json::json!({"version":2,"nodes":[{"type":"camera"}]});
                 if field == "materials" {
                     value["materials"] = serde_json::json!({"unused":{"program":program}});
                 } else {
-                    value["render"] = serde_json::json!({"display":{"program":program}});
+                    value["composition"] = serde_json::json!({"space":"3d","view":{"program":program}});
                 }
                 let error = parse(value).unwrap_err().to_string();
                 assert!(error.contains("vork help upgrade"), "{program} {field}: {error}");
@@ -486,7 +753,7 @@ mod tests {
         assert!(error.contains("unknown program \"blender/principled\"")
             && error.contains("use std/openpbr"), "{error}");
         assert!(crate::libraries::module_source("blender/principled").is_none());
-        assert_eq!(crate::libraries::module_source("blender/principled_volume").is_some(), cfg!(feature="test-support"));
+        assert!(crate::libraries::module_source("blender/principled_volume").is_none());
     }
     #[test]
     fn camera_material_uses_shared_inline_material() {
@@ -502,7 +769,7 @@ mod tests {
 
     #[test]
     fn openpbr_inputs_are_exactly_the_specification_table() {
-        assert_eq!(OPENPBR.len(), 37);
+        assert_eq!(OPENPBR.len(), 39);
         let line = include_str!("reference.txt").lines()
             .find(|l| l.starts_with("material.inputs (std/openpbr): OpenPBR Surface; shaded inputs:")).unwrap();
         let listed = line.split("shaded inputs: ").nth(1).unwrap().split_whitespace().collect::<Vec<_>>();

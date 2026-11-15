@@ -1,0 +1,18 @@
+# Ported from Moda (desktop-moda native/crates/moda-engine, the text drawing files); the changes are listed in
+# PROVENANCE.md.
+[package]
+name = "moda-text-draw"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+publish = false
+description = "Moda's text drawing on the GPU: the vector glyph lane's batches and the extracted text pipelines."
+
+[dependencies]
+anyhow = "1"
+bytemuck = { version = "1", features = ["derive"] }
+half = "2"
+wgpu = "29"
+moda-text = { path = "../moda-text" }
+moda-shaders = { path = "../moda-shaders" }
+rustc-hash = "2"

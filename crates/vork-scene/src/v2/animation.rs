@@ -17,7 +17,7 @@ pub struct Layer {
     #[schemars(extend("x-source" = "vork (explicit contract/technique choice)", "x-help-path" = "animation.layer.weight", "x-help" = "number"))]
     pub weight: f32,
     #[serde(default)]
-    #[schemars(extend("x-source" = "vork (explicit contract/technique choice)", "x-help-path" = "animation.layer.blend", "x-help" = "replace|add"))]
+    #[schemars(extend("x-source" = "vork (explicit contract/technique choice)", "x-help-path" = "animation.layer.blend", "x-help" = "replace|combine"))]
     pub blend: Blend,
     #[serde(default)]
     #[schemars(extend("x-source" = "vork (explicit contract/technique choice)", "x-help-path" = "animation.layer.offset", "x-help" = "number; source time = offset + time*speed"))]
@@ -34,6 +34,7 @@ pub struct Layer {
 pub enum Blend {
     #[default]
     Replace,
+    #[serde(rename = "combine")]
     Add,
 }
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -66,13 +67,31 @@ pub struct Track {
 #[schemars(title = "Track")]
 struct AuthoredTrack {
     /// Segments naming the keyed property, e.g. ["nodes","Bone.001","rotation"].
-    #[schemars(extend("x-source" = "vork (explicit contract/technique choice)", "x-help-path" = "animation.track.path", "x-help" = "string[]; [\"nodes\",node,property...] | [\"nodes\",asset,\"nodes\",imported-name|#index,property...] | [\"materials\",material,\"inputs\",input] | [\"animation\",layer,\"weight\"] | [\"render\",property...]", "x-help-extra" = "animation.track.path properties: node translation|rotation|scale|visible|visible_camera|visible_shadow|visible_diffuse|visible_glossy|visible_transmission|morph_weights,<morph>, camera/light numeric fields (camera optics are material inputs); imported nodes: translation|rotation|scale|morph_weights|visible\nanimation.track.path render properties: camera|background (RGB)|motion_blur,shutter"))]
+    #[serde(deserialize_with = "path_segments")]
+    #[schemars(with = "Vec<PathSegment>")]
+    #[schemars(extend("x-source" = "vork (explicit contract/technique choice)", "x-help-path" = "animation.track.path", "x-help" = "(string|index)[]; [\"nodes\",node,property...] | [\"nodes\",asset,\"nodes\",imported-name|#index,property...] | [\"materials\",material,\"inputs\",input] | [\"animation\",layer,\"weight\"] | [\"render\",property...] | [\"nodes\",text-node,\"glyphs\"|\"words\"|\"lines\",index,translation|rotation|scale|opacity|fill|stroke|transform-origin]", "x-help-extra" = "animation.track.path properties: node translation|rotation|scale|visible|visible_camera|visible_shadow|visible_diffuse|visible_glossy|visible_transmission|morph_weights,<morph>, camera/light numeric fields (camera optics are material inputs); canvas: filter, clip-path, mask, all path/text style fields; imported nodes: translation|rotation|scale|morph_weights|visible\nanimation.track.path render properties: camera|background (RGB; CSS colour on a canvas)|motion_blur,shutter\nanimation.track.path text pieces: fill and stroke [r,g,b,a] 0..1 or CSS colour/gradient or image paint; transform-origin CSS, default the ink box centre"))]
     path: Vec<String>,
     #[schemars(extend("x-source" = "vork; glTF 2.0 animation samplers", "x-help-path" = "animation.track.keys", "x-help" = "[[time, value], ...] | {times: buffer, values: buffer}; time increasing; CUBICSPLINE [time, value, in_tangent, out_tangent] (tangents per second) or [time, value] (zero tangents); rotation values as in node.rotation"))]
     keys: Keys,
     #[serde(default)]
-    #[schemars(extend("x-source" = "glTF 2.0 LINEAR", "x-help-path" = "animation.track.interpolation", "x-help" = "STEP|LINEAR|CUBICSPLINE; omitted: STEP for strings/bools, else LINEAR"))]
+    #[schemars(extend("x-source" = "glTF 2.0 LINEAR", "x-help-path" = "animation.track.interpolation", "x-help" = "STEP|LINEAR|CUBICSPLINE; omitted: LINEAR for numeric and CSS/SVG fields; STEP for bools and resource tokens"))]
     interpolation: Option<Interpolation>,
+}
+/// A track path segment: a name, or a zero-based index (`["nodes", "title", "glyphs", 3, "opacity"]`).
+#[derive(JsonSchema)]
+#[serde(untagged)]
+#[allow(dead_code)]
+enum PathSegment {
+    Name(String),
+    Index(u32),
+}
+/// Path segments as strings; an index segment is kept as its decimal digits.
+fn path_segments<'de, D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Vec<String>, D::Error> {
+    Vec::<serde_json::Value>::deserialize(deserializer)?.into_iter().map(|segment| match segment {
+        serde_json::Value::String(name) => Ok(name),
+        serde_json::Value::Number(index) if index.is_u64() => Ok(index.to_string()),
+        other => Err(serde::de::Error::custom(format!("a track path segment is a name or a zero-based index, not {other}"))),
+    }).collect()
 }
 /// Keyframes inline as `[time, value]` pairs, or two buffers for bulk data.
 #[derive(Clone, Debug, Serialize, Deserialize, JsonSchema)]
@@ -95,8 +114,10 @@ impl TryFrom<AuthoredTrack> for Track {
                 t.interpolation.unwrap_or_default()),
             Keys::Inline(keys) => {
                 // Names and switches hold until the next key: STEP is the only meaning.
-                let clock_value=matches!(t.path.as_slice(),[root,_,field] if root=="images" && field=="time");
-                let discrete = !clock_value && keys.first().and_then(|k| k.get(1)).is_some_and(|v| v.is_string() || v.is_boolean());
+                let clock_value=matches!(t.path.as_slice(),[root,_,field] if root=="images" && field=="time")
+                    || matches!(t.path.as_slice(),[.., time, speed] if time=="time" && speed=="speed");
+                let css = css_path(&t.path);
+                let discrete = !clock_value && !css && keys.first().and_then(|k| k.get(1)).is_some_and(|v| v.is_string() || v.is_boolean());
                 let interpolation = t.interpolation.unwrap_or(if discrete { Interpolation::Step } else { Interpolation::Linear });
                 let cubic = matches!(interpolation, Interpolation::Cubic);
                 let mut times = Vec::with_capacity(keys.len());
@@ -125,6 +146,25 @@ impl TryFrom<AuthoredTrack> for Track {
         Ok(Self { path: t.path, keys: t.keys, interpolation, times, values })
     }
 }
+/// CSS inference follows target grammar, never program-owned input names.
+fn css_path(path: &[String]) -> bool {
+    if matches!(path, [root, field] if root == "render" && field == "background") { return true; }
+    let mut path = match path {
+        [root, _, rest @ ..] if root == "nodes" => rest,
+        _ => path, // Node-owned tracks start at a property or a child.
+    };
+    while let [root, _, rest @ ..] = path {
+        if root != "children" { break; }
+        path = rest;
+    }
+    match path {
+        [field] => StyleProperty::parse(field).is_some() || matches!(field.as_str(), "fill" | "stroke"),
+        [unit, index, field] => TextUnit::parse(unit).is_some() && index.parse::<usize>().is_ok()
+            && matches!(field.as_str(), "fill" | "stroke" | "transform-origin"),
+        _ => false,
+    }
+}
+
 /// A zero tangent shaped like a key's value.
 fn zero_like(value: &serde_json::Value) -> serde_json::Value {
     match value {
@@ -158,6 +198,39 @@ pub enum Interpolation {
 #[cfg(test)]
 mod key_tests {
     use super::*;
+    #[test]
+    fn css_defaults_follow_absolute_and_node_owned_targets() {
+        for prefix in [vec!["nodes", "title"], vec![], vec!["children", "title"], vec!["children", "group", "children", "title"]] {
+            for suffix in [vec!["fill"], vec!["filter"], vec!["direction"], vec!["glyphs", "1", "fill"], vec!["words", "0", "stroke"], vec!["lines", "0", "transform-origin"]] {
+                let path: Vec<_> = prefix.iter().chain(&suffix).copied().collect();
+                let t = track(serde_json::json!({"path":path,"keys":[[0,"a"],[1,"b"]]})).unwrap();
+                assert!(matches!(t.interpolation, Interpolation::Linear), "{path:?}");
+                let t = track(serde_json::json!({"path":path,"interpolation":"STEP","keys":[[0,"a"],[1,"b"]]})).unwrap();
+                assert!(matches!(t.interpolation, Interpolation::Step));
+            }
+        }
+        for field in ["fill", "direction", "width", "filter", "transform-origin"] {
+            let t = track(serde_json::json!({"path":["materials","m","inputs",field],"keys":[[0,0],[1,1]]})).unwrap();
+            assert!(matches!(t.interpolation, Interpolation::Linear));
+        }
+    }
+
+    #[test]
+    fn combine_is_the_only_serialized_spelling_for_combining_layers() {
+        let blend: Blend = serde_json::from_str("\"combine\"").unwrap();
+        assert_eq!(blend, Blend::Add);
+        assert_eq!(serde_json::to_string(&blend).unwrap(), "\"combine\"");
+        assert_eq!(serde_json::from_str::<Blend>("\"replace\"").unwrap(), Blend::Replace);
+        assert!(serde_json::from_str::<Blend>("\"add\"").is_err());
+        for count in [1, 3] {
+            let bytes = serde_json::to_vec(&serde_json::json!({
+                "version": 2, "animation": vec![serde_json::json!({"blend":"add","tracks":[]}); count],
+            })).unwrap();
+            let error = Scene::parse_json_with_source(&bytes, b"", None).unwrap_err().to_string();
+            assert_eq!(error.lines().count(), 1, "{error}");
+            assert!(error.ends_with("use \"combine\" instead of \"add\"; see `vork help upgrade`"), "{error}");
+        }
+    }
     #[test]
     fn buffer_keys_reject_unknown_fields() {
         let valid = serde_json::json!({"path":["nodes","a","translation"],"keys":{"times":"t","values":"v"}});
@@ -198,7 +271,7 @@ mod output_rate_tests {
     use super::*;
     #[test]
     fn output_rate_decoding_preserves_numeric_inputs() -> anyhow::Result<()> {
-        let scene: Scene = serde_json::from_str(r#"{"version":2,"render":{"fps":29.970000000000001,"background":[0.1,0.2,0.3],"compositor":[{"material":"m","resolution":0.5}]},"materials":{"m":{"inputs":{"base_weight":0.1,"base_color":[0.125,0.25,0.5]}}},"nodes":[{"type":"camera","translation":[0.001,0.2,0.3],"scale":[0.001,0.001,0.001],"rotation":{"euler":[0.01,0.02,0.03]},"target":[0.1,0.2,0.3]},{"type":"light","shape":"sun","energy":1e-3,"angle":1e-5}]}"#)?;
+        let scene: Scene = serde_json::from_str(r#"{"version":2,"composition":{"space":"3d","compositor":[{"material":"m","resolution":0.5}]},"render":{"fps":29.970000000000001,"background":[0.1,0.2,0.3]},"materials":{"m":{"inputs":{"base_weight":0.1,"base_color":[0.125,0.25,0.5]}}},"nodes":[{"type":"camera","translation":[0.001,0.2,0.3],"scale":[0.001,0.001,0.001],"rotation":{"euler":[0.01,0.02,0.03]},"target":[0.1,0.2,0.3]},{"type":"light","shape":"sun","energy":1e-3,"angle":1e-5}]}"#)?;
         assert_eq!(scene.render.fps, "29.970000000000001".parse()?);
         assert_ne!(scene.render.fps, "29.97".parse()?);
         assert_eq!(scene.nodes[0].transform.translation, [0.001,0.2,0.3]);

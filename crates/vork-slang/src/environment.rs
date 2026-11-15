@@ -12,6 +12,13 @@ pub struct EnvironmentProgram {
     pub dependencies: Vec<PathBuf>,
     pub warnings: String,
 }
+impl EnvironmentProgram {
+    /// Prove camera radiance independent of the complete camera context. The
+    /// caller must separately exclude changing inputs and certify image planes.
+    pub fn constant_camera(&self, uniform_images: bool) -> Result<bool> {
+        effects::environment_constant_camera(&self.wgsl, &self.entry, uniform_images)
+    }
+}
 impl Compiler {
     pub fn compile_environment(
         &self,
@@ -43,5 +50,29 @@ impl Compiler {
             dependencies: compiled.output.dependencies,
             warnings: compiled.output.diagnostics,
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires pinned Slang"]
+    fn compiled_environment_constants_preserve_procedural_dependencies() -> Result<()> {
+        let abi=Abi {aov_count:0,context:Abi::spec_context(),closure:openpbr_fields()};
+        let compiler=Compiler::discover();
+        for (source,uniform_images,expected) in [
+            (module_source("std/environment_image").unwrap(),true,true),
+            (module_source("std/environment_image").unwrap(),false,false),
+            ("struct Inputs {float gain=1.;}; float3 environment(EnvironmentContext c,Inputs i){return float3(i.gain);}",false,true),
+            ("struct Inputs {Image image;}; float3 environment(EnvironmentContext c,Inputs i){return sample(i.image,c.direction.xy,c).rgb+float3(c.direction.x>0.?1.:0.);}",true,false),
+            ("struct Inputs {}; float3 environment(EnvironmentContext c,Inputs i){return c.camera?float3(2.,4.,8.):c.direction;}",false,true),
+            ("struct Inputs {}; float3 environment(EnvironmentContext c,Inputs i){return float3(c.time);}",true,false),
+        ] {
+            let program=compiler.compile_environment(&abi,source,Path::new("constant-environment.slang"),"constant")?;
+            assert_eq!(program.constant_camera(uniform_images)?,expected,"{source}\n{}",program.wgsl);
+        }
+        Ok(())
     }
 }

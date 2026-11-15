@@ -5,9 +5,9 @@ Source: OpenPBR Surface specification **v1.1.1** (2026-04-17), Academy Software 
 - Meanings: https://github.com/AcademySoftwareFoundation/OpenPBR/blob/v1.1.1/index.html (per-section parameter tables)
 - Fetched 2026-10-21 from tag `v1.1.1` (latest release). Copied, not recalled.
 
-This table holds the 36 of the specification's 41 parameters that vork shades, with the specification's
-identifiers, types, ranges and defaults. All are std/openpbr material inputs. The other five (base_diffuse_roughness,
-transmission_scatter, transmission_scatter_anisotropy, coat_roughness_anisotropy, geometry_coat_tangent) are neither inputs nor Closure fields.
+This table holds the 38 of the specification's 41 parameters that vork shades, with the specification's
+identifiers, types, ranges and defaults. All are std/openpbr material inputs. The other three (base_diffuse_roughness,
+transmission_scatter, transmission_scatter_anisotropy) are neither inputs nor Closure fields.
 No aliases. The std-only evaluation input below is excluded from Closure. Range: `[]` inclusive, `()` exclusive, per channel for colours and vectors. Norm is the
 typically useful range where it differs from the allowed range (a soft range, not a clamp). Lengths other than
 `thin_film_thickness` are in scene world units (metres in vork). `color3` is linear in the model colour space (OpenPBR
@@ -41,6 +41,7 @@ The binding-restriction column records the supported table-input subset; an empt
 | `coat_weight` | float | [0, 1] | | 0 | | Coverage weight of the coat slab | |
 | `coat_color` | color3 | [0, 1]³ | | (1, 1, 1) | | Square of the coat's normal-incidence transmittance | |
 | `coat_roughness` | float | [0, 1] | | 0 | | Roughness of the coat NDF | |
+| `coat_roughness_anisotropy` | float | [0, 1] | | 0 | | Anisotropy of NDF of coat BSDF | |
 | `coat_ior` | float | (0, ∞) | [1, 3] | 1.6 | | Refractive index of the coat | |
 | `coat_darkening` | float | [0, 1] | | 1 | | Modulates the physical coat darkening effect | |
 | **Fuzz** | | | | | | |
@@ -60,6 +61,7 @@ The binding-restriction column records the supported table-input subset; an empt
 | `geometry_normal` | vector3 | N/A | | unperturbed normal | | Shading normal of the base | |
 | `geometry_tangent` | vector3 | N/A | | unperturbed tangent | | Reference tangent for specular anisotropy | |
 | `geometry_coat_normal` | vector3 | N/A | | unperturbed normal | | Shading normal of the coat; linear tangent-space RGB; factor scales XY; independent of base normal | |
+| `geometry_coat_tangent` | vector3 | N/A | | unperturbed tangent | | Reference tangent for coat anisotropy | |
 
 Spec-text notes (copied as the reference table gives them):
 - `subsurface_color` range is written `[0, 1]` (no ³) although its type is color3; read it per channel.

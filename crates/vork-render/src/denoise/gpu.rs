@@ -3,6 +3,9 @@
 use super::*;
 
 #[cfg(any(target_os = "linux", target_os = "windows"))]
+mod device_match;
+
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 const STORAGE_USAGE: ash::vk::BufferUsageFlags = ash::vk::BufferUsageFlags::from_raw(ash::vk::BufferUsageFlags::STORAGE_BUFFER.as_raw() | ash::vk::BufferUsageFlags::TRANSFER_DST.as_raw());
 #[cfg(target_os = "linux")]
 const EXTERNAL_HANDLE: ash::vk::ExternalMemoryHandleTypeFlags = ash::vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD;
@@ -13,6 +16,66 @@ const EXTERNAL_HANDLE: ash::vk::ExternalMemoryHandleTypeFlags = ash::vk::Externa
 const OIDN_EXTERNAL_TYPE: u32 = 1;
 #[cfg(target_os = "windows")]
 const OIDN_EXTERNAL_TYPE: u32 = 4;
+// OIDN device types that can share Vulkan memory, most preferred first. CUDA
+// stays first so NVIDIA hosts keep selecting the backend they used before;
+// HIP follows on Linux so AMD hosts can use the same zero-copy path.
+#[cfg(target_os = "linux")]
+const GPU_BACKENDS: &[(i32, &str, Identity)] = &[
+    (3, "CUDA", Identity::VulkanUuid),
+    (4, "HIP", Identity::PciAddress),
+];
+#[cfg(target_os = "windows")]
+const GPU_BACKENDS: &[(i32, &str, Identity)] = &[(3, "CUDA", Identity::VulkanUuid)];
+#[cfg(target_os = "linux")]
+const GPU_BACKENDS_LABEL: &str = "CUDA or HIP";
+#[cfg(target_os = "windows")]
+const GPU_BACKENDS_LABEL: &str = "CUDA";
+
+/// How an OIDN backend names the renderer's adapter.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Identity {
+    /// The backend reports the 16-byte UUID Vulkan exposes (CUDA).
+    VulkanUuid,
+    /// OIDN's HIP backend names an AMD device by its hardware UUID, which RADV
+    /// does not expose (RADV derives its own Vulkan UUID), so HIP devices are
+    /// matched by PCI address, which both OIDN and VK_EXT_pci_bus_info report.
+    #[cfg(target_os = "linux")]
+    PciAddress,
+}
+
+/// `domain:bus:device.function`, the PCI address spelling used in diagnostics.
+#[cfg(target_os = "linux")]
+fn pci_bdf(address: [u32; 4]) -> String {
+    format!("{:04x}:{:02x}:{:02x}.{:x}", address[0], address[1], address[2], address[3])
+}
+
+/// Query PCI properties only when the driver advertises VK_EXT_pci_bus_info.
+#[cfg(target_os = "linux")]
+fn adapter_pci(instance: &ash::Instance, physical: ash::vk::PhysicalDevice) -> std::result::Result<Option<[u32; 4]>, String> {
+    let extensions = unsafe { instance.enumerate_device_extension_properties(physical) }
+        .map_err(|error| format!("could not query Vulkan device extensions: {error}"))?;
+    if !extensions.iter().any(|extension| unsafe { CStr::from_ptr(extension.extension_name.as_ptr()) } == ash::ext::pci_bus_info::NAME) {
+        return Ok(None);
+    }
+    let mut pci = ash::vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+    let mut properties = ash::vk::PhysicalDeviceProperties2::default().push_next(&mut pci);
+    unsafe { instance.get_physical_device_properties2(physical, &mut properties) };
+    Ok(Some([pci.pci_domain, pci.pci_bus, pci.pci_device, pci.pci_function]))
+}
+
+/// The physical device's `domain:bus:device.function`, if OIDN reports it.
+/// Only the HIP backend populates this; CUDA devices may leave it unset.
+#[cfg(target_os = "linux")]
+fn oidn_pci(api: &Api, index: i32) -> Option<[u32; 4]> {
+    if unsafe { (api.physical_int)(index, c"pciAddressSupported".as_ptr()) } == 0 { return None; }
+    Some([
+        unsafe { (api.physical_int)(index, c"pciDomain".as_ptr()) } as u32,
+        unsafe { (api.physical_int)(index, c"pciBus".as_ptr()) } as u32,
+        unsafe { (api.physical_int)(index, c"pciDevice".as_ptr()) } as u32,
+        unsafe { (api.physical_int)(index, c"pciFunction".as_ptr()) } as u32,
+    ])
+}
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
 unsafe extern "system" { fn CloseHandle(handle: Handle) -> i32; }
@@ -52,21 +115,52 @@ pub(super) fn select(api: &Api, r: &Renderer) -> std::result::Result<Handle, Str
         let mut id = vk::PhysicalDeviceIDProperties::default();
         let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
         unsafe { instance.get_physical_device_properties2(hal.raw_physical_device(), &mut properties); }
-        for index in 0..unsafe { (api.physical_count)() } {
-            if unsafe { (api.physical_int)(index, c"type".as_ptr()) } != 3 { continue; }
-            let mut bytes = 0;
-            let uuid = unsafe { (api.physical_data)(index, c"uuid".as_ptr(), &mut bytes) };
-            if bytes == 16 && !uuid.is_null() && unsafe { std::slice::from_raw_parts(uuid.cast::<u8>(), 16) } == id.device_uuid {
-                let handle = committed(unsafe { (api.new_by_id)(index) }, "CUDA")?;
+        #[cfg(target_os = "linux")]
+        let mut adapter = None;
+        let count = unsafe { (api.physical_count)() };
+        #[cfg(target_os = "linux")]
+        let mut hip_seen = false;
+        for &(device_type, label, identity) in GPU_BACKENDS {
+            #[cfg(target_os = "linux")]
+            if identity == Identity::PciAddress {
+                adapter = adapter_pci(instance, hal.raw_physical_device())?;
+            }
+            for index in 0..count {
+                if unsafe { (api.physical_int)(index, c"type".as_ptr()) } != device_type { continue; }
+                #[cfg(target_os = "linux")]
+                if device_type == 4 { hip_seen = true; }
+                let matching = match identity {
+                    Identity::VulkanUuid => {
+                        let mut bytes = 0;
+                        let uuid = unsafe { (api.physical_data)(index, c"uuid".as_ptr(), &mut bytes) };
+                        let uuid = if bytes == 16 && !uuid.is_null() {
+                            Some(unsafe { &*uuid.cast::<[u8; 16]>() })
+                        } else { None };
+                        device_match::matches(device_type, &id.device_uuid, None, uuid, None)
+                    }
+                    #[cfg(target_os = "linux")]
+                    Identity::PciAddress => device_match::matches(device_type, &id.device_uuid, adapter, None, oidn_pci(api, index)),
+                };
+                if !matching { continue; }
+                let handle = committed(unsafe { (api.new_by_id)(index) }, label)?;
                 let supported = unsafe { (api.device_int)(handle, c"externalMemoryTypes".as_ptr()) };
                 if supported as u32 & OIDN_EXTERNAL_TYPE == 0 {
                     unsafe { (api.release_device)(handle); }
-                    return Err("OIDN's CUDA device cannot import Vulkan memory".into());
+                    return Err(format!("OIDN's {label} device cannot import Vulkan memory"));
                 }
                 return Ok(handle);
             }
         }
-        return Err("OIDN found no CUDA device matching it".into());
+        #[cfg(target_os = "linux")]
+        return Err(match adapter {
+            Some(address) if hip_seen =>
+                format!("OIDN found no {GPU_BACKENDS_LABEL} device matching it at PCI {}", pci_bdf(address)),
+            Some(address) =>
+                format!("OIDN found no {GPU_BACKENDS_LABEL} device matching it at PCI {}; for AMD, OIDN's HIP backend needs the ROCm runtime", pci_bdf(address)),
+            None => format!("OIDN found no {GPU_BACKENDS_LABEL} device matching it; its Vulkan driver reports no PCI address (VK_EXT_pci_bus_info)"),
+        });
+        #[cfg(target_os = "windows")]
+        return Err(format!("OIDN found no {GPU_BACKENDS_LABEL} device matching it"));
     }
     #[cfg(target_os = "macos")]
     if let Some(hal) = unsafe { r.device.as_hal::<wgpu::hal::api::Metal>() } {
@@ -96,7 +190,7 @@ struct Shared {
 impl Shared {
     fn new(r: &Renderer, device: &Arc<Device>, bytes: u64) -> Result<Self> {
         ensure!(bytes <= u64::from(r.device.limits().max_storage_buffer_binding_size)
-            && bytes <= r.device.limits().max_buffer_size, "{}", crate::gpu_memory::limit_message("OIDN workspace", format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",r.device.limits().max_storage_buffer_binding_size,r.device.limits().max_buffer_size), "reduce resolution or disable denoising with --set denoise=false"));
+            && bytes <= r.device.limits().max_buffer_size, crate::gpu_memory::device_limit("OIDN workspace", format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",r.device.limits().max_storage_buffer_binding_size,r.device.limits().max_buffer_size), "reduce resolution or disable denoising with --set denoise=false"));
         let desc = wgpu::BufferDescriptor {label: Some("OIDN shared images"), size: bytes,
             usage: wgpu::BufferUsages::STORAGE, mapped_at_creation: false};
         #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -115,7 +209,7 @@ impl Shared {
                 requirements.memory_type_bits & (1 << i) != 0 && memory_properties.memory_types[i as usize].property_flags.contains(vk::MemoryPropertyFlags::DEVICE_LOCAL));
             let Some(memory_type) = memory_type else {
                 unsafe { raw.destroy_buffer(buffer, None); }
-                anyhow::bail!("No device-local memory for OIDN");
+                return Err(anyhow::anyhow!("No device-local memory for OIDN").context(crate::failure::FailureKind::Device));
             };
             let mut export = vk::ExportMemoryAllocateInfo::default().handle_types(EXTERNAL_HANDLE);
             let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(buffer);
@@ -151,7 +245,7 @@ impl Shared {
                 };
                 let imported = Buffer {engine:device.clone(),handle:handle as usize,bytes:bytes as usize};
                 device.check()?;
-                ensure!(!handle.is_null(), "OIDN returned null imported buffer");
+                if handle.is_null() { return Err(anyhow::anyhow!("OIDN returned null imported buffer").context(crate::failure::FailureKind::Device)); }
                 Ok(imported)
             })();
             let oidn = match imported {
@@ -171,13 +265,13 @@ impl Shared {
             let handle = unsafe { (device.api.shared_metal)(device.handle as Handle, &*native as *const _ as *mut c_void) };
             let oidn = Buffer {engine: device.clone(), handle: handle as usize, bytes: bytes as usize};
             device.check()?;
-            ensure!(!handle.is_null(), "OIDN returned null Metal buffer");
+            if handle.is_null() { return Err(anyhow::anyhow!("OIDN returned null Metal buffer").context(crate::failure::FailureKind::Device)); }
             let native = unsafe { wgpu::hal::metal::Device::buffer_from_raw(native, bytes) };
             let buffer = unsafe { r.device.create_buffer_from_hal::<wgpu::hal::api::Metal>(native, &desc) };
             Ok(Self {oidn, buffer})
         }
         #[cfg(not(any(target_os = "linux", target_os = "windows", target_os = "macos")))]
-        anyhow::bail!("No OIDN memory sharing backend")
+        return Err(anyhow::anyhow!("No OIDN memory sharing backend").context(crate::failure::FailureKind::Device));
     }
     fn ownership(&self, r: &Renderer, encoder: &mut wgpu::CommandEncoder, release: bool) {
         #[cfg(any(target_os = "linux", target_os = "windows"))]
@@ -213,6 +307,12 @@ impl Workspace {
     fn new(r: &Renderer, device: &Arc<Device>, size: [u32;2], guides: bool) -> Result<Self> {
         let bytes = size[0] as u64 * size[1] as u64 * 16;
         let shared = Shared::new(r, device, bytes * 3)?;
+        let (usage, headroom) = crate::residency::camera_usage_headroom(&r.device).unwrap_or_else(|| {
+            // Imported planes bypass Vulkan's allocator report.
+            let reserved = r.device.generate_allocator_report().map_or(0, |m| m.total_reserved_bytes);
+            (reserved.saturating_add(bytes * 3), r.camera_memory)
+        });
+        let memory_mb = memory_limit_mb(r.camera_memory, r.camera_memory_usage_at_creation, usage, headroom)?;
         let mut filters = Vec::new();
         let image = |filter: &Filter, name: &CStr, plane: usize| unsafe {
             (device.api.image)(filter.handle, name.as_ptr(), shared.oidn.handle as Handle,
@@ -236,6 +336,7 @@ impl Workspace {
         filters.push(filter);
         for filter in &filters {
             unsafe {
+                (device.api.integer)(filter.handle,c"maxMemoryMB".as_ptr(),memory_mb);
                 (device.api.integer)(filter.handle,c"quality".as_ptr(),OIDN_QUALITY_HIGH);
                 (device.api.commit_filter)(filter.handle);
             }
@@ -385,7 +486,7 @@ impl Stage {
 mod tests {
     use super::*;
     #[test]
-    #[ignore = "requires real CUDA/Metal GPU, Slang and pinned OIDN"]
+    #[ignore = "requires real CUDA/HIP/Metal GPU, Slang and pinned OIDN"]
     fn shared_images_match_gpu_host_reference_across_reuse_and_resize() -> Result<()> {
         use wgpu::util::DeviceExt;
         let r=Renderer::new()?;

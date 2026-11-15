@@ -1,0 +1,295 @@
+{
+  "nodes": [
+    {
+      "id": "tb-main",
+      "type": "table",
+      "x": 160,
+      "y": 120,
+      "width": 760,
+      "height": 248,
+      "rotation": 0,
+      "scale": 1,
+      "rows": [
+        {
+          "size": 56
+        },
+        {
+          "size": 48
+        },
+        {
+          "size": 48
+        },
+        {
+          "size": 48
+        },
+        {
+          "size": 48
+        }
+      ],
+      "columns": [
+        {
+          "size": 280
+        },
+        {
+          "size": 280
+        },
+        {
+          "size": 200
+        }
+      ],
+      "cells": [
+        [
+          {
+            "id": "tb-c-0-0",
+            "textContent": "<p style=\"font-family: Inter; font-size: 20px; font-weight: 700; color: #ffffff\">Product</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tb-c-0-1",
+            "textContent": "<p style=\"font-family: Inter; font-size: 20px; font-weight: 700; color: #ffffff\">Description</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tb-c-0-2",
+            "textContent": "<p style=\"font-family: Inter; font-size: 20px; font-weight: 700; color: #ffffff\">Price</p>",
+            "textHorizontalAlign": "right",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          }
+        ],
+        [
+          {
+            "id": "tb-c-1-0",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">Canvas</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tb-c-1-1",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">Infinite design surface</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tb-c-1-2",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">$12</p>",
+            "textHorizontalAlign": "right",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          }
+        ],
+        [
+          {
+            "id": "tb-c-2-0",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">Slides</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tb-c-2-1",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">Presentations with <span style=\"font-weight: 700; color: #8338ec\">styled runs</span></p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tb-c-2-2",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">$18</p>",
+            "textHorizontalAlign": "right",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          }
+        ],
+        [
+          {
+            "id": "tb-c-3-0",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">Flows</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tb-c-3-1",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">Diagrams and connectors</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tb-c-3-2",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">$9</p>",
+            "textHorizontalAlign": "right",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          }
+        ],
+        [
+          {
+            "id": "tb-c-4-0",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">Export</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tb-c-4-1",
+            "textContent": "",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tb-c-4-2",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">$4</p>",
+            "textHorizontalAlign": "right",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          }
+        ]
+      ],
+      "backgroundColors": [
+        "#ffffff",
+        "#f3f4f6"
+      ],
+      "headerBackgroundColor": "#1d2733",
+      "columnStrokeConfig": "all",
+      "rowStrokeConfig": "all",
+      "cornerRadius": 12,
+      "strokes": [
+        {
+          "id": "stroke-0",
+          "paint": {
+            "type": "solid",
+            "color": "#cbd5e1"
+          },
+          "width": 1
+        }
+      ]
+    },
+    {
+      "id": "tb-minimal",
+      "type": "table",
+      "x": 160,
+      "y": 460,
+      "width": 560,
+      "height": 144,
+      "rotation": 0,
+      "scale": 1,
+      "rows": [
+        {
+          "size": 48
+        },
+        {
+          "size": 48
+        },
+        {
+          "size": 48
+        }
+      ],
+      "columns": [
+        {
+          "size": 280
+        },
+        {
+          "size": 280
+        }
+      ],
+      "cells": [
+        [
+          {
+            "id": "tbm-0-0",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; font-weight: 700; color: #1d2733\">Key</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tbm-0-1",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; font-weight: 700; color: #1d2733\">Value</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          }
+        ],
+        [
+          {
+            "id": "tbm-1-0",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">alpha</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tbm-1-1",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">one</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          }
+        ],
+        [
+          {
+            "id": "tbm-2-0",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">beta</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          },
+          {
+            "id": "tbm-2-1",
+            "textContent": "<p style=\"font-family: Inter; font-size: 18px; color: #1d2733\">two</p>",
+            "textHorizontalAlign": "left",
+            "textVerticalAlign": "middle",
+            "textPadding": 10
+          }
+        ]
+      ],
+      "columnStrokeConfig": "outside",
+      "rowStrokeConfig": "after-first",
+      "strokes": [
+        {
+          "id": "stroke-0",
+          "paint": {
+            "type": "solid",
+            "color": "#1d2733"
+          },
+          "width": 2
+        }
+      ]
+    }
+  ],
+  "pages": [
+    {
+      "id": "page-1",
+      "name": "table",
+      "width": 1280,
+      "height": 800,
+      "nodeIds": [
+        "tb-main",
+        "tb-minimal"
+      ],
+      "fills": [
+        {
+          "id": "fill-0",
+          "paint": {
+            "type": "solid",
+            "color": "#ffffff"
+          }
+        }
+      ]
+    }
+  ],
+  "config": {
+    "renderPageClipping": true
+  },
+  "variables": [],
+  "canvasRootNodeIds": [],
+  "layoutMode": "vertical"
+}

@@ -6,13 +6,20 @@ import material;
 import hit;
 import implicit_scene;
 import hit_geometry;
+#ifndef VORK_NO_GAUSSIANS
+import gaussian_geometry;
+#endif
 import variant;
 import surface;
 import stream;
 import closure;
 import path_boundary;
 #include "path_work_arguments.slang"
-struct DielectricHit { float t; uint instance; uint primitive; uint object; float2 barycentrics; float3x4 world_to_object; bool field; FieldHit field_hit; };
+struct DielectricHit { float t; uint instance; uint primitive; uint object; float2 barycentrics; float3x4 world_to_object; bool field; FieldHit field_hit;
+#ifndef VORK_NO_GAUSSIANS
+    float3 gaussian_point;
+#endif
+};
 // Merge field zero sets with an existing hardware triangle hit. Both camera
 // path transport and raster dielectric continuation use the same acceptance,
 // visibility masks and contact tie rule. Domain-box triangles never shade.
@@ -49,6 +56,9 @@ DielectricHit merge_field_hits<P:IProgram,G:IHitGeometry>(G g,DielectricHit h,ui
 }
 HitSurface dielectric_surface<V:IVariant,P:IProgram,G:IHitGeometry>(G g,DielectricHit h,float3 direction,float2 pixel,Lobe lobe) {
     if(h.field) return field_surface<V,P>(h.object,h.field_hit,direction,pixel,lobe);
+#ifndef VORK_NO_GAUSSIANS
+    if(gaussian_geometry<G>(g,h.instance)) return gaussian_surface<V,P,G>(g,h.instance,h.primitive,h.object,h.world_to_object,h.gaussian_point,direction,pixel,lobe);
+#endif
     return hit_surface<V,P,G>(g,h.instance,h.primitive,h.object,h.world_to_object,h.barycentrics,direction,pixel,lobe);
 }
 void path_boundary_error(uint code, uint object) {
@@ -68,7 +78,13 @@ void plain_path_cross<let N:uint>(inout PathOccupancy<N> state,PathBoundary boun
     if(!state.cross<EqualBoundaryPriority>(boundary,entering)) boundary_overflow(state,boundary.object);
 }
 // The solid a ray instance bounds, or 0xffffffff.
-uint instance_solid<G:IHitGeometry>(G g,uint instance,uint2 tables) {return g.word(tables.x+instance);}
+uint instance_solid<G:IHitGeometry>(G g,uint instance,uint2 tables) {
+    let identity=g.word(tables.x+instance);
+    return identity==REG_RAY_OPAQUE_SOLID_OWNER ? 0xffffffffu : identity;
+}
+// Side admission retains every patch of an installed possible solid, even if
+// its evaluated transmission is zero. Occupancy still uses boundary IDs above.
+bool instance_has_solid_owner<G:IHitGeometry>(G g,uint instance,uint2 tables) {return g.word(tables.x+instance)!=0xffffffffu;}
 // A solid's words (REG_PATH_SOLID_WORDS): object-space lo.xyz, hi.xyz, then
 // the object row whose transform (the TLAS instance's) places them.
 uint solid_words(uint solid,uint2 tables) {return tables.y+solid*REG_PATH_SOLID_WORDS;}
@@ -108,7 +124,7 @@ void validate_boundary<V:IVariant,P:IProgram>(Varying v,bool entering,Coordinate
     if (P.lobes && s.lobes>1u) {
         for (var i=0u;i<s.lobes;i++) {
             let other=surface_at<V,P>(v,entering,s.view,k,Lobe(i,0.)).closure;
-            if (other.geometry_thin_walled!=c.geometry_thin_walled || other.specular_ior!=c.specular_ior || other.transmission_dispersion_scale!=c.transmission_dispersion_scale || other.transmission_dispersion_abbe_number!=c.transmission_dispersion_abbe_number || any(other.transmission_color!=c.transmission_color) || other.transmission_depth!=c.transmission_depth) {path_boundary_error(REG_PATH_BOUNDARY_AMBIGUOUS,v.object);}
+            if (other.geometry_thin_walled!=c.geometry_thin_walled || other.specular_ior!=c.specular_ior || other.specular_weight!=c.specular_weight || other.transmission_dispersion_scale!=c.transmission_dispersion_scale || other.transmission_dispersion_abbe_number!=c.transmission_dispersion_abbe_number || any(other.transmission_color!=c.transmission_color) || other.transmission_depth!=c.transmission_depth) {path_boundary_error(REG_PATH_BOUNDARY_AMBIGUOUS,v.object);}
         }
     }
 }
@@ -152,6 +168,7 @@ struct BoundaryEvent<let N:uint> {
             }
             state.set_entry(slot,e);
         }
+        state.resolve_iors();
     }
     PathBoundary owner(PathOccupancy<N> state) {
         for(var slot=state.count;slot>0u;slot--) {
@@ -218,7 +235,7 @@ BoundaryEvent<N> boundary_event<V:IVariant,P:IProgram,G:IHitGeometry,let N:uint>
         DielectricHit hit={};hit.t=first.t;hit.instance=instance;hit.primitive=primitive;hit.object=query.CandidateInstanceID();
         hit.barycentrics=query.CandidateTriangleBarycentrics();hit.world_to_object=query.CandidateWorldToObject3x4();
 #ifdef VORK_MEDIUM_WORK_LIMIT
-        if(!medium_alpha_reserve(medium_work,2u,hit.object)) {break;}
+        if(!medium_work_step(medium_work)) {break;}
 #endif
         let h=dielectric_surface<V,P,G>(g,hit,direction,pixel,Lobe(0u,0.));
         if(h.s.discarded || h.s.closure.geometry_opacity<=0. || h.s.closure.geometry_thin_walled || h.s.closure.transmission_weight<=0.) continue;
@@ -241,10 +258,13 @@ void camera_interior<let N:uint>(inout PathOccupancy<N> state,PathBoundary b,flo
         state.set_entry(slot,previous);slot--;
     }
     state.set_entry(slot,e);
+    state.resolve_iors();
 }
 PathOccupancy<N> camera_occupancy<V:IVariant,P:IProgram,G:IHitGeometry,let N:uint>(G g,RaytracingAccelerationStructure scene,float3 origin, float3 direction,uint2 tables,float2 pixel,uint field_offset,uint field_count VORK_WORK_PARAMETER) {
     PathOccupancy<N> state={};
-    if(N==0u) return state;
+    // Installation can prove that no camera sample starts inside a solid
+    // (passes::path::camera_exterior); the query then compiles away.
+    if(N==0u || !V.has_camera_interior) return state;
     // Bounds reject impossible interiors; they never establish containment.
     // Resolve each solid's nearest actual boundary before retaining a descriptor.
     // In particular, arbitrarily many separated deforming/open solids may have
@@ -279,7 +299,7 @@ PathOccupancy<N> camera_occupancy<V:IVariant,P:IProgram,G:IHitGeometry,let N:uin
         if(nearest.t<0.) break;
         first_identity=selected+1u;
 #ifdef VORK_MEDIUM_WORK_LIMIT
-        if(!medium_alpha_reserve(medium_work,2u,nearest.object)) break;
+        if(!medium_work_step(medium_work)) break;
 #endif
         let h=dielectric_surface<V,P,G>(g,nearest,direction,pixel,Lobe(0u,0.));
         if(h.entering || h.s.closure.geometry_thin_walled || h.s.closure.transmission_weight<=0.) continue;

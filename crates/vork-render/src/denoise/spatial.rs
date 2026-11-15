@@ -1,172 +1,77 @@
-//! Small stateless edge-aware reconstruction for the final raster budget.
+//! Normalize the already film-filtered camera samples without spatial denoising.
 use crate::*;
 
 pub(crate) fn entries() -> Vec<wgpu::BindGroupLayoutEntry> {
-    (0..6)
-        .map(|binding| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            count: None,
-            ty: wgpu::BindingType::Buffer {
-                ty: if binding == 0 {
-                    wgpu::BufferBindingType::Uniform
-                } else {
-                    wgpu::BufferBindingType::Storage {
-                        read_only: matches!(binding, 2 | 3),
-                    }
-                },
-                has_dynamic_offset: false,
-                min_binding_size: None,
+    (0..3).map(|binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::COMPUTE,
+        count: None,
+        ty: wgpu::BindingType::Buffer {
+            ty: if binding == 0 { wgpu::BufferBindingType::Uniform } else {
+                wgpu::BufferBindingType::Storage { read_only: binding == 1 }
             },
-        })
-        .collect()
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+    }).collect()
 }
 pub(crate) struct Pipelines {
     layout: wgpu::BindGroupLayout,
-    prepare: wgpu::ComputePipeline,
-    filter: wgpu::ComputePipeline,
     finish: wgpu::ComputePipeline,
 }
 impl Pipelines {
     fn new(r: &Renderer) -> Self {
-        let layout = r
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("final reconstruction"),
-                entries: &entries(),
-            });
-        let pipeline_layout = r
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("final reconstruction"),
-                bind_group_layouts: &[Some(&layout)],
-                immediate_size: 0,
-            });
-        let pipeline = |shader: &crate::native::Compiled| {
-            let module = crate::native::shader_module(&r.device, shader);
-            r.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some(shader.name),
-                layout: Some(&pipeline_layout),
-                module: &module,
-                entry_point: Some(shader.entry),
-                compilation_options: Default::default(),
-                cache: r.cache.as_ref(),
-            })
-        };
-        let prepare = pipeline(&crate::native::RECONSTRUCT_PREPARE);
-        let filter = pipeline(&crate::native::RECONSTRUCT_FILTER);
-        let finish = pipeline(&crate::native::RECONSTRUCT_FINISH);
-        Self {
-            layout,
-            prepare,
-            filter,
-            finish,
-        }
+        let layout = r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("final reconstruction"), entries: &entries(),
+        });
+        let pipeline_layout = r.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("final reconstruction"), bind_group_layouts: &[Some(&layout)], immediate_size: 0,
+        });
+        let shader = &crate::native::RECONSTRUCT_FINISH;
+        let module = crate::native::shader_module(&r.device, shader);
+        let finish = r.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some(shader.name), layout: Some(&pipeline_layout), module: &module,
+            entry_point: Some(shader.entry), compilation_options: Default::default(), cache: r.cache.as_ref(),
+        });
+        Self { layout, finish }
     }
 }
 pub(crate) struct Stage {
     pipelines: std::sync::Arc<Pipelines>,
-    bindings: Vec<wgpu::BindGroup>,
+    binding: wgpu::BindGroup,
     groups: [u32; 3],
 }
 impl Stage {
     pub(crate) fn new(
-        r: &Renderer,
-        accumulation: &wgpu::Buffer,
-        output: &wgpu::Buffer,
-        guides: &wgpu::Buffer,
-        size: [u32; 2],
-        samples: u32,
+        r: &Renderer, accumulation: &wgpu::Buffer, output: &wgpu::Buffer,
+        size: [u32; 2], samples: u32,
     ) -> Result<Self> {
-        let pipelines = r
-            .pipelines
-            .reconstruction
-            .get_or_init(|| std::sync::Arc::new(Pipelines::new(r)))
-            .clone();
-        let bytes = u64::from(size[0]) * u64::from(size[1]) * 16;
-        let scratch = std::array::from_fn::<_, 2, _>(|_| {
-            crate::gpu_memory::buffer(
-                &r.device,
-                &wgpu::BufferDescriptor {
-                    label: Some("final reconstruction scratch"),
-                    size: bytes,
-                    usage: wgpu::BufferUsages::STORAGE,
-                    mapped_at_creation: false,
-                },
-            )
+        let pipelines = r.pipelines.reconstruction
+            .get_or_init(|| std::sync::Arc::new(Pipelines::new(r))).clone();
+        let params = crate::gpu_memory::buffer_init(&r.device, "final reconstruction parameters",
+            bytemuck::cast_slice(&[size[0], size[1], samples, 0]), wgpu::BufferUsages::UNIFORM);
+        let binding = r.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("final reconstruction"), layout: &pipelines.layout,
+            entries: &[
+                entry(0, params.as_entire_binding()),
+                entry(1, accumulation.as_entire_binding()),
+                entry(2, output.as_entire_binding()),
+            ],
         });
-        let filtered_guides = crate::gpu_memory::buffer(
-            &r.device,
-            &wgpu::BufferDescriptor {
-                label: Some("final reconstruction guides"),
-                size: bytes * 2,
-                usage: wgpu::BufferUsages::STORAGE,
-                mapped_at_creation: false,
-            },
-        );
-        let mut bindings = Vec::new();
-        let steps = vork_slang::registry::RECONSTRUCT_STEPS;
-        for pass in 0..steps + 2 {
-            let params = crate::gpu_memory::buffer_init(
-                &r.device,
-                "final reconstruction parameters",
-                bytemuck::cast_slice(&[
-                    size[0],
-                    size[1],
-                    samples,
-                    if pass == 0 { 0 } else { 1 << (pass - 1) },
-                ]),
-                wgpu::BufferUsages::UNIFORM,
-            );
-            let source = &scratch[((pass + 1) % 2) as usize];
-            let destination = if pass == steps + 1 {
-                output
-            } else {
-                &scratch[(pass % 2) as usize]
-            };
-            bindings.push(r.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("final reconstruction"),
-                layout: &pipelines.layout,
-                entries: &[
-                    entry(0, params.as_entire_binding()),
-                    entry(1, accumulation.as_entire_binding()),
-                    entry(2, guides.as_entire_binding()),
-                    entry(3, source.as_entire_binding()),
-                    entry(4, destination.as_entire_binding()),
-                    entry(5, filtered_guides.as_entire_binding()),
-                ],
-            }));
-        }
-        Ok(Self {
-            pipelines,
-            bindings,
-            groups: [size[0].div_ceil(8), size[1].div_ceil(8), 1],
-        })
+        Ok(Self { pipelines, binding, groups: [size[0].div_ceil(8), size[1].div_ceil(8), 1] })
     }
     pub(crate) fn encode(&self, encoder: &mut wgpu::CommandEncoder, queries: Option<&wgpu::QuerySet>) {
-        for (i, bind) in self.bindings.iter().enumerate() {
-            let pipeline = if i == 0 {
-                &self.pipelines.prepare
-            } else if i == self.bindings.len() - 1 {
-                &self.pipelines.finish
-            } else {
-                &self.pipelines.filter
-            };
-            let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: Some("final spatial reconstruction"),
-                timestamp_writes: queries.and_then(|query_set| {
-                    let first=i==0;let last=i==self.bindings.len()-1;
-                    (first || last).then_some(wgpu::ComputePassTimestampWrites {
-                        query_set,
-                        beginning_of_pass_write_index:first.then_some(timing::query("reconstruction")),
-                        end_of_pass_write_index:last.then_some(timing::query("reconstruction")+1),
-                    })
-                }),
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, bind, &[]);
-            pass.dispatch_workgroups(self.groups[0], self.groups[1], 1);
-        }
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("final film reconstruction"),
+            timestamp_writes: queries.map(|query_set| wgpu::ComputePassTimestampWrites {
+                query_set,
+                beginning_of_pass_write_index: Some(timing::query("reconstruction")),
+                end_of_pass_write_index: Some(timing::query("reconstruction") + 1),
+            }),
+        });
+        pass.set_pipeline(&self.pipelines.finish);
+        pass.set_bind_group(0, &self.binding, &[]);
+        pass.dispatch_workgroups(self.groups[0], self.groups[1], 1);
     }
 }
 
@@ -178,10 +83,10 @@ mod tests {
     #[ignore = "requires GPU and pinned Slang; runs in the main GPU contracts"]
     #[cfg(vork_private_tests)]
     fn raster_hdr_silhouette_without_surface_guides_stays_unfiltered() -> Result<()> {
-        let r = crate::test_renderer()?.expect("GPU required");
+        let r = crate::test_renderer()?;
         let mut value: serde_json::Value = serde_json::from_str(include_str!("../../../../examples/compositor-bloom.json"))?;
         value["render"]["resolution"] = serde_json::json!([128, 72]);
-        value["render"]["compositor"] = serde_json::json!([]);
+        value["composition"]["space"] = "3d".into(); value["composition"]["compositor"] = serde_json::json!([]);
         value["render"]["settings"] = serde_json::json!({"integrator":"raster","samples":32,"denoiser":null,"reconstruct":false});
         let render = |value: &serde_json::Value| -> Result<Vec<[f32; 4]>> {
             let scene = r.install(vork_scene::v2::from_test_value(value.clone())?, std::path::Path::new("."))?;
@@ -208,7 +113,7 @@ mod tests {
     #[test]
     #[ignore = "requires GPU and pinned Slang; runs in the main GPU contracts"]
     fn path_reconstruction_preserves_detail_behind_glass() -> Result<()> {
-        let r = crate::test_renderer()?.expect("GPU required");
+        let r = crate::test_renderer()?;
         let mut scene = serde_json::json!({
             "version":2,
             "render":{"resolution":[24,16],"settings":{
@@ -251,10 +156,8 @@ mod tests {
     }
     #[test]
     #[ignore = "requires GPU and pinned Slang; runs in the main GPU contracts"]
-    fn reconstruction_preserves_dc_alpha_and_edges_while_reducing_noise() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {
-            anyhow::bail!("GPU required");
-        };
+    fn reconstruction_preserves_film_filtered_signal_and_alpha() -> Result<()> {
+        let r = crate::test_renderer()?;
         let size = [32, 16];
         let count = (size[0] * size[1]) as usize;
         let samples = 16u32;
@@ -272,9 +175,9 @@ mod tests {
                 .map(|p| p.map(|v| v * samples as f32))
                 .collect();
             let accumulation = make(&accumulated);
-            let guide = make(guides);
+            let _ = guides;
             let output = make(&vec![[0.; 4]; count]);
-            let stage = Stage::new(&r, &accumulation, &output, &guide, size, samples)?;
+            let stage = Stage::new(&r, &accumulation, &output, size, samples)?;
             let mut encoder = r.device.create_command_encoder(&Default::default());
             stage.encode(&mut encoder,None);
             let readback = r.device.create_buffer(&wgpu::BufferDescriptor {
@@ -365,11 +268,15 @@ mod tests {
         }).collect();
         assert_eq!(filter(&silhouette, &unguided)?, silhouette,
             "radiance without a surface guide must remain exact");
-        let smooth = filter(&noisy, &guides)?;
-        let rms = (smooth.iter().map(|p| (p[0] - 0.5).powi(2)).sum::<f32>() / count as f32).sqrt();
-        assert!(rms < 0.04, "noise residual {rms}");
-        let mean = smooth.iter().map(|p| p[0]).sum::<f32>() / count as f32;
-        assert!((mean - 0.5).abs() < 0.005, "mean energy {mean}");
+        // Spatial variation is signal, even with identical primary guides.
+        // A checker, emission boundary and smooth illumination gradient must
+        // not be interpreted as Monte Carlo variance.
+        assert_eq!(filter(&noisy, &guides)?, noisy);
+        let gradient: Vec<_> = (0..count).map(|i| {
+            let x=(i % 32) as f32 / 31.;
+            [x*x*16., x, 1.-x, 1.]
+        }).collect();
+        assert_eq!(filter(&gradient, &guides)?, gradient);
         // Nonuniform HDR signal, including image borders, fractional coverage,
         // material edges and protected/no-guide pixels. The global RGB sum is
         // an independent conservation invariant, not another filter reference.

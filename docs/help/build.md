@@ -8,8 +8,7 @@ pinned Intel Mac or Linux ARM archive.
 
 ## Prerequisites
 
-The pinned Slang 2026.21 macOS binaries target macOS 26. Older macOS versions
-have not been qualified with this toolchain.
+Use Apple Silicon with macOS 15 or newer.
 
 On macOS, install Apple's command line tools, then install Homebrew from
 https://brew.sh if it is not already available:
@@ -53,6 +52,9 @@ sh /tmp/vork-rustup.sh -y --default-toolchain 1.96
 
 ## Install Slang and build
 
+For a private Mac toolchain URL, set `GH_TOKEN` with repository read access or
+build Slang from the pinned recipe in docs/BUILD.md.
+
 Clone the repository if needed, then enter it.
 
 Choose a new, empty destination outside the checkout. The installer downloads
@@ -74,8 +76,9 @@ that only need Vulkan may set VORK_SHADER_TARGETS=spirv to skip Metal compilatio
 the Slang version against the pin. `VORK_SLANGC` must be an absolute executable
 path; alternatively the build can find the pinned `slangc` on `PATH`. Export
 `VORK_SLANGC` again in each new shell, or add the export to your shell startup
-file. A `cannot start slangc` error means this setup is missing; a version
-mismatch means a different compiler was selected.
+file. A compiler-start failure includes the loader diagnostic; check the selected
+toolchain and its OS requirement. A version mismatch means a different compiler
+was selected.
 
 The binary is `target/release/vork`, or `$CARGO_TARGET_DIR/release/vork` when
 that environment variable is set. These commands do not install it globally.
@@ -95,8 +98,9 @@ cargo +1.96 build --release --workspace --locked
 .\target\release\vork.exe help
 ```
 
-Rendering requires a supported NVIDIA Vulkan driver on Windows and Linux, or
-Apple Silicon Metal on macOS. For binary installation on Windows use install.ps1;
+Rendering requires a supported NVIDIA Vulkan driver on Windows and Linux, an AMD
+Vulkan driver with ray queries on Linux (Mesa RADV), or Apple Silicon Metal on
+macOS. For binary installation on Windows use install.ps1;
 see README.md (Install). The compiled help and scene JSON are identical on every platform.
 
 ## Runtime dependencies
@@ -130,9 +134,8 @@ crates/vork-{std,text}/tests/fonts/OFL.txt). No additional asset downloads are n
 Corpus-dependent tests requiring unshipped assets are excluded from the public
 source and are not part of its coverage.
 
-Renderer GPU tests require the explicit runtime opt-in `VORK_GPU_TESTS=1`;
-without it they print a skip diagnostic (visible with `-- --nocapture`). CPU and
-numeric tests remain enabled. Ignored tests state their extra requirements.
+Run ignored renderer GPU tests with `VORK_GPU_TESTS=1` and a working renderer.
+CPU and numeric tests remain enabled. Ignored tests state their requirements.
 With a supported GPU and the runtime dependencies installed:
 
 ```sh
@@ -140,6 +143,5 @@ VORK_GPU_TESTS=1 cargo test -p vork-render -p vork-cli -- --include-ignored --no
 ```
 
 In PowerShell set `$env:VORK_GPU_TESTS = "1"` before the Cargo command.
-Use `-- --nocapture` on the default tests to see diagnostics, including skips
-when adapter discovery finds no GPU. Ignored and skipped tests supply no GPU
-coverage. Denoising tests also need the pinned OIDN runtime described above.
+Explicitly selected GPU tests fail if renderer creation fails. Ignored tests supply
+no GPU coverage. Install the pinned OIDN runtime above for denoising tests.

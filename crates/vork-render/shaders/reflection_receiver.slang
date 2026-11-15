@@ -110,11 +110,13 @@ struct ReflectionSlots {
             } else if (pool!=0u) {
                 let entry=layout.entry(pool-1u);at=entry+1u;pool=slots[entry];
             } else {return false;}
-            let base=layout.reflection(at);
+            let base=layout.reflection(at,!merged);
             let payload=unpackHalf2x16ToFloat(records[5u][base]);
             if (surface_world_specular(payload.x)!=(world_class==0u) || !surface_reflection_traceable(payload)) {continue;}
             site.receiver=reflection_response(payload);
-            for(uint i=0u;i<REG_REFLECTION_BSDF_VECTORS;i++) {site.bsdf.data[i]=float4(unpackHalf2x16ToFloat(records[6u+i*2u][base]),unpackHalf2x16ToFloat(records[7u+i*2u][base]));}
+            for(uint i=0u;i<REG_REFLECTION_BSDF_VECTORS-1u;i++) {site.bsdf.data[i]=float4(unpackHalf2x16ToFloat(records[6u+i*2u][base]),unpackHalf2x16ToFloat(records[7u+i*2u][base]));}
+            site.bsdf.data[11]=float4(unpackHalf2x16ToFloat(records[REG_VISIBILITY_REFLECTION_WORDS-1u][base]),site.bsdf.data[9].w,site.bsdf.data[10].w);
+            site.bsdf.data[9].w=0.;site.bsdf.data[10].w=0.;
             site.geometric=asfloat(uint3(records[0u][base],records[1u][base],records[2u][base]));
             distance=asfloat(records[3u][base]);
             site.normal=decode_octahedron(unpackHalf2x16ToFloat(records[4u][base]));

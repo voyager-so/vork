@@ -178,20 +178,28 @@ mod tests {
     use super::*;
     #[test]
     fn camera_headroom_ignores_staging_but_not_local_pressure() {
-        assert_eq!(local_headroom([(true, 4<<30), (false, 32<<30)]), Some(4<<30));
-        assert_eq!(local_headroom([(true, 0), (false, 32<<30)]), Some(0));
-        assert_eq!(local_headroom([(true, 4<<30), (true, 2<<30)]), None);
-        assert_eq!(local_headroom([(false, 32<<30)]), None);
+        assert_eq!(local_headroom::<u64>([(true, 4<<30), (false, 32<<30)]), Some(4<<30));
+        assert_eq!(local_headroom::<u64>([(true, 0), (false, 32<<30)]), Some(0));
+        assert_eq!(local_headroom::<u64>([(true, 4<<30), (true, 2<<30)]), None);
+        assert_eq!(local_headroom::<u64>([(false, 32<<30)]), None);
+    }
+
+    #[test]
+    fn camera_usage_and_headroom_come_from_the_same_local_heap() {
+        let heaps = [(false, (1_u64 << 30, 31_u64 << 30)), (true, (2 << 30, 6 << 30))];
+        assert_eq!(local_headroom(heaps), Some((2 << 30, 6 << 30)));
+        assert_eq!(local_headroom([(true, (2_u64 << 30, 6_u64 << 30)),
+            (true, (4 << 30, 1 << 30))]), None);
     }
 
     #[test]
     fn unrelated_heaps_never_supply_an_admission_budget() {
-        assert_eq!(common_headroom([]), None);
-        assert_eq!(common_headroom([4096]), Some(4096));
+        assert_eq!(common_headroom::<u64>([]), None);
+        assert_eq!(common_headroom::<u64>([4096]), Some(4096));
         // Device-local small/large heaps, and host-visible staging respectively.
-        assert_eq!(common_headroom([0, 4096]), None);
-        assert_eq!(common_headroom([4096, 0]), None);
-        assert_eq!(common_headroom([0, 4096, 8192]), None);
+        assert_eq!(common_headroom::<u64>([0, 4096]), None);
+        assert_eq!(common_headroom::<u64>([4096, 0]), None);
+        assert_eq!(common_headroom::<u64>([0, 4096, 8192]), None);
     }
     #[test]
     fn native_retry_evicts_only_after_pressure_and_stops_when_pinned() {
@@ -254,16 +262,29 @@ mod tests {
 /// Only a single shared Vulkan heap has resource-independent headroom. wgpu's
 /// selected memory type is not exposed here: multiple heaps (including staging
 /// heaps) are unknown, never a minimum/maximum admission budget.
-fn common_headroom(heaps: impl IntoIterator<Item = u64>) -> Option<u64> {
+fn common_headroom<T>(heaps: impl IntoIterator<Item = T>) -> Option<T> {
     let mut heaps = heaps.into_iter();
     let first = heaps.next()?;
     heaps.next().is_none().then_some(first)
 }
 
-/// Camera storage prefers device-local memory. A host staging heap must not
-/// hide pressure on the single VRAM heap (the usual discrete Vulkan adapter).
-/// Multiple local heaps remain unknown because their allocation type is opaque.
-pub(crate) fn camera_headroom(device: &wgpu::Device) -> Option<u64> {
+/// Snapshot bytes of startup headroom and its matching usage baseline together.
+/// The qualification override lowers headroom, so it has the same relative basis.
+pub(crate) fn camera_budget(device: &wgpu::Device, device_memory: u64, override_bytes: Option<u64>) -> (u64, u64, bool) {
+    let (usage, headroom) = camera_usage_headroom(device).unwrap_or_else(|| {
+        let usage = device.generate_allocator_report().map_or(0, |m| m.total_reserved_bytes);
+        (usage, device_memory.saturating_sub(usage))
+    });
+    let native_budget = headroom.min(device_memory);
+    let budget = override_bytes.map_or(native_budget, |bytes| native_budget.min(bytes));
+    (budget, usage, budget < native_budget)
+}
+
+/// Process usage and currently usable headroom in bytes from the same native
+/// heap. Driver reservations and other processes reduce headroom, not our usage.
+/// Camera storage selects the single local heap independently of host staging;
+/// multiple local heaps remain unknown because their allocation type is opaque.
+pub(crate) fn camera_usage_headroom(device: &wgpu::Device) -> Option<(u64, u64)> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     if let Some(hal) = unsafe { device.as_hal::<wgpu::hal::api::Vulkan>() } {
         use ash::{ext, vk};
@@ -272,11 +293,19 @@ pub(crate) fn camera_headroom(device: &wgpu::Device) -> Option<u64> {
         let mut properties = vk::PhysicalDeviceMemoryProperties2::default().push_next(&mut budget);
         unsafe {hal.shared_instance().raw_instance().get_physical_device_memory_properties2(hal.raw_physical_device(), &mut properties);}
         return local_headroom(properties.memory_properties.memory_heaps_as_slice().iter().enumerate()
-            .map(|(i, heap)| (heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL), budget.heap_budget[i].saturating_sub(budget.heap_usage[i]))));
+            .map(|(i, heap)| (heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL), (budget.heap_usage[i], budget.heap_budget[i].saturating_sub(budget.heap_usage[i])))));
     }
-    available(device)
+    #[cfg(target_os = "macos")]
+    if let Some(hal) = unsafe { device.as_hal::<wgpu::hal::api::Metal>() } {
+        use objc2_metal::MTLDevice;
+        let native = hal.raw_device();
+        let capacity = native.recommendedMaxWorkingSetSize();
+        let usage = native.currentAllocatedSize() as u64;
+        return Some((usage, capacity.saturating_sub(usage)));
+    }
+    None
 }
-fn local_headroom(heaps: impl IntoIterator<Item = (bool, u64)>) -> Option<u64> {
+fn local_headroom<T>(heaps: impl IntoIterator<Item = (bool, T)>) -> Option<T> {
     common_headroom(heaps.into_iter().filter_map(|(local, free)| local.then_some(free)))
 }
 

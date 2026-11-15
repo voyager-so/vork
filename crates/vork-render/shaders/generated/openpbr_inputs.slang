@@ -26,24 +26,25 @@ Closure material_closure<V:IVariant>(uint r, MaterialUv m, float3 normal, float3
     c.coat_weight=material_value(r,26u);
     c.coat_color=material_constant_color(r,27u);
     c.coat_roughness=material_value(r,30u);
-    c.coat_ior=material_value(r,31u);
-    c.coat_darkening=material_value(r,32u);
-    c.fuzz_weight=material_value(r,33u);
-    c.fuzz_color=material_constant_color(r,34u);
-    c.fuzz_roughness=material_value(r,37u);
-    c.emission_luminance=material_value(r,38u);
-    c.emission_color=material_constant_color(r,39u);
-    c.thin_film_weight=V.has_film ? material_value(r,42u) : 0.;
-    c.thin_film_thickness=material_value(r,43u);
-    c.thin_film_ior=material_value(r,44u);
-    c.geometry_opacity=material_value(r,45u);
-    c.geometry_thin_walled=material_value(r,46u)>.5;
-    c.transmission_dispersion_scale=material_value(r,56u);
-    c.transmission_dispersion_abbe_number=material_value(r,57u);
+    c.coat_roughness_anisotropy=V.has_coat_anisotropy ? material_value(r,31u) : 0.;
+    c.coat_ior=material_value(r,32u);
+    c.coat_darkening=material_value(r,33u);
+    c.fuzz_weight=material_value(r,34u);
+    c.fuzz_color=material_constant_color(r,35u);
+    c.fuzz_roughness=material_value(r,38u);
+    c.emission_luminance=material_value(r,39u);
+    c.emission_color=material_constant_color(r,40u);
+    c.thin_film_weight=V.has_film ? material_value(r,43u) : 0.;
+    c.thin_film_thickness=material_value(r,44u);
+    c.thin_film_ior=material_value(r,45u);
+    c.geometry_opacity=material_value(r,46u);
+    c.geometry_thin_walled=material_value(r,47u)>.5;
+    c.transmission_dispersion_scale=material_value(r,60u);
+    c.transmission_dispersion_abbe_number=material_value(r,61u);
     // Runtime sockets share one texture evaluator; no per-input lighting or shader variants.
     [loop] for(uint input=0u;input<=MATERIAL_OPACITY;input++) {
         let b=material_byte<V>(r,input);if((b&REG_MATERIAL_TAP_INDEX_MASK)==0u) {continue;}
-        if((input==6u && !V.has_anisotropy) || (input==26u && !V.has_film)) {continue;}
+        if((input==6u && !V.has_anisotropy) || (input==19u && !V.has_coat_anisotropy) || (input==27u && !V.has_film)) {continue;}
         let texel=material_sample(material_tap(r,b&REG_MATERIAL_TAP_INDEX_MASK,m));
         let scalar=texel[min(b>>28u,3u)];let color=select((b>>28u)==4u,texel.rgb,float3(scalar));
         switch(input) {
@@ -66,19 +67,20 @@ Closure material_closure<V:IVariant>(uint r, MaterialUv m, float3 normal, float3
         case 16u:c.coat_weight*=scalar;break;
         case 17u:c.coat_color*=color;break;
         case 18u:c.coat_roughness*=scalar;break;
-        case 19u:c.coat_ior*=scalar;break;
-        case 20u:c.coat_darkening*=scalar;break;
-        case 21u:c.fuzz_weight*=scalar;break;
-        case 22u:c.fuzz_color*=color;break;
-        case 23u:c.fuzz_roughness*=scalar;break;
-        case 24u:c.emission_luminance*=scalar;break;
-        case 25u:c.emission_color*=color;break;
-        case 26u:c.thin_film_weight*=scalar;break;
-        case 27u:c.thin_film_thickness*=scalar;break;
-        case 28u:c.thin_film_ior*=scalar;break;
-        case 29u:c.geometry_opacity*=scalar;break;
-        case 34u:c.transmission_dispersion_scale*=scalar;break;
-        case 35u:c.transmission_dispersion_abbe_number*=scalar;break;
+        case 19u:c.coat_roughness_anisotropy*=scalar;break;
+        case 20u:c.coat_ior*=scalar;break;
+        case 21u:c.coat_darkening*=scalar;break;
+        case 22u:c.fuzz_weight*=scalar;break;
+        case 23u:c.fuzz_color*=color;break;
+        case 24u:c.fuzz_roughness*=scalar;break;
+        case 25u:c.emission_luminance*=scalar;break;
+        case 26u:c.emission_color*=color;break;
+        case 27u:c.thin_film_weight*=scalar;break;
+        case 28u:c.thin_film_thickness*=scalar;break;
+        case 29u:c.thin_film_ior*=scalar;break;
+        case 30u:c.geometry_opacity*=scalar;break;
+        case 36u:c.transmission_dispersion_scale*=scalar;break;
+        case 37u:c.transmission_dispersion_abbe_number*=scalar;break;
         }
     }
     return c;
@@ -105,20 +107,21 @@ Closure material_closure<V:IVariant>(uint r, MaterialUv m, float3 normal, float3
     c.coat_weight=material_float<V>(r,16u,26u,m);
     c.coat_color=material_color<V>(r,17u,27u,m);
     c.coat_roughness=material_float<V>(r,18u,30u,m);
-    c.coat_ior=material_float<V>(r,19u,31u,m);
-    c.coat_darkening=material_float<V>(r,20u,32u,m);
-    c.fuzz_weight=material_float<V>(r,21u,33u,m);
-    c.fuzz_color=material_color<V>(r,22u,34u,m);
-    c.fuzz_roughness=material_float<V>(r,23u,37u,m);
-    c.emission_luminance=material_float<V>(r,24u,38u,m);
-    c.emission_color=material_color<V>(r,25u,39u,m);
-    c.thin_film_weight=V.has_film ? material_float<V>(r,26u,42u,m) : 0.;
-    c.thin_film_thickness=material_float<V>(r,27u,43u,m);
-    c.thin_film_ior=material_float<V>(r,28u,44u,m);
-    c.geometry_opacity=material_float<V>(r,29u,45u,m);
-    c.geometry_thin_walled=material_value(r,46u)>.5;
-    c.transmission_dispersion_scale=material_float<V>(r,34u,56u,m);
-    c.transmission_dispersion_abbe_number=material_float<V>(r,35u,57u,m);
+    c.coat_roughness_anisotropy=V.has_coat_anisotropy ? material_float<V>(r,19u,31u,m) : 0.;
+    c.coat_ior=material_float<V>(r,20u,32u,m);
+    c.coat_darkening=material_float<V>(r,21u,33u,m);
+    c.fuzz_weight=material_float<V>(r,22u,34u,m);
+    c.fuzz_color=material_color<V>(r,23u,35u,m);
+    c.fuzz_roughness=material_float<V>(r,24u,38u,m);
+    c.emission_luminance=material_float<V>(r,25u,39u,m);
+    c.emission_color=material_color<V>(r,26u,40u,m);
+    c.thin_film_weight=V.has_film ? material_float<V>(r,27u,43u,m) : 0.;
+    c.thin_film_thickness=material_float<V>(r,28u,44u,m);
+    c.thin_film_ior=material_float<V>(r,29u,45u,m);
+    c.geometry_opacity=material_float<V>(r,30u,46u,m);
+    c.geometry_thin_walled=material_value(r,47u)>.5;
+    c.transmission_dispersion_scale=material_float<V>(r,36u,60u,m);
+    c.transmission_dispersion_abbe_number=material_float<V>(r,37u,61u,m);
     return c;
 }
 #endif

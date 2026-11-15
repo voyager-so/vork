@@ -21,10 +21,10 @@ interface IVariant {
     static const bool has_coat;
     static const bool has_fuzz;
     static const bool has_anisotropy;
+    static const bool has_coat_anisotropy;
     static const bool has_film;
     static const bool has_tint;
     static const bool has_mask;
-    static const bool has_sided;
     static const bool has_punctual;
     static const bool has_finite;
     static const bool has_rectangle;
@@ -42,6 +42,23 @@ interface IVariant {
     // The scene's light kinds as bits (sun, point, spot, rect); 15 is any.
     static const uint light_types;
     static const bool has_implicit_geometry;
+    static const bool has_weighted_ior;
+    static const bool has_gltf_tint;
+    // Some installed material can pass a straight path connection through a
+    // covered point; false proves every covered candidate blocks it.
+    static const bool has_null_connection;
+    // Some camera sample may start inside a solid. Only a path key carrying
+    // the installed proof (FEATURE_CAMERA_EXTERIOR) is false.
+    static const bool has_camera_interior;
+    // Scene unions of a transport kernel's key (surface.slang installed_surface):
+    // some installed closure can have a subsurface lobe; some installed material
+    // is a fibre program. Distinct from `subsurface`, the raster diffusion technique.
+    static const bool has_subsurface;
+    static const bool has_hair;
+    // The key is the union of every installed material. Only then are the
+    // capabilities it lacks absent from the whole scene, and only then does
+    // installed_surface state them.
+    static const bool installed;
 }
 // Whether `input` may be textured in this variant.
 bool input_textured<V:IVariant>(uint input) {
@@ -50,6 +67,8 @@ bool input_textured<V:IVariant>(uint input) {
 }
 // The depth prepass and every unspecialized pipeline: every capability.
 struct Unspecialized : IVariant {
+    // Static-only policy: avoid Slang 2026.21 synthesizing a zero initializer.
+    __init() {}
     static const bool layered = true;
     static const bool metal = true;
     static const bool ray_shadows = false;
@@ -62,10 +81,10 @@ struct Unspecialized : IVariant {
     static const bool has_coat = true;
     static const bool has_fuzz = true;
     static const bool has_anisotropy = true;
+    static const bool has_coat_anisotropy = true;
     static const bool has_film = true;
     static const bool has_tint = true;
     static const bool has_mask = true;
-    static const bool has_sided = true;
     static const bool has_punctual = true;
     static const bool has_finite = true;
     static const bool has_rectangle = true;
@@ -79,4 +98,11 @@ struct Unspecialized : IVariant {
     static const bool has_lit = true;
     static const uint light_types = 15u;
     static const bool has_implicit_geometry = true;
+    static const bool has_weighted_ior = true;
+    static const bool has_gltf_tint = true;
+    static const bool has_null_connection = true;
+    static const bool has_camera_interior = true;
+    static const bool has_subsurface = true;
+    static const bool has_hair = true;
+    static const bool installed = false;
 };

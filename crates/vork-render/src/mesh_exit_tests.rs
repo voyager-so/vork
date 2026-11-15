@@ -1,10 +1,9 @@
 use super::*;
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn strand_tree_matches_brute_force_for_bends_caps_and_parallel_rays() -> Result<()> {
-    let Some(renderer) = crate::test_renderer()? else {
-        return Ok(());
-    };
+    let renderer = crate::test_renderer()?;
     let mut points = Vec::new();
     for strand in 0..2 {
         let x = (strand as f32 - 11.5) * 0.095;

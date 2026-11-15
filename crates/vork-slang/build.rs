@@ -1,5 +1,6 @@
 fn main() {
     println!("cargo:rerun-if-env-changed=VORK_SLANGC");
+    println!("cargo:rerun-if-changed=../../dist/macos-minimum.txt");
     println!("cargo:rerun-if-changed=src/filesystem.cpp");
     let compiler = std::env::var_os("VORK_SLANGC")
         .map(std::path::PathBuf::from)
@@ -63,6 +64,9 @@ fn main() {
             .arg("src/filesystem.cpp")
             .arg("-o")
             .arg(&output);
+        if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "macos" {
+            command.arg(format!("-mmacosx-version-min={}", include_str!("../../dist/macos-minimum.txt").trim()));
+        }
         if std::env::var("CARGO_CFG_TARGET_OS").unwrap() == "linux" {
             command.arg("-ldl");
         }

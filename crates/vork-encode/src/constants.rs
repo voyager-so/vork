@@ -6,8 +6,6 @@ pub(crate) const NVENC_PROBE_EXTENT: u32 = 256;
 pub(crate) const SOFTWARE_PRESET: &str = "veryfast";
 /// quality/performance setting: existing portable H.264 constant rate factor.
 pub(crate) const SOFTWARE_CRF: u8 = 18;
-/// quality/performance setting: one software encoding thread per ordered output.
-pub(crate) const SOFTWARE_THREADS: &str = "1";
 /// quality/performance setting: existing hardware encoder bitrate in bits per second.
 pub(crate) const HARDWARE_BITRATE: u32 = 12_000_000;
 /// quality/performance setting: existing maximum keyframe spacing, in seconds.

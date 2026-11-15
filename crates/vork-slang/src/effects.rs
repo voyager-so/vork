@@ -142,12 +142,16 @@ struct State {
     certified: bool,
     proof_failures: std::sync::Arc<std::sync::Mutex<std::collections::BTreeSet<String>>>,
     dependency: bool,
+    /// Follow output dependence through unrelated conditional computations.
+    output_slice: bool,
     /// Material input words, `None` where unknown: set, word reads evaluate
     /// to the words (outside the dependency domain too) and bitcasts of known
     /// words keep their value.
     words: Option<std::sync::Arc<[Option<u32>]>>,
     simulate_loop: bool,
     loop_flow: Option<LoopFlow>,
+    loop_breaks: Vec<std::sync::Arc<State>>,
+    loop_continues: Vec<std::sync::Arc<State>>,
     /// Inside a switch case, `break` leaves the switch (`switch_exit`), not
     /// an enclosing loop.
     in_switch: bool,
@@ -290,6 +294,17 @@ fn expression(
                     return Value::NumberRange(f64::from(a as f32),f64::from(b as f32));
                 }
             }
+            if let Value::NumberRange(a,b)=get(*expr) {
+                let limits=match kind {
+                    naga::ScalarKind::Sint=>Some((i32::MIN as f64,i32::MAX as f64)),
+                    naga::ScalarKind::Uint=>Some((0.,u32::MAX as f64)),
+                    _=>None,
+                };
+                if *width==4 && limits.is_some_and(|(lo,hi)|a>=lo && b<=hi) {
+                    let (a,b)=(a.trunc() as i64,b.trunc() as i64);
+                    return if a==b {Value::Integer(a)}else{Value::IntegerRange(a,b)};
+                }
+            }
             let number = match get(*expr) {
                 Value::Number(n) => Some(n),
                 Value::Integer(n) => Some(n as f64),
@@ -333,13 +348,15 @@ fn expression(
         E::Compose { components, .. } => Value::Parts(components.iter().map(|h| get(*h)).collect()),
         E::Splat { size, value } => Value::Parts(vec![get(*value); *size as usize]),
         E::Binary { op, left, right } => match (get(*left), get(*right)) {
-            (Value::Bool(a),Value::Bool(b)) if state.numeric => match op {
+            (Value::Bool(a),Value::Bool(b)) if state.numeric || state.certified => match op {
                 naga::BinaryOperator::LogicalAnd => Value::Bool(a && b),
                 naga::BinaryOperator::LogicalOr => Value::Bool(a || b),
                 naga::BinaryOperator::Equal => Value::Bool(a == b),
                 naga::BinaryOperator::NotEqual => Value::Bool(a != b),
                 _ => Value::Unknown,
             },
+            (a @ (Value::Integer(_)|Value::IntegerRange(..)),b @ (Value::Integer(_)|Value::IntegerRange(..)))
+                if matches!(op,naga::BinaryOperator::Equal|naga::BinaryOperator::NotEqual|naga::BinaryOperator::Less|naga::BinaryOperator::LessEqual|naga::BinaryOperator::Greater|naga::BinaryOperator::GreaterEqual)=>interval::binary(*op,a,b),
             (Value::IntegerRange(a,b),Value::Integer(c)) | (Value::Integer(c),Value::IntegerRange(a,b)) if *op==naga::BinaryOperator::Add => {
                 match (a.checked_add(c),b.checked_add(c)) {
                     (Some(a),Some(b)) if a>=i32::MIN as i64 && b<=i32::MAX as i64 => Value::IntegerRange(a,b),
@@ -360,6 +377,7 @@ fn expression(
                 // A mask of non-negative (u32) words is never larger than either.
                 naga::BinaryOperator::And if a >= 0 && b >= 0 => Value::Integer(a & b),
                 naga::BinaryOperator::And=>integer_result(Some(a&b)),
+                naga::BinaryOperator::ShiftLeft=>integer_result(u32::try_from(b).ok().filter(|b|*b<32).and_then(|b|a.checked_shl(b))),
                 naga::BinaryOperator::ShiftRight=>integer_result(u32::try_from(b).ok().and_then(|b|a.checked_shr(b))),
                 _ => Value::Unknown,
             }),
@@ -398,7 +416,7 @@ fn expression(
             _ => get(*accept).merge(&get(*reject)),
         },
         E::Math { fun: naga::MathFunction::Min, arg, arg1: Some(other), .. } => {
-            let bounds=|value:Value| match value {Value::Integer(n)=>Some((n,n)),Value::IntegerRange(a,b)=>Some((a,b)),_=>None};
+            let bounds=|value:Value| match value {Value::Integer(n)=>Some((n,n)),Value::IntegerRange(a,b)=>Some((a.clone(),b.clone())),_=>None};
             match (bounds(get(*arg)),bounds(get(*other))) {
                 (Some((a,b)),Some((c,d))) => {
                     let (a,b)=(a.min(c),b.min(d));
@@ -407,7 +425,12 @@ fn expression(
                 _=>Value::dependent([get(*arg),get(*other)]),
             }
         },
-        E::Unary { op: naga::UnaryOperator::Negate, expr } if state.numeric => match get(*expr) {
+        E::Unary { op: naga::UnaryOperator::Negate, expr } if state.numeric || state.certified => match get(*expr) {
+            Value::Integer(n) => integer_result(n.checked_neg()),
+            Value::IntegerRange(a,b) => match (b.checked_neg(),a.checked_neg()) {
+                (Some(a),Some(b)) if a>=i32::MIN as i64 && b<=i32::MAX as i64=>Value::IntegerRange(a,b),
+                _=>Value::Unknown,
+            },
             Value::Number(n) => Value::Number(-n),
             v => Value::dependent([v]),
         },
@@ -761,6 +784,13 @@ fn merge_state(state: &mut State, a: &State, b: &State) {
     if state.simulate_loop {
         state.loop_flow = if a.loop_flow == b.loop_flow {a.loop_flow} else {Some(LoopFlow::Mixed)};
     }
+    let paths=|a:&[std::sync::Arc<State>],b:&[std::sync::Arc<State>]| {
+        let mut result=a.to_vec();
+        for path in b {if !result.iter().any(|p|std::sync::Arc::ptr_eq(p,path)) {result.push(path.clone());}}
+        result
+    };
+    state.loop_breaks=paths(&a.loop_breaks,&b.loop_breaks);
+    state.loop_continues=paths(&a.loop_continues,&b.loop_continues);
     state.time_control = a.time_control || b.time_control;
     state.effects.extend(a.effects.clone());
     state.effects.extend(b.effects.clone());
@@ -886,7 +916,7 @@ fn block(
                     })
                     .collect();
                 let (value, mut after) =
-                    evaluate_mode(module, &module.functions[*callee], &values, depth + 1,state.dependency,state.words.clone(),state.live,state.certified,state.numeric,state.image_reads.clone(),state.query_reads.clone(),state.work.clone());
+                    evaluate_mode(module, &module.functions[*callee], &values, depth + 1,state.dependency,state.words.clone(),state.live,state.certified,state.numeric,state.image_reads.clone(),state.query_reads.clone(),state.work.clone(),state.output_slice);
                 if state.certified {
                     state.proof_failures.lock().unwrap().extend(after.proof_failures.lock().unwrap().iter().cloned());
                 }
@@ -931,18 +961,52 @@ fn block(
                 }
             }
             S::If { condition, accept, reject } => {
-                if state.dependency && !get(state,*condition).independent() {return unknown(state);}
+                if state.dependency && !state.output_slice && !get(state,*condition).independent() {return unknown(state);}
                 if let Value::Bool(condition) = get(state, *condition) {
                     if let Some(value) = block(module,function,args,state,if condition {accept} else {reject},depth) {return Some(value);}
                     continue;
                 }
-                let dependent = get(state, *condition).time();
+                let dependent = if state.output_slice {!get(state,*condition).independent()} else {get(state, *condition).time()};
+                let enclosing_control=state.time_control;
                 let mut a = state.clone();
                 let mut b = state.clone();
                 a.time_control |= dependent;
                 b.time_control |= dependent;
                 let ra = block(module, function, args, &mut a, accept, depth);
                 let rb = block(module, function, args, &mut b, reject, depth);
+                // Keep a path leaving this iteration separate from the path
+                // executing its remaining statements. Joining their counters
+                // here would lose a finite bound (or execute skipped stores).
+                if state.simulate_loop && state.certified && ra.is_none() && rb.is_none() && a.loop_flow != b.loop_flow {
+                    let split=match (a.loop_flow,b.loop_flow) {
+                        (Some(LoopFlow::Break|LoopFlow::Continue),None)=>Some((a.clone(),b.clone())),
+                        (None,Some(LoopFlow::Break|LoopFlow::Continue))=>Some((b.clone(),a.clone())),
+                        _=>None,
+                    };
+                    if let Some((mut stopped,mut running))=split {
+                        let flow=stopped.loop_flow.take();
+                        running.loop_breaks.append(&mut stopped.loop_breaks);
+                        running.loop_continues.append(&mut stopped.loop_continues);
+                        if flow==Some(LoopFlow::Break) {running.loop_breaks.push(std::sync::Arc::new(stopped));}
+                        else {running.loop_continues.push(std::sync::Arc::new(stopped));}
+                        *state=running;
+                        continue;
+                    } else {
+                        // Both terminal paths skip the rest of this body.
+                        // Preserve each destination until the iteration joins.
+                        merge_state(state,&a,&b);
+                        if matches!((a.loop_flow,b.loop_flow),(Some(LoopFlow::Break),Some(LoopFlow::Continue))|(Some(LoopFlow::Continue),Some(LoopFlow::Break))) {
+                            for mut branch in [a,b] {
+                                let flow=branch.loop_flow.take();
+                                branch.loop_breaks.clear();branch.loop_continues.clear();
+                                if flow==Some(LoopFlow::Break) {state.loop_breaks.push(std::sync::Arc::new(branch));}
+                                else {state.loop_continues.push(std::sync::Arc::new(branch));}
+                            }
+                            state.loop_flow=Some(LoopFlow::Break);
+                        }
+                        return None;
+                    }
+                }
                 match (ra, rb) {
                     (Some(x), Some(y)) => {
                         merge_state(state, &a, &b);
@@ -966,14 +1030,18 @@ fn block(
                     (None, None) => {
                         merge_state(state, &a, &b);
                         state.switch_exit = a.switch_exit;
+                        // Both arms reconverge. Their writes retain dependence;
+                        // subsequent unrelated computations do not inherit it.
+                        if state.output_slice {state.time_control=enclosing_control;}
                     }
                 }
             }
             S::Loop {
                 body, continuing, break_if,
             } => {
-                if let Some(after) = constant_loop(module,function,args,state,body,continuing,*break_if,depth) {
+                if let Some((after,returned)) = constant_loop(module,function,args,state,body,continuing,*break_if,depth) {
                     *state=after;
+                    if returned.is_some() {return returned;}
                     continue;
                 }
                 if let Some(work)=&state.work {
@@ -981,7 +1049,7 @@ fn block(
                     return Some(Value::Unknown);
                 }
                 if state.dependency || state.certified {
-                    if state.certified {state.proof_failures.lock().unwrap().insert("loop count is not provably finite".into());}
+                    if state.certified {state.proof_failures.lock().unwrap().insert(format!("{}: loop count is not provably finite; use a provably bounded loop",function.name.as_deref().unwrap_or("entry")));}
                     return unknown(state);
                 }
                 // Join every intermediate store, including paths before break,
@@ -1095,32 +1163,90 @@ fn block(
     None
 }
 // Execute only loops whose control flow is proven at every iteration. Unknown
-// control, early returns, or the analysis budget fall back to conservative widening.
+// control or the analysis budget fall back to conservative widening. Return
+// paths are retained as exits while the remaining paths continue to termination.
 fn constant_loop(
     module: &naga::Module, function: &naga::Function, args: &[Value], initial: &State,
     body: &naga::Block, continuing: &naga::Block, break_if: Option<naga::Handle<E>>, depth: usize,
-) -> Option<State> {
+) -> Option<(State,Option<Value>)> {
     let mut state=initial.clone();
     state.simulate_loop=true;
     state.loop_flow=None;
+    state.loop_breaks.clear();
+    state.loop_continues.clear();
     state.in_switch=false;
-    let leave=|mut state: State| {state.simulate_loop=initial.simulate_loop;state.in_switch=initial.in_switch;state.loop_flow=None;Some(state)};
+    let join=|states:Vec<std::sync::Arc<State>>|->Option<State> {
+        let mut states=states.into_iter();
+        let mut result=states.next()?.as_ref().clone();
+        for other in states {let before=result.clone();merge_state(&mut result,&before,&other);}
+        Some(result)
+    };
+    let leave=|mut state: State,returned:Option<Value>| {
+        let mut breaks=std::mem::take(&mut state.loop_breaks);
+        let returned=if breaks.is_empty() {returned} else {
+            if let Some(value)=returned {let arguments=state.arguments.clone();exit(&mut state,value,arguments);}
+            else {breaks.push(std::sync::Arc::new(state.clone()));}
+            let mut after=join(breaks).unwrap();
+            merge_exits(&mut after,&state);
+            state=after;
+            None
+        };
+        state.simulate_loop=initial.simulate_loop;
+        state.in_switch=initial.in_switch;
+        state.loop_flow=None;
+        state.loop_breaks=initial.loop_breaks.clone();
+        state.loop_continues=initial.loop_continues.clone();
+        (state,returned)
+    };
     for _ in 0..4096 {
-        if block(module,function,args,&mut state,body,depth).is_some() || state.exits != initial.exits {return None;}
-        match state.loop_flow {
-            Some(LoopFlow::Break) => return leave(state),
-            Some(LoopFlow::Mixed) => return None,
-            _ => state.loop_flow=None,
+        let before_locals=state.locals.clone();
+        let before_arguments=state.arguments.clone();
+        let returned=block(module,function,args,&mut state,body,depth);
+        let mut continues=std::mem::take(&mut state.loop_continues);
+        let running=if let Some(value)=returned {
+            if continues.is_empty() {return Some(leave(state,Some(value)));}
+            let arguments=state.arguments.clone();exit(&mut state,value,arguments);
+            false
+        }else {
+            match state.loop_flow {
+                Some(LoopFlow::Break) if continues.is_empty()=>return Some(leave(state,None)),
+                Some(LoopFlow::Break)=> {
+                    let mut stopped=state.clone();stopped.loop_breaks.clear();stopped.loop_continues.clear();
+                    state.loop_breaks.push(std::sync::Arc::new(stopped));
+                    false
+                },
+                Some(LoopFlow::Mixed)=>return None,
+                _=>true,
+            }
+        };
+        if !continues.is_empty() {
+            let breaks=std::mem::take(&mut state.loop_breaks);
+            let terminal=state.clone();
+            if running {continues.push(std::sync::Arc::new(state));}
+            state=join(continues)?;
+            state.loop_breaks=breaks;
+            merge_exits(&mut state,&terminal);
         }
-        if block(module,function,args,&mut state,continuing,depth).is_some() {return None;}
+        // Coalesce completed paths once per iteration, so a runtime early
+        // exit does not retain a growing history of interpreter snapshots.
+        if state.loop_breaks.len()>1 {
+            let mut after=join(std::mem::take(&mut state.loop_breaks))?;
+            after.loop_breaks.clear();after.loop_continues.clear();
+            state.loop_breaks.push(std::sync::Arc::new(after));
+        }
+        state.loop_flow=None;
+        if let Some(value)=block(module,function,args,&mut state,continuing,depth) {return Some(leave(state,Some(value)));}
         if let Some(condition)=break_if {
             match expression(module,function,args,&state,condition) {
-                Value::Bool(true) => return leave(state),
-                Value::Bool(false) => {},
-                _ => return None,
+                Value::Bool(true)=>return Some(leave(state,None)),
+                Value::Bool(false)=>{},
+                _=>return None,
             }
         }
         if state.loop_flow.is_some() {return None;}
+        // An unchanged abstract store cannot establish a later exit. Avoid
+        // spending the full iteration budget on a runtime/unbounded loop.
+        if state.locals==before_locals && state.arguments==before_arguments {return None;}
     }
     None
 }
@@ -1134,7 +1260,7 @@ fn evaluate(
     live: Option<Live>,
     certified: bool,
 ) -> (Value, State) {
-    evaluate_mode(module,function,args,depth,dependency,words,live,certified,false,None,None,None)
+    evaluate_mode(module,function,args,depth,dependency,words,live,certified,false,None,None,None,false)
 }
 fn evaluate_mode(
     module: &naga::Module,
@@ -1149,6 +1275,7 @@ fn evaluate_mode(
     image_reads: Option<std::sync::Arc<std::sync::Mutex<Option<BTreeSet<u32>>>>>,
     query_reads: Option<std::sync::Arc<std::sync::Mutex<QueryReads>>>,
     work: Option<std::sync::Arc<std::sync::Mutex<WorkProof>>>,
+    output_slice: bool,
 ) -> (Value, State) {
     if function.name.as_deref() == Some("vork_trace_field") {
         if let Some(reads)=&query_reads {
@@ -1231,6 +1358,8 @@ fn evaluate_mode(
             "vork_attribute" | "vork_object_to_generated"
                 | "vork_world_to_object"
                 | "vork_world_normal_to_object"
+                | "vork_object_direction_to_world"
+                | "vork_object_normal_to_world"
                 | "vork_world_to_camera"
                 | "vork_world_to_window"
         )
@@ -1250,13 +1379,16 @@ fn evaluate_mode(
         numeric,
         certified,
         dependency,
+        output_slice,
         words,
         live,
         arguments: args.to_vec(),
         ..Default::default()
     };
-    if depth > 32 {
-        if certified {state.proof_failures.lock().unwrap().insert("query call depth is not provably finite".into());}
+    // Validated Naga functions form an acyclic call graph. Its size bounds
+    // every finite call chain; the smaller budget belongs to other analyses.
+    if depth > if live.is_some_and(|l|l.query_bounds) {module.functions.len()}else{32} {
+        if certified {state.proof_failures.lock().unwrap().insert(format!("{}: call depth is not provably finite; remove recursive calls",function.name.as_deref().unwrap_or("entry")));}
         unknown(&mut state);
         return (
             state.arguments.first().cloned().unwrap_or(Value::Unknown),
@@ -1286,6 +1418,23 @@ pub(super) fn environment_uses_time(wgsl: &str, entry: &str) -> Result<bool> {
 }
 pub(super) fn environment_uses_origin(wgsl: &str, entry: &str) -> Result<bool> {
     environment_depends_on(wgsl, entry, true)
+}
+pub(super) fn environment_constant_camera(wgsl: &str, entry: &str, uniform_images: bool) -> Result<bool> {
+    // Uniform image sampling returns the same bits for every coordinate. Keep
+    // slot dependence: a direction-dependent choice between constants varies.
+    // Use an unknown word, never a made-up numeric texel: zero could otherwise
+    // incorrectly erase a procedural contribution multiplied by the image.
+    let texel=format!("bitcast<f32>({MATERIAL_WORD}(slot))");
+    let sample = if uniform_images { texel } else { format!("{texel}+dot(uv+dx+dy,vec2<f32>(1.))") };
+    let source = format!("fn {MATERIAL_WORD}(i:u32)->u32{{return i;}}\nfn {SAMPLE_IMAGE}(slot:u32,uv:vec2<f32>,dx:vec2<f32>,dy:vec2<f32>)->vec4<f32>{{return vec4<f32>({sample});}}\n{wgsl}");
+    let module = naga::front::wgsl::parse_str(&source)
+        .map_err(|e| anyhow::anyhow!(e.emit_to_string(&source)))?;
+    let function = module.functions.iter().find(|(_,f)| f.name.as_deref()==Some(entry))
+        .context("environment entry missing")?.1;
+    let spatial=Value::Parts(vec![Value::Position;3]);
+    let (_,state)=evaluate_mode(&module,function,&[spatial.clone(),spatial,Value::Position,Value::Independent,
+        Value::Parts(vec![Value::Parts(vec![Value::Number(0.);4]);2])],0,true,None,None,false,false,None,None,None,true);
+    Ok(state.arguments[4].part(1).independent())
 }
 fn environment_depends_on(wgsl: &str, entry: &str, origin: bool) -> Result<bool> {
     let unknown=Value::Parts(vec![Value::Unknown;3]);
@@ -1484,6 +1633,8 @@ pub(super) fn displacement_depends_on(wgsl: &str, entry: &str, parameter: usize)
                             | "vork_object_to_generated"
                             | "vork_world_to_object"
                             | "vork_world_normal_to_object"
+                            | "vork_object_direction_to_world"
+                            | "vork_object_normal_to_world"
                     ),
                 "displace cannot call surface or read scene transforms, cameras or rendered images ({name})"
             );
@@ -1521,7 +1672,7 @@ pub(super) fn composite_reads(wgsl: &str, entry: &str, abi: &Abi) -> Result<Opti
     if !image_call {return Ok(Some(Vec::new()));}
     let reads=std::sync::Arc::new(std::sync::Mutex::new(Some(BTreeSet::new())));
     let args=vec![Value::Unknown;function.arguments.len()];
-    evaluate_mode(&module,function,&args,0,false,None,None,false,false,Some(reads.clone()),None,None);
+    evaluate_mode(&module,function,&args,0,false,None,None,false,false,Some(reads.clone()),None,None,false);
     let result=reads.lock().unwrap().clone().map(|reads|reads.into_iter().collect());
     Ok(result)
 }
@@ -1560,15 +1711,19 @@ pub(super) fn calls_trace(wgsl: &str, entry: &str, abi: &Abi) -> Result<bool> {
     Ok(false)
 }
 
+fn query_bound_failure(failures:&BTreeSet<String>)->Option<&str> {
+    failures.iter().find(|reason| reason.contains(": loop count is not provably finite") || reason.contains(": call depth is not provably finite")).map(String::as_str)
+}
+
 pub(super) fn compute_query_filters(wgsl:&str,abi:&Abi)->Result<Vec<QueryFilter>> {
     let module=super::validated_module(wgsl,abi)?;
     let function=&module.entry_points.iter().find(|entry|entry.name=="vork_entry").context("compute query entry missing")?.function;
     let reads=std::sync::Arc::new(std::sync::Mutex::new(QueryReads::default()));
     let args=vec![Value::Unknown;function.arguments.len()];
-    let (_,state)=evaluate_mode(&module,function,&args,0,false,Some(Vec::<Option<u32>>::new().into()),Some(Live {texels:false,wavelength:true,query_bounds:true}),true,false,None,Some(reads.clone()),None);
+    let (_,state)=evaluate_mode(&module,function,&args,0,false,Some(Vec::<Option<u32>>::new().into()),Some(Live {texels:false,wavelength:true,query_bounds:true}),true,false,None,Some(reads.clone()),None,false);
     let failures=state.proof_failures.lock().unwrap();
-    ensure!(!reads.lock().unwrap().incomplete && !failures.contains("loop count is not provably finite") && !failures.contains("query call depth is not provably finite"),
-        "compute trace requires provably finite loops and call depth; use constant loop bounds (at most 4095 iterations)");
+    if let Some(reason)=query_bound_failure(&failures) {anyhow::bail!("trace: {reason}");}
+    ensure!(!reads.lock().unwrap().incomplete,"trace: compute entry query filters are not provably finite; use fixed query filters");
     let filters=reads.lock().unwrap().filters.iter().copied().collect();
     Ok(filters)
 }
@@ -1582,8 +1737,7 @@ pub(super) fn require_bounded_query_caller(wgsl: &str, entry: &str, abi: &Abi) -
     // remain unknown. The non-time live domain keeps fixed loop counters exact.
     let (_, state) = evaluate(&module, function, &args, 0, false, Some(Vec::<Option<u32>>::new().into()), Some(Live {texels:false,wavelength:true,query_bounds:true}), true);
     let failures = state.proof_failures.lock().unwrap();
-    ensure!(!failures.contains("loop count is not provably finite") && !failures.contains("query call depth is not provably finite"),
-        "trace callers require provably finite loops and call depth; use constant loop bounds (at most 4095 iterations)");
+    if let Some(reason)=query_bound_failure(&failures) {anyhow::bail!("trace: {reason}");}
     Ok(())
 }
 
@@ -1603,7 +1757,9 @@ pub(super) fn program_dependencies(wgsl: &str, entry: &str, abi: &Abi) -> Result
         let callee = &module.functions[handle];
         match callee.name.as_deref().unwrap_or("") {
             name if CAMERA_CALLS.contains(&name) => dependencies.camera = true,
-            "vork_object_to_generated" | "vork_world_to_object" | "vork_world_normal_to_object" => dependencies.object_transforms = true,
+            "vork_object_to_generated" | "vork_world_to_object" | "vork_world_normal_to_object"
+                | "vork_object_direction_to_world"
+                | "vork_object_normal_to_world" => dependencies.object_transforms = true,
             "vork_attribute" => dependencies.attributes = true,
             "vork_trace_field" => dependencies.trace = true,
             name if name == SAMPLE_IMAGE => dependencies.images = true,
@@ -1678,10 +1834,12 @@ impl EffectProbe {
             opacity: active(1),
             transmission: active(2),
             anisotropy: active(7) || active(9),
+            coat_anisotropy: active(registry::EFFECT_SURFACE_COAT_ANISOTROPY as usize) || active(registry::EFFECT_LIT_COAT_ANISOTROPY as usize),
             film: active(8) || active(10),
             coat: active(11) || active(14),
             fuzz: active(12) || active(15),
             tint: active(13) || active(16),
+            weighted_ior: active(registry::EFFECT_SURFACE_WEIGHTED_IOR as usize) || active(registry::EFFECT_LIT_WEIGHTED_IOR as usize),
             lobes: active(3),
             blend_lobes: match state.effects.get(&6) {
                 Some(Value::NumberRange(a,b)) if *a>=1. && b.is_finite() && *b<=u32::MAX as f64 && b.fract()==0. => Some(*b as u32),
@@ -1858,6 +2016,8 @@ mod tests {
             ("vec4<f32>(vork_world_to_camera(vec3<f32>(0.)),1.)", false, true, false, false, false),
             ("vec4<f32>(vork_world_to_window(vec3<f32>(0.)),1.)", false, true, false, false, false),
             ("vec4<f32>(vork_world_to_object(0u,vec3<f32>(0.)),1.)", false, false, true, false, false),
+            ("vec4<f32>(vork_object_direction_to_world(0u,vec3<f32>(1.)),1.)", false, false, true, false, false),
+            ("vec4<f32>(vork_object_normal_to_world(0u,vec3<f32>(1.)),1.)", false, false, true, false, false),
             ("vork_attribute(0u,0u)", false, false, false, true, false),
             ("vork_attribute(u32(a[0].x),0u)", true, false, false, true, false),
             ("vec4<f32>(vork_world_to_camera(vec3<f32>(a[0].x)),1.)", true, true, false, false, false),
@@ -1873,6 +2033,36 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn environment_camera_constants_require_an_output_proof() -> Result<()> {
+        for (value,uniform_images,expected) in [
+            ("vec4<f32>(2.)",false,true),
+            ("vec4<f32>(direction,1.)",true,false),
+            ("vec4<f32>(origin,1.)",true,false),
+            ("vec4<f32>(time)",true,false),
+            ("vork_sample_image(0u,direction.xy,vec2(0.),vec2(0.))",false,false),
+            ("vork_sample_image(0u,direction.xy,vec2(0.),vec2(0.))",true,true),
+            ("vork_sample_image(0u,vec2(0.),vec2(0.),vec2(0.))*vec4(direction,1.)",true,false),
+            ("vork_sample_image(u32(direction.x),vec2(0.),vec2(0.),vec2(0.))",true,false),
+            ("select(vec4(1.),vec4(2.),direction.x>0.)",true,false),
+        ] {
+            let value=value.replace("vork_sample_image",SAMPLE_IMAGE);
+            let source=format!("fn environment(origin:vec3<f32>,direction:vec3<f32>,time:f32,base:u32,result:ptr<function,array<vec4<f32>,2>>) {{ (*result)[0]=vec4(direction,1.); (*result)[1]={value}; }}");
+            assert_eq!(environment_constant_camera(&source,"environment",uniform_images)?,expected,"{value}");
+        }
+        for (body,expected) in [
+            ("var uv=0.; if direction.x>0. {uv=direction.y;} (*result)[1]=vork_sample_image(0u,vec2(uv),vec2(0.),vec2(0.));",true),
+            ("var v=0.; if direction.x>0. {v=1.;} (*result)[1]=vec4(v);",false),
+            ("if direction.x>0. {(*result)[1]=vec4(1.); return;} (*result)[1]=vec4(2.);",false),
+            ("var slot=0u; if direction.x>0. {slot=1u;} (*result)[1]=vork_sample_image(slot,vec2(0.),vec2(0.),vec2(0.));",false),
+            ("var v=0.; loop {if v>direction.x {break;} v+=.1;} (*result)[1]=vec4(v);",false),
+        ] {
+            let body=body.replace("vork_sample_image",SAMPLE_IMAGE);
+            let source=format!("fn environment(origin:vec3<f32>,direction:vec3<f32>,time:f32,base:u32,result:ptr<function,array<vec4<f32>,2>>) {{ {body} }}");
+            assert_eq!(environment_constant_camera(&source,"environment",true)?,expected,"{body}");
+        }
+        Ok(())
+    }
     #[test]
     fn environment_time_survives_bitcasts() -> Result<()> {
         for (value, expected) in [
@@ -2209,6 +2399,58 @@ mod tests {
     }
     #[test]
     #[ignore = "requires pinned Slang"]
+    fn coat_anisotropy_and_weighted_ior_proofs_are_independent() -> Result<()> {
+        let abi = Abi { aov_count: 0, context: Abi::spec_context(), closure: openpbr_fields() };
+        for coat in [false, true] {
+            for weighted in [false, true] {
+                for stage in ["surface", "blend", "lit"] {
+                    let body = format!("Closure c={{}};c.coat_weight=1.;c.coat_roughness_anisotropy={};c.specular_weight={};",
+                        if coat {".7"} else {"0."}, if weighted {".25"} else {"1."});
+                    let source = match stage {
+                        "blend" => format!("struct Inputs {{}}; Blend surface(ShadingContext ctx,Inputs i) {{{body}return add(c,c);}}"),
+                        "lit" => format!("struct Inputs {{}}; Closure surface(ShadingContext ctx,Inputs i) {{Closure c={{}};return c;}} Closure lit(ShadingContext ctx,Inputs i,Lighting light) {{{body}return c;}}"),
+                        _ => format!("struct Inputs {{}}; Closure surface(ShadingContext ctx,Inputs i) {{{body}return c;}}"),
+                    };
+                    let c = Compiler::discover().compile_surface(&abi,&source,Path::new("independent.slang"),"independent")?.capabilities;
+                    assert_eq!((c.coat_anisotropy,c.weighted_ior),(coat,weighted),"{stage}: {source}");
+                }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires pinned Slang"]
+    fn unit_weight_effects_cover_surface_lobes_and_lit_returns() -> Result<()> {
+        let abi = Abi { aov_count: 0, context: Abi::spec_context(), closure: openpbr_fields() };
+        for (result, body, lit, expected) in [
+            ("Closure", "return c;", "", false),
+            ("Closure", "c.specular_weight=.25;return c;", "", true),
+            ("Closure", "c.specular_weight=inputs.factor;return c;", "", true),
+            ("Blend", "return blend(c,c,inputs.factor);", "", false),
+            ("Blend", "Closure d=c;d.specular_weight=0.;return add(c,d);", "", true),
+            ("Closure", "return c;", "Closure lit(ShadingContext ctx,Inputs inputs,Lighting light) {Closure c={};c.specular_weight=inputs.factor;return c;}", true),
+        ] {
+            let source=format!("struct Inputs {{float factor=1.;}}; {result} surface(ShadingContext ctx,Inputs inputs) {{Closure c={{}};{body}}} {lit}");
+            let program=Compiler::discover().compile_surface(&abi,&source,Path::new("weight.slang"),"weight")?;
+            assert_eq!(serde_json::to_value(program.capabilities)?["weighted_ior"],serde_json::json!(expected),"{source}");
+        }
+        let source="struct Inputs {float weight=1.;}; Closure surface(ShadingContext ctx,Inputs i) {Closure c={};c.specular_weight=i.weight;return c;}";
+        let program=Compiler::discover().compile_surface(&abi,source,Path::new("bound_weight.slang"),"boundweight")?;
+        for (values,animated,expected) in [
+            (serde_json::json!({}),false,false),
+            (serde_json::json!({"weight":1}),false,false),
+            (serde_json::json!({"weight":0}),false,true),
+            (serde_json::json!({"weight":0.25}),false,true),
+            (serde_json::json!({"weight":1}),true,true),
+        ] {
+            assert_eq!(instance_capabilities(&program,values,if animated {&["weight"]} else {&[]})?.weighted_ior,expected);
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[ignore = "requires pinned Slang"]
     fn layer_effects_cover_surface_lobes_and_lit_returns() -> Result<()> {
         let abi = Abi { aov_count: 0, context: Abi::spec_context(), closure: openpbr_fields() };
         for (result, body, lit, expected) in [
@@ -2236,18 +2478,23 @@ mod tests {
     fn response_effects_cover_closures_shader_lobes_and_lit() -> Result<()> {
         let abi = Abi { aov_count: 0, context: Abi::spec_context(), closure: openpbr_fields() };
         for (result, body, lit, expected) in [
-            ("Closure", "return c;", "", (false,false)),
-            ("Closure", "c.specular_roughness_anisotropy=inputs.factor;return c;", "", (true,false)),
-            ("Closure", "c.thin_film_weight=inputs.factor;return c;", "", (false,true)),
-            ("Blend", "return blend(c,c,inputs.factor);", "", (false,false)),
-            ("Blend", "Closure d=c;d.thin_film_weight=inputs.factor;return blend(c,d,inputs.factor);", "", (false,true)),
-            ("Blend", "Closure d=c;d.specular_roughness_anisotropy=inputs.factor;return add(c,d);", "", (true,false)),
-            ("Closure", "return c;", "Closure lit(ShadingContext ctx,Inputs inputs,Lighting light) {Closure c={};c.thin_film_weight=inputs.factor;return c;}", (false,true)),
-            ("Closure", "return c;", "Closure lit(ShadingContext ctx,Inputs inputs,Lighting light) {return unlit(light.color);}", (false,false)),
+            ("Closure", "return c;", "", (false,false,false)),
+            ("Closure", "c.coat_roughness_anisotropy=inputs.factor;return c;", "", (false,false,false)),
+            ("Closure", "c.coat_weight=1.;c.coat_roughness_anisotropy=inputs.factor;return c;", "", (true,false,true)),
+            ("Closure", "c.coat_weight=1.;c.specular_roughness_anisotropy=inputs.factor;return c;", "", (true,false,false)),
+            ("Blend", "Closure d=c;d.coat_weight=1.;d.coat_roughness_anisotropy=inputs.factor;return add(c,d);", "", (true,false,true)),
+            ("Closure", "return c;", "Closure lit(ShadingContext ctx,Inputs inputs,Lighting light) {Closure c={};c.coat_weight=1.;c.coat_roughness_anisotropy=inputs.factor;return c;}", (true,false,true)),
+            ("Closure", "c.specular_roughness_anisotropy=inputs.factor;return c;", "", (true,false,false)),
+            ("Closure", "c.thin_film_weight=inputs.factor;return c;", "", (false,true,false)),
+            ("Blend", "return blend(c,c,inputs.factor);", "", (false,false,false)),
+            ("Blend", "Closure d=c;d.thin_film_weight=inputs.factor;return blend(c,d,inputs.factor);", "", (false,true,false)),
+            ("Blend", "Closure d=c;d.specular_roughness_anisotropy=inputs.factor;return add(c,d);", "", (true,false,false)),
+            ("Closure", "return c;", "Closure lit(ShadingContext ctx,Inputs inputs,Lighting light) {Closure c={};c.thin_film_weight=inputs.factor;return c;}", (false,true,false)),
+            ("Closure", "return c;", "Closure lit(ShadingContext ctx,Inputs inputs,Lighting light) {return unlit(light.color);}", (false,false,false)),
         ] {
             let source=format!("struct Inputs {{float factor=1.;}}; {result} surface(ShadingContext ctx,Inputs inputs) {{Closure c={{}};{body}}} {lit}");
             let program=Compiler::discover().compile_surface(&abi,&source,Path::new("response.slang"),"response")?;
-            assert_eq!((program.capabilities.anisotropy,program.capabilities.film),expected,"{source}");
+            assert_eq!((program.capabilities.anisotropy,program.capabilities.film,program.capabilities.coat_anisotropy),expected,"{source}");
         }
         Ok(())
     }
@@ -2384,6 +2631,23 @@ pub(super) fn scalar_argument_spectral(module: &naga::Module, entry: &str, wavel
     Ok(value.time())
 }
 
+/// Numeric initializer accessors share camera calibration's exact CPU evaluator.
+pub(super) fn input_value(module: &naga::Module, entry: &str, words: &[u32]) -> Option<serde_json::Value> {
+    fn json(value: Value) -> Option<serde_json::Value> {
+        match value {
+            Value::Number(v) => serde_json::Number::from_f64(v).map(serde_json::Value::Number),
+            Value::Integer(v) => Some(v.into()),
+            Value::Bool(v) => Some(v.into()),
+            Value::Parts(v) => v.into_iter().map(json).collect::<Option<Vec<_>>>().map(serde_json::Value::Array),
+            _ => None,
+        }
+    }
+    let function=module.functions.iter().find(|(_,f)|f.name.as_deref()==Some(entry))?.1;
+    let words=words.iter().copied().map(Some).collect::<Vec<_>>();
+    let (value,_)=evaluate_mode(module,function,&[Value::Integer(0)],0,false,Some(words.into()),None,false,true,None,None,None,false);
+    json(value)
+}
+
 /// Evaluate an acceleration certificate from packed, sampled material inputs.
 /// Unsupported or non-finite expressions fail admission instead of borrowing optics.
 pub(super) fn camera_calibration(module: &naga::Module, entry: &str, words: &[u32], aspect: f32, focus: f32, time: f32) -> Result<[[f32;4];4]> {
@@ -2392,7 +2656,7 @@ pub(super) fn camera_calibration(module: &naga::Module, entry: &str, words: &[u3
     let args=[Value::Number(aspect.into()),Value::Number(focus.into()),Value::Number(time.into()),Value::Integer(0),
         Value::Parts(vec![Value::Parts(vec![Value::Number(0.);4]);4])];
     let words=words.iter().copied().map(Some).collect::<Vec<_>>();
-    let (_,state)=evaluate_mode(module,function,&args,0,false,Some(words.into()),None,false,true,None,None,None);
+    let (_,state)=evaluate_mode(module,function,&args,0,false,Some(words.into()),None,false,true,None,None,None,false);
     let mut result=[[0.;4];4];
     for row in 0..4 {for col in 0..4 {
         let Value::Number(v)=state.arguments[4].part(row).part(col) else {
@@ -2422,6 +2686,47 @@ pub(super) fn camera_unit_weight(module: &naga::Module, entry: &str, words: &[Op
 }
 
 #[cfg(test)]
+mod query_loop_tests {
+    use super::*;
+
+    #[test]
+    fn finite_call_graph_has_no_fixed_depth_ceiling() -> Result<()> {
+        let mut source=String::from("fn chain0(x:f32)->f32{return x;}");
+        for i in 1..48 {source+=&format!("fn chain{i}(x:f32)->f32{{return chain{}(x);}}",i-1);}
+        let module=naga::front::wgsl::parse_str(&source)?;
+        let function=module.functions.iter().last().unwrap().1;
+        let (_,state)=evaluate(&module,function,&[Value::Unknown],0,false,None,Some(Live {texels:false,wavelength:true,query_bounds:true}),true);
+        assert!(query_bound_failure(&state.proof_failures.lock().unwrap()).is_none());
+        // Recursive call graphs cannot enter the validated Naga interpreter.
+        let error=naga::front::wgsl::parse_str("fn recursiveHelper(x:f32)->f32{return recursiveHelper(x);}").unwrap_err();
+        assert!(error.emit_to_string("fn recursiveHelper(x:f32)->f32{return recursiveHelper(x);}").contains("recursiveHelper"));
+        Ok(())
+    }
+
+    #[test]
+    fn finite_paths_and_unbounded_survivors() -> Result<()> {
+        for (body,finite) in [
+            ("for(var i=0;i<4;i++){if(i==3){return 0.5;}}return 0.;",true),
+            ("for(var i=0;i<4;i++){if(x>0.){continue;}if(x<0.){break;}}return 0.;",true),
+            ("for(var i=0;i<4;i++){if(x>0.){break;}else{continue;}}return 0.;",true),
+            ("for(var i=0;i<4;i++){if(x>0.){return 0.5;}}return 0.;",true),
+            ("for(var i=0;i<4;i++){if(x>0.){continue;}i-=1;}return 0.;",false),
+            ("loop {if(x>0.){break;}}return 0.;",false),
+            ("loop {if(x>0.){return 0.5;}}return 0.;",false),
+        ] {
+            let source=format!("fn helper(x:f32)->f32 {{{body}}}");
+            let module=naga::front::wgsl::parse_str(&source)?;
+            let function=&module.functions.iter().next().unwrap().1;
+            let (_,state)=evaluate(&module,function,&[Value::Unknown],0,false,None,Some(Live {texels:false,wavelength:true,query_bounds:true}),true);
+            let failures=state.proof_failures.lock().unwrap();
+            assert_eq!(query_bound_failure(&failures).is_none(),finite,"{body}: {failures:?}");
+            if !finite {assert!(query_bound_failure(&failures).unwrap().starts_with("helper: loop"));}
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
 mod volume_tests {
     use super::*;
     #[test]
@@ -2439,7 +2744,7 @@ mod volume_tests {
 pub(super) fn medium_work(module:&naga::Module,entry:&str,words:&[Option<u32>])->Result<u32> {
     let (_,function)=module.functions.iter().find(|(_,f)|f.name.as_deref()==Some(entry)).context("medium coefficient bridge missing")?;
     let proof=std::sync::Arc::new(std::sync::Mutex::new(WorkProof::default()));
-    evaluate_mode(module,function,&[Value::Position,Value::Time,Value::Integer(0),Value::Position,Value::Independent],0,false,Some(words.iter().copied().collect()),None,false,false,None,None,Some(proof.clone()));
+    evaluate_mode(module,function,&[Value::Position,Value::Time,Value::Integer(0),Value::Position,Value::Independent],0,false,Some(words.iter().copied().collect()),None,false,false,None,None,Some(proof.clone()),false);
     let proof=proof.lock().unwrap();
     ensure!(proof.failure.is_none(),"{}",proof.failure.as_deref().unwrap_or("medium work proof failed"));
     Ok(proof.operations.max(1))

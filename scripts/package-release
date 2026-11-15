@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """Package each supported platform identically. Does not publish anything."""
 import argparse
+import gzip
 import hashlib
 import json
+import lzma
 from pathlib import Path
 import shutil
 import subprocess
@@ -12,7 +14,7 @@ import tempfile
 import tomllib
 import zipfile
 from shader_bundle import package as package_shaders
-from runtime_platform import check_runtime_platform
+from runtime_platform import check_runtime_platform, macos_manifest
 
 ROOT = Path(__file__).resolve().parents[1]
 p = argparse.ArgumentParser(description=__doc__)
@@ -32,6 +34,9 @@ except (OSError, subprocess.CalledProcessError) as error:
     p.error(f'cannot read binary version: {error}')
 if len(reported) < 2 or reported[0] != 'vork' or reported[1] != cargo_version:
     p.error(f'binary version {reported!r} does not match Cargo version {cargo_version!r}')
+commit = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=ROOT, text=True).strip()
+if reported != ['vork', cargo_version, '(commit', commit + ';', 'API', 'v2)']:
+    p.error(f'binary source identity {reported!r} does not match full source commit {commit}')
 windows = a.platform.startswith('windows')
 if windows and not (a.msvc_runtime and a.msvc_runtime.is_dir()):
     p.error('windows-x64 needs --msvc-runtime: OIDN imports the VC++ runtime, which ships app-local beside it')
@@ -68,7 +73,7 @@ subprocess.run([sys.executable, str(ROOT / 'scripts/generate-notice'), '--check'
 # and drops its sample tools, headers, CMake files and manuals.
 NOTICES = ['LICENSE', 'LICENSES', 'third-party-notices']
 SLANG = {
-    'darwin-arm64': NOTICES + ['bin/slangc', 'lib/libslang-compiler.0.*.dylib', 'lib/libslang-glsl-module-*.dylib', 'lib/slang-standard-module-*'],
+    'darwin-arm64': NOTICES + ['vork-build.json', 'bin/slangc', 'lib/libslang-compiler.0.*.dylib', 'lib/libslang-glsl-module-*.dylib', 'lib/slang-standard-module-*'],
     'linux-x64': NOTICES + ['bin/slangc', 'lib/libslang-compiler.so.*', 'lib/libslang-glsl-module-*.so', 'lib/libslang-glslang-*.so', 'lib/slang-standard-module-*'],
     'windows-x64': NOTICES + ['bin/slangc.exe', 'bin/slang-compiler.dll', 'bin/slang-glsl-module.dll', 'bin/slang-glslang.dll', 'bin/slang-standard-module-*'],
 }
@@ -207,6 +212,8 @@ with tempfile.TemporaryDirectory(dir=a.output) as tmp:
     # integrations/ (the GPL Blender bridge) is a separate component and never ships in an archive.
     if any('integrations' in f.relative_to(stage).parts for f in stage.rglob('*')):
         p.error('release archive must not include integrations/')
+    if a.platform == 'darwin-arm64':
+        (stage / 'macos-runtime.json').write_text(json.dumps(macos_manifest(stage), indent=2) + '\n')
     archive = a.output / f'vork-{cargo_version}-{a.platform}.{"zip" if windows else "tar.gz"}'
     if windows:
         with zipfile.ZipFile(archive, 'w', zipfile.ZIP_DEFLATED) as z:
@@ -216,9 +223,19 @@ with tempfile.TemporaryDirectory(dir=a.output) as tmp:
         with tarfile.open(archive, 'w:gz') as tar:
             for f in sorted(stage.iterdir()):
                 tar.add(f, arcname=f.name)
-    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    archives = [archive]
+    if not windows:
+        # The smaller download for installers that can read xz: the .tar.gz's own tar stream, recompressed,
+        # so both archives hold the same bytes (cut-release refuses a pair whose streams differ).
+        compact = archive.with_name(archive.name.removesuffix('.gz') + '.xz')
+        with gzip.open(archive, 'rb') as source, lzma.open(compact, 'wb', preset=9) as target:
+            shutil.copyfileobj(source, target, 1 << 20)
+        archives.append(compact)
     sums = a.output / 'SHA256SUMS'
     rows = sums.read_text(encoding='utf-8').splitlines() if sums.exists() else []
-    rows = [r for r in rows if r.split()[-1] != archive.name]
-    sums.write_text('\n'.join(sorted(rows + [f'{digest}  {archive.name}'])) + '\n', encoding='utf-8', newline='\n')
-    print(f'{archive}: {archive.stat().st_size} bytes')
+    names = {archive.name for archive in archives}
+    rows = [r for r in rows if r.split()[-1] not in names]
+    rows += [f'{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}' for archive in archives]
+    sums.write_text('\n'.join(sorted(rows)) + '\n', encoding='utf-8', newline='\n')
+    for archive in archives:
+        print(f'{archive}: {archive.stat().st_size} bytes')

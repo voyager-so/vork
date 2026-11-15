@@ -291,7 +291,7 @@ fn concurrent_proof_workspaces_keep_ast_and_inputs_isolated() -> Result<()> {
             scope.spawn(move || -> Result<Vec<u8>> {
                 fs::create_dir(&directory)?;
                 fs::write(directory.join("palette.slang"),format!("public float value(){{return {value};}}"))?;
-                let source = "import palette; struct Inputs {}; float3 display(DisplayContext ctx,Inputs i){return float3(value());}";
+                let source = "import palette; struct Inputs {}; import std.view; ViewResult view(ViewContext ctx,Inputs i){return finish_view(float3(value()),ctx,1.);}";
                 let (_,receipt) = compiler.capture_inputs(|compiler|compiler.compile_display(&Abi {aov_count:0,context:Abi::spec_context(),closure:openpbr_fields()},source,&directory.join("main.slang"),"parallel"))?;
                 assert!(receipt.valid());
                 assert!(!directory.join("program.slang-ast").exists(),"AST escaped owned compiler workspace");

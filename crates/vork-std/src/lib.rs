@@ -6,6 +6,7 @@ mod expand;
 pub use expand::{expand_scene, load_scene};
 pub mod environment;
 mod extrude;
+pub mod moda;
 mod sky;
 mod sweep;
 mod text;

@@ -2,6 +2,7 @@
 pub const HELP_TOPICS: &[&str] = &[
     "init",
     "check",
+    "ask",
     "std",
     "blender",
     "fluid",
@@ -23,6 +24,9 @@ pub const HELP_TOPICS: &[&str] = &[
     "programs",
     "compositor",
     "animation",
+    "springs",
+    "sequences",
+    "captions",
     "outputs",
     "export",
     "diagnostics",

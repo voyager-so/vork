@@ -117,6 +117,10 @@ pub(crate) struct PathSolid {
     /// Rest bounds of a closed, consistently placed domain. Shadow discovery
     /// refits deforming domains from the existing evaluated geometry bounds.
     pub(crate) shadow_bounds: Option<(Vec3,Vec3)>,
+    /// World bounds of a closed solid that never moves or changes shape: every
+    /// point the kernel lets it hold lies within them (placed_bounds). None for
+    /// open, deforming, compute-placed or animated solids, which may hold any point.
+    pub(crate) rest_bounds: Option<(Vec3,Vec3)>,
 }
 
 /// Each solid's bounds in its object space (the union of its material groups'
@@ -170,6 +174,7 @@ pub(crate) fn occupancy(solids: &Solids, draws: &[install::Draw], roots: &[insta
         || (nodes[node].embedded.is_some() && nodes[node].dynamic);
     let mut fixed = Vec::new();
     let mut contact_bounds=vec![UNBOUNDED;count];
+    let mut rest_bounds=vec![None;count];
     let mut groups = std::collections::HashMap::<(usize, u32), Vec<(Vec3, Vec3)>>::new();
     for id in 0..count {
         let Some(object) = first[id] else {continue};
@@ -188,7 +193,11 @@ pub(crate) fn occupancy(solids: &Solids, draws: &[install::Draw], roots: &[insta
         }
         if unbounded[id] || moving_geometry[id] {fixed.push(UNBOUNDED); continue;}
         match mover {
-            None => fixed.push(placed(id, objects[object].model)),
+            None => {
+                let bounds=placed(id, objects[object].model);
+                rest_bounds[id]=(bounds.0.is_finite() && bounds.1.is_finite()).then_some(bounds);
+                fixed.push(bounds);
+            }
             // An embedded glTF node's world comes from its asset pose, not this chain.
             Some(_) if chain.iter().any(|&n| nodes[n].embedded.is_some()) => fixed.push(UNBOUNDED),
             Some(mover) => {
@@ -203,12 +212,33 @@ pub(crate) fn occupancy(solids: &Solids, draws: &[install::Draw], roots: &[insta
     }
     let capacity = groups.values().fold(overlap_capacity(&fixed), |sum, group| sum.saturating_add(overlap_capacity(group)));
     // A solid without a row is in no draw, so never hit or tracked; its row is unused.
-    let solids = local.into_iter().zip(unbounded).zip(moving_geometry).zip(first).zip(contact_bounds).map(|(((((lo, hi), unbounded), moving), first), contact_bounds)| {
+    let solids = local.into_iter().zip(unbounded).zip(moving_geometry).zip(first).zip(contact_bounds).zip(rest_bounds).map(|((((((lo, hi), unbounded), moving), first), contact_bounds), rest_bounds)| {
         let shadow_bounds=(!unbounded).then_some((lo,hi));
         let (lo, hi) = if unbounded || moving {UNBOUNDED} else {(lo, hi)};
-        PathSolid { lo, hi, row: first.unwrap_or_default() as u32, shadow_bounds, contact_bounds }
+        PathSolid { lo, hi, row: first.unwrap_or_default() as u32, shadow_bounds, contact_bounds, rest_bounds }
     }).collect();
     (solids, capacity)
+}
+/// Whether a node's world position is fixed for the life of the install: no
+/// transform track, glTF clip or aim moves it or any ancestor. An aim on the
+/// node itself only turns it about that position.
+pub(crate) fn position_at_rest(node: usize, nodes: &[install::EvalNode], animation: &crate::animation::Plan, targets: &crate::targets::Plan) -> bool {
+    let moved = |n: usize| animation.transforms_node(n) || (nodes[n].embedded.is_some() && nodes[n].dynamic);
+    !moved(node) && std::iter::successors(nodes[node].parent, |&n| nodes[n].parent).all(|n| !moved(n) && targets.aims[n].is_none())
+}
+/// Whether no camera sample can start inside a solid, so camera containment
+/// (dielectric_scene.slang camera_occupancy) is empty for every sample of every
+/// frame. `origins` are balls holding every origin of every reachable camera
+/// (camera_program::origin_balls); None is a camera whose origins are unknown.
+/// Every solid must be closed and at rest, and every ball must miss every
+/// solid's placed bounds, which hold each point the kernel's bounds test
+/// admits: then no containment candidate passes that test. Without a solid
+/// there is nothing to be inside, whatever the cameras are or do.
+pub(crate) fn camera_exterior(solids: &[PathSolid], origins: Option<&[(Vec3, f32)]>) -> bool {
+    if solids.is_empty() {return true;}
+    let Some(origins) = origins else {return false};
+    solids.iter().all(|solid| solid.rest_bounds.is_some_and(|(lo, hi)|
+        origins.iter().all(|&(centre, radius)| (lo - centre).max(centre - hi).max(Vec3::ZERO).length() > radius)))
 }
 /// Small register-resident interior list. Actual deeper nesting spills to the
 /// device-backed material arena; scene size never grows invocation-private state.
@@ -295,7 +325,7 @@ pub(crate) fn layout_entries(adaptive: bool) -> Vec<wgpu::BindGroupLayoutEntry> 
     let mut entries = crate::pipelines::global_entries();
     entries.extend([
         wgpu::BindGroupLayoutEntry {
-            binding: 10,
+            binding: 11,
             visibility: Stages::COMPUTE,
             ty: wgpu::BindingType::AccelerationStructure {
                 vertex_return: false,
@@ -303,44 +333,48 @@ pub(crate) fn layout_entries(adaptive: bool) -> Vec<wgpu::BindGroupLayoutEntry> 
             count: None,
         },
         buffer_entry(
-            11,
+            12,
             Stages::COMPUTE,
             wgpu::BufferBindingType::Storage { read_only: true },
         ),
         wgpu::BindGroupLayoutEntry {
-            binding: 12, visibility: Stages::COMPUTE,
+            binding: 13, visibility: Stages::COMPUTE,
             ty: wgpu::BindingType::Buffer {ty: wgpu::BufferBindingType::Uniform,
                 has_dynamic_offset: true, min_binding_size: std::num::NonZeroU64::new(std::mem::size_of::<PathUniform>() as u64)},
             count: None,
         },
         wgpu::BindGroupLayoutEntry {
-            binding: 13,
+            binding: 14,
             visibility: Stages::COMPUTE,
+            // Transport reads the camera environment pass's value from the
+            // sample's output pixel before writing the sample there.
             ty: wgpu::BindingType::StorageTexture {
-                access: wgpu::StorageTextureAccess::WriteOnly,
+                access: wgpu::StorageTextureAccess::ReadWrite,
                 format: wgpu::TextureFormat::Rgba32Float,
                 view_dimension: wgpu::TextureViewDimension::D2,
             },
             count: None,
         },
         buffer_entry(
-            14,
+            15,
             Stages::COMPUTE,
             wgpu::BufferBindingType::Storage { read_only: true },
         ),
-        pipelines::environment_texture_entry(15),
-        sampler_entry(16, false),
-        buffer_entry(17, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: true }),
+        buffer_entry(28, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: true }),
+        pipelines::environment_texture_entry(16),
+        sampler_entry(17, false),
         buffer_entry(18, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: true }),
-        buffer_entry(19, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: false }),
+        buffer_entry(19, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: true }),
         buffer_entry(20, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: false }),
-        buffer_entry(24, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: false }),
+        buffer_entry(21, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: false }),
         buffer_entry(25, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: false }),
+        buffer_entry(26, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: false }),
+        buffer_entry(27, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: true }),
     ]);
     if adaptive {
-        entries.push(buffer_entry(26, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: false }));
+        entries.push(buffer_entry(29, Stages::COMPUTE, wgpu::BufferBindingType::Storage { read_only: false }));
     }
-    for (binding,format) in [(21,wgpu::TextureFormat::Rg32Float),(22,wgpu::TextureFormat::Rgba16Float),(23,wgpu::TextureFormat::R32Uint)] {
+    for (binding,format) in [(22,wgpu::TextureFormat::Rg32Float),(23,wgpu::TextureFormat::Rgba16Float),(24,wgpu::TextureFormat::R32Uint)] {
         entries.push(wgpu::BindGroupLayoutEntry {binding,visibility:Stages::COMPUTE,ty:wgpu::BindingType::StorageTexture {access:wgpu::StorageTextureAccess::WriteOnly,format,view_dimension:wgpu::TextureViewDimension::D2},count:None});
     }
     for e in &mut entries {
@@ -349,40 +383,123 @@ pub(crate) fn layout_entries(adaptive: bool) -> Vec<wgpu::BindGroupLayoutEntry> 
     entries
 }
 
+/// The path kernel's group-0 layout and its pipeline layout over a material table layout.
+fn layouts(d: &wgpu::Device, adaptive: bool, material: &wgpu::BindGroupLayout) -> (wgpu::BindGroupLayout, wgpu::PipelineLayout) {
+    let global = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("path globals"),
+        entries: &layout_entries(adaptive),
+    });
+    let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("path layout"),
+        bind_group_layouts: &[Some(&global), Some(material), None, Some(&crate::rt::hits_layout(d))],
+        immediate_size: 0,
+    });
+    (global, layout)
+}
+
+/// The identity of one prebuilt engine family's driver pipeline over the material
+/// table's shared capacity. It is the key an install of that family remembers
+/// (CachedPipelines::kernel_content_key), so a family created by either is warm
+/// to both. The ledger belongs to this build, driver and GPU (disk_cache::Store).
+fn engine_pipeline_key(r: &Renderer, family: crate::surface_native::PathEngine, shader: &crate::native::Compiled) -> blake3::Hash {
+    crate::pipelines::compute_pipeline_key(shader.input_key(r.adapter_info.backend == wgpu::Backend::Metal),
+        &crate::pipelines::path_groups(layout_entries(family.adaptive), crate::pipelines::material_entries(true),
+            crate::rt::hit_buffers_entry(0, wgpu::ShaderStages::COMPUTE)))
+}
+
+type ColdEngine = (crate::surface_native::PathEngine, &'static crate::native::Compiled, blake3::Hash);
+
+/// The prebuilt engine families whose driver pipeline this device's persistent
+/// cache does not hold. None where no later process could reuse one, or where
+/// path transport cannot run.
+fn cold_engines(r: &Renderer) -> Vec<ColdEngine> {
+    if r.release_preparation || (r.cache.is_none() && r.adapter_info.backend != wgpu::Backend::Metal)
+        || !r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY | crate::rt::HIT_BUFFER_FEATURES) {
+        return Vec::new();
+    }
+    crate::native::PATH_ENGINES.iter()
+        .map(|&(family, shader)| (family, shader, engine_pipeline_key(r, family, shader)))
+        .filter(|(_, _, key)| !r.compiler.is_known(key)).collect()
+}
+
+/// Create these families' driver pipelines, all at once, each exactly as an
+/// install creates it, through the persistent pipeline cache (a Metal binary
+/// archive on macOS). Only explicit setup warms unrelated families.
+fn create_engines(d: &wgpu::Device, compiler: &crate::pipelines::Compiler, cold: &[ColdEngine]) {
+    if cold.is_empty() { return; }
+    let material = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("material"), entries: &crate::pipelines::material_entries(true) });
+    std::thread::scope(|scope| {
+        let jobs: Vec<_> = cold.iter().map(|&(family, shader, key)| {
+            let material = &material;
+            scope.spawn(move || {
+                let (_, layout) = layouts(d, family.adaptive, material);
+                let module = crate::native::shader_module(d, shader);
+                drop(compiler.compute_entry(&layout, &module, shader.entry, "unidirectional path"));
+                compiler.remember(key);
+            })
+        }).collect();
+        jobs.into_iter().for_each(crate::pipelines::join);
+    });
+}
+
+/// `vork setup`: every engine family is in the cache before any scene exists, so
+/// the first path render of a scene the engine draws starts from it.
+pub(crate) fn warm_engines(r: &Renderer) -> Result<()> {
+    create_engines(&r.device, &r.compiler, &cold_engines(r));
+    r.errors.check()
+}
+
 pub(crate) struct Pipeline {
     volume_bounces: u32,
     medium_batch_rows: Option<u32>,
     global_layout: wgpu::BindGroupLayout,
-    pipeline: wgpu::ComputePipeline,
+    /// The transport kernel, installed like every other hit kernel: a drawn
+    /// variant that may start behind a fallback and is promoted when it lands.
+    pipeline: crate::pipelines::Drawn<wgpu::ComputePipeline>,
+    environment: Option<wgpu::ComputePipeline>,
     kernel: crate::pipelines::ProgramKernel,
+    /// Whether the prebuilt engine can draw this scene before its own kernel
+    /// exists, or what in the scene it cannot draw (the render report says so).
+    engine: std::result::Result<(), &'static str>,
+    /// The kernel the install chose to draw first: the scene's own, or its engine family.
+    selected: crate::pipelines::ProgramKernel,
 }
 impl Pipeline {
     pub(crate) fn adaptive(&self)->bool {matches!(self.kernel,crate::pipelines::ProgramKernel::Path {adaptive:true,..})}
-    pub(crate) fn new(r: &Renderer, adaptive: bool, catchers: bool, random_walk: bool, features: FeatureMask, boundary_capacity: u32, emitter_profiles: bool, media: Option<u32>, options: &crate::InstallOptions, pipelines: &crate::pipelines::CachedPipelines) -> Result<Self> {
+    /// The transport kernel's drawn slot (InstalledScene::variants_ready).
+    pub(crate) fn drawn(&self)->&crate::pipelines::Drawn<wgpu::ComputePipeline> {&self.pipeline}
+    pub(crate) fn engine(&self)->std::result::Result<(), &'static str> {self.engine}
+    /// Whether an exposure encoded with this `specialized` choice (Drawn::current)
+    /// draws the prebuilt engine. Setup holds the engine as its only pipeline; a
+    /// render compiles its own kernel behind the engine and draws the engine
+    /// until the frame slot promotes its variants.
+    pub(crate) fn draws_engine(&self,specialized:bool)->bool {
+        self.selected!=self.kernel && (!self.pipeline.deferred() || !specialized)
+    }
+    pub(crate) fn new(r: &Renderer, adaptive: bool, catchers: bool, random_walk: bool, features: FeatureMask, boundary_capacity: u32, emitter_profiles: bool, media: Option<u32>, environment: bool, options: &crate::InstallOptions, pipelines: &std::sync::Arc<crate::pipelines::CachedPipelines>) -> Result<Self> {
         #[cfg(any(test, feature = "test-support"))]
         let adaptive=adaptive && r.reference_transport_bounces.is_none();
         let d = &r.device;
         let kernel = crate::pipelines::ProgramKernel::Path { adaptive, catchers, random_walk, features, boundaries: boundary_capacity, emitter_profiles, media };
-        let (module, entry) = pipelines.program_kernel(kernel)?;
-        let entries = layout_entries(adaptive);
-        let global_layout = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label: Some("path globals"),
-            entries: &entries,
-        });
-        let material_layout = pipelines.mat_layout.clone();
-        let layout = d.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("path layout"),
-            bind_group_layouts: &[Some(&global_layout), Some(&material_layout), None, Some(&crate::rt::hits_layout(d))],
-            immediate_size: 0,
-        });
-        let pipeline = r.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-            label: Some("unidirectional path"),
-            layout: Some(&layout),
-            module: &module,
-            entry_point: Some(entry),
-            compilation_options: Default::default(),
-            cache: r.cache.as_ref(),
-        });
+        let (global_layout, layout) = layouts(d, adaptive, &pipelines.mat_layout);
+        let engine = pipelines.shader.path_engine(kernel).map(drop);
+        let (pipeline, selected) = pipelines.install_hit_selected(r, kernel, &options.variants, layout.clone(), "unidirectional path")?;
+        // Release preparation: the bundle holds this scene's kernel at every covered
+        // light and camera case, so a scene that differs only in those starts
+        // without compiling. Code generation only; no pipeline is created for them.
+        if r.release_path_cases {
+            for case in kernel.release_cases() {
+                pipelines.program_kernel(case)?;
+            }
+        }
+        let environment=if environment {
+            let (module,entry)=pipelines.program_kernel(crate::pipelines::ProgramKernel::PathEnvironment {adaptive})?;
+            Some(r.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label:Some("path camera environment"),layout:Some(&layout),module:&module,entry_point:Some(entry),
+                compilation_options:Default::default(),cache:r.cache.as_ref(),
+            }))
+        } else {None};
         #[cfg(not(any(test, feature = "test-support")))]
         let volume_bounces = crate::constants::PATH_MAX_BOUNCES;
         #[cfg(any(test, feature = "test-support"))]
@@ -403,7 +520,7 @@ impl Pipeline {
             }
         } else {None};
         let _ = options;
-        Ok(Self { volume_bounces, global_layout, pipeline, kernel,
+        Ok(Self { volume_bounces, global_layout, pipeline, environment, kernel, engine, selected,
             medium_batch_rows,
         })
     }
@@ -426,6 +543,7 @@ pub(crate) fn record(
     catcher: &wgpu::Buffer,
     pixels: &wgpu::Buffer,
     catcher_base: u32,
+    invalid_bitmap_word: u32,
     recorder: &mut crate::graph::Recorder,
     view: &crate::views::ViewDesc,
 ) -> Result<()> {
@@ -458,7 +576,8 @@ pub(crate) fn record(
         boundaries: [rays_table.boundaries, rays_table.subsurface, 0, rays_table.occupancy_solids],
         environment: [s.environment.distribution_size[0], s.environment.distribution_size[1], s.render.aovs.len() as u32,
             u32::from(guides.is_some())],
-        matte: [if s.has_catchers {catcher_base} else {0},0,0,0],
+        matte: [if s.has_catchers {catcher_base} else {0},invalid_bitmap_word,
+            if s.environment.primary.as_ref().is_some_and(|p|p.constant_camera.is_some()) {2} else {u32::from(retained.environment.is_some())},0],
     };
     // Previs keeps required ray camera visibility (IES, hair, custom cameras,
     // catchers and propagation) but spends no diffuse or glossy continuation.
@@ -470,6 +589,7 @@ pub(crate) fn record(
     #[cfg(any(test, feature = "test-support"))]
     if let Some(limit)=r.reference_transport_bounces {
         params.bounces=[limit;4];
+        params.limits[2]=r.reference_transparent_bounces.unwrap_or(limit);
         params.clamp[0]=0f32.to_bits();
         params.clamp[1]=0f32.to_bits();
     }
@@ -482,7 +602,7 @@ pub(crate) fn record(
         ensure!(
             bytes <= d.limits().max_buffer_size
                 && bytes <= u64::from(d.limits().max_storage_buffer_binding_size),
-            "{}", crate::gpu_memory::limit_message("path adaptive moments", format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",d.limits().max_storage_buffer_binding_size,d.limits().max_buffer_size), "reduce resolution")
+            crate::gpu_memory::device_limit("path adaptive moments", format_args!("{bytes} bytes"), format_args!("storage binding={} bytes, buffer={} bytes",d.limits().max_storage_buffer_binding_size,d.limits().max_buffer_size), "reduce resolution")
         );
         // Interleaved captures retain their own convergence
         // history, just as their resolve keeps a separate exposure sum.
@@ -494,6 +614,10 @@ pub(crate) fn record(
     } else {
         None
     };
+    // Per-sample camera environments live in the output texture; only a
+    // proven-constant one has storage of its own (its one installed value).
+    let environment_constant=s.environment.primary.as_ref().and_then(|p|p.constant_camera.clone())
+        .unwrap_or_else(||s.transients.buffer(d,"unused path environment constant",16,wgpu::BufferUsages::STORAGE));
     let rows = dispatch_rows([width, height]);
     let rows = retained.medium_batch_rows.map_or(rows, |cap| rows.min(cap));
     let chunks = height.div_ceil(rows) as usize;
@@ -507,6 +631,7 @@ pub(crate) fn record(
     }
     let config = init(d, "path settings", &uniforms, wgpu::BufferUsages::UNIFORM);
     let mut entries = vec![
+        entry(10, light_tree.as_entire_binding()),
         entry(0, uniform.as_entire_binding()),
         entry(1, objects.as_entire_binding()),
         entry(2, lights.as_entire_binding()),
@@ -526,25 +651,27 @@ pub(crate) fn record(
             9,
             wgpu::BindingResource::TextureView(&s.environment.ltc),
         ),
-        entry(10, rays.tlas.as_binding()),
-        entry(11, table.as_entire_binding()),
-        entry(12, wgpu::BindingResource::Buffer(wgpu::BufferBinding {buffer: &config, offset: 0,
+        entry(15, light_tree.as_entire_binding()),
+        entry(11, rays.tlas.as_binding()),
+        entry(12, table.as_entire_binding()),
+        entry(13, wgpu::BindingResource::Buffer(wgpu::BufferBinding {buffer: &config, offset: 0,
             size: std::num::NonZeroU64::new(std::mem::size_of::<PathUniform>() as u64)})),
-        entry(13, wgpu::BindingResource::TextureView(target)),
-        entry(14, light_tree.as_entire_binding()),
-        entry(15, wgpu::BindingResource::TextureView(&s.environment.source)),
-        entry(16, wgpu::BindingResource::Sampler(&s.environment.image_sampler)),
-        entry(17, s.environment.distribution.as_ref().unwrap_or(table).as_entire_binding()),
-        entry(18,rays.emitter_weights.as_ref().map_or(table,|weights|&weights.buffer).as_entire_binding()),
+        entry(14, wgpu::BindingResource::TextureView(target)),
+        entry(28,s.environment.primary.as_ref().and_then(|p|p.image_data.as_ref()).unwrap_or(table).as_entire_binding()),
+        entry(16, wgpu::BindingResource::TextureView(&s.environment.source)),
+        entry(17, wgpu::BindingResource::Sampler(&s.environment.image_sampler)),
+        entry(18, s.environment.distribution.as_ref().unwrap_or(table).as_entire_binding()),
+        entry(19,rays.emitter_weights.as_ref().map_or(table,|weights|&weights.buffer).as_entire_binding()),
     ];
-    entries.push(entry(19, aovs.as_entire_binding()));
+    entries.push(entry(20, aovs.as_entire_binding()));
     let unused_guides = guides.is_none().then(|| s.transients.buffer(d,"unused path guides",32,wgpu::BufferUsages::STORAGE));
-    entries.push(entry(20,guides.or(unused_guides.as_ref()).unwrap().as_entire_binding()));
-    entries.extend([entry(21,wgpu::BindingResource::TextureView(&controls.post_depth)),entry(22,wgpu::BindingResource::TextureView(&controls.post_normals)),entry(23,wgpu::BindingResource::TextureView(&controls.post_ids))]);
-    entries.push(entry(24, catcher.as_entire_binding()));
-    entries.push(entry(25, pixels.as_entire_binding()));
+    entries.push(entry(21,guides.or(unused_guides.as_ref()).unwrap().as_entire_binding()));
+    entries.extend([entry(22,wgpu::BindingResource::TextureView(&controls.post_depth)),entry(23,wgpu::BindingResource::TextureView(&controls.post_normals)),entry(24,wgpu::BindingResource::TextureView(&controls.post_ids))]);
+    entries.push(entry(25, catcher.as_entire_binding()));
+    entries.push(entry(26, pixels.as_entire_binding()));
+    entries.push(entry(27, environment_constant.as_entire_binding()));
     if let Some(moments) = &moments {
-        entries.push(entry(26, moments.as_entire_binding()));
+        entries.push(entry(29, moments.as_entire_binding()));
     }
     let bind = d.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("path scene"),
@@ -552,12 +679,29 @@ pub(crate) fn record(
         entries: &entries,
     });
     let hits = rays.hits_bind(d);
+    // Transport also writes the control targets here, so it runs in samples that
+    // produce no colour. The camera environment pass runs in exactly the samples
+    // transport does: transport reads what that pass left in the output.
+    let targets = |dispatch: crate::graph::Dispatch| {
+        if rays_table.implicit[1]>0 || s.scene.propagation.is_some() || s.plan.effects.implicit {dispatch.all_targets()} else {dispatch}
+    };
+    if let Some(pipeline)=&retained.environment {
+        let dispatches=(0..chunks).map(|chunk| {
+            let row=chunk as u32*rows;
+            targets(crate::graph::Dispatch::new(pipeline,bind.clone(),[width.div_ceil(TILE),(height-row).min(rows).div_ceil(TILE),1])
+                .with_material(material).with_hits(hits.clone()).with_offset((chunk*stride) as u32))
+        }).collect();
+        recorder.compute(crate::graph::Pass::PathEnvironment,"path camera environment","path camera",false,dispatches);
+    }
     let dispatches = (0..chunks).map(|chunk| {
         let row = chunk as u32 * rows;
-        let dispatch=crate::graph::Dispatch::new(&retained.pipeline, bind.clone(),
+        // Every chunk of one exposure draws the same kernel: the frame slot
+        // promotes a landed variant only when the exposure is submitted.
+        let dispatch=crate::graph::Dispatch::new(retained.pipeline.current(false), bind.clone(),
             [width.div_ceil(TILE), (height - row).min(rows).div_ceil(TILE), 1])
+            .with_pipeline(retained.pipeline.clone())
             .with_material(material).with_hits(hits.clone()).with_offset((chunk * stride) as u32);
-        if rays_table.implicit[1]>0 || s.scene.propagation.is_some() || s.plan.effects.implicit {dispatch.all_targets()} else {dispatch}
+        targets(dispatch)
     }).collect();
     recorder.compute(crate::graph::Pass::Path, "path transport", "path", false, dispatches);
     if retained.medium_batch_rows == Some(TILE) { recorder.time_budget_last(); }
@@ -567,6 +711,33 @@ pub(crate) fn record(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn engine_warming_names_each_family_and_creates_nothing_it_cannot_persist() -> Result<()> {
+        // Release preparation runs on the no-op device: no driver cache to fill.
+        let r = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        warm_engines(&r)?;
+        assert_eq!(r.compiler.created(), 0);
+        let keys: std::collections::HashSet<_> = crate::native::PATH_ENGINES.iter()
+            .map(|&(family, shader)| engine_pipeline_key(&r, family, shader)).collect();
+        assert_eq!(keys.len(), crate::native::PATH_ENGINES.len(), "each family is its own driver pipeline");
+        // Warming and installation name one pipeline by one key: what either
+        // remembers, the other finds warm.
+        let scene = crate::slang_forward::SlangScene { no_points: true,
+            camera: Some(std::sync::Arc::new(crate::camera_program::Native { standard_camera: true, ..Default::default() })),
+            ..Default::default() };
+        let installed = crate::pipelines::CachedPipelines::with_sources(&r, crate::RESOLVE, 1, false, scene);
+        for &(family, shader) in crate::native::PATH_ENGINES {
+            let engine = crate::pipelines::ProgramKernel::Path { adaptive: family.adaptive, catchers: false, random_walk: false,
+                features: crate::forward_variant::FEATURE_SPECIALIZED, boundaries: family.boundaries, emitter_profiles: false, media: None }
+                .path_engine().expect("a prebuilt family");
+            let key = engine_pipeline_key(&r, family, shader);
+            assert_eq!(installed.kernel_content_key(engine), Some(key), "{}", shader.name);
+            r.compiler.remember(installed.kernel_content_key(engine));
+            assert!(r.compiler.is_known(&key));
+        }
+        Ok(())
+    }
+
     #[test]
     fn path_layout_fits_every_backend_per_stage() {
         for adaptive in [false, true] {
@@ -581,6 +752,48 @@ mod tests {
     }
 
     use super::*;
+
+    /// The route a frame reports is the one selection its install made. Selecting
+    /// twice let a background worker publish the scene's key between the two
+    /// reads of the ledger, so frames drawn by the scene kernel said "engine".
+    #[test]
+    fn a_path_install_reports_the_one_route_it_installed() -> Result<()> {
+        use crate::pipelines::{ProgramKernel, VariantCompile};
+        let r = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
+        let scene = crate::slang_forward::SlangScene { no_points: true,
+            camera: Some(std::sync::Arc::new(crate::camera_program::Native { standard_camera: true, ..Default::default() })),
+            ..Default::default() };
+        let pipelines = std::sync::Arc::new(crate::pipelines::CachedPipelines::with_sources(&r, crate::RESOLVE, 1, false, scene));
+        let features = crate::forward_variant::FEATURE_SPECIALIZED;
+        let kernel = ProgramKernel::Path { adaptive: true, catchers: false, random_walk: false, features,
+            boundaries: 0, emitter_profiles: false, media: None };
+        let engine = kernel.path_engine().expect("a prebuilt family");
+        // A warm engine and a cold scene kernel: a render draws the engine first.
+        // Setup installs the engine alone, so this test compiles no scene kernel.
+        let still = crate::InstallOptions { variants: VariantCompile::Setup, ..Default::default() };
+        r.compiler.remember(pipelines.kernel_content_key(engine));
+        assert_eq!(pipelines.drawn_kernel(kernel, &VariantCompile::Fallback, &r.compiler), engine);
+        assert_eq!(pipelines.drawn_kernel(kernel, &VariantCompile::Background, &r.compiler), engine);
+        let layout = r.device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: None, bind_group_layouts: &[Some(&r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: None, entries: &layout_entries(true) })), Some(&pipelines.mat_layout), None, Some(&crate::rt::hits_layout(&r.device))],
+            immediate_size: 0 });
+        let (drawn, selected) = pipelines.install_hit_selected(&r, kernel, &still.variants, layout, "unidirectional path")?;
+        assert_eq!(selected, engine);
+        assert!(drawn.ready() && !drawn.deferred(), "setup holds the engine as its only pipeline");
+        let path = Pipeline::new(&r, true, false, false, features, 0, false, None, false, &still, &pipelines)?;
+        assert_eq!(path.selected, engine);
+        assert!(path.draws_engine(true) && path.draws_engine(false), "the receipt follows the installed selection");
+        // An inline install draws its own kernel and says so (its engine key is the kernel itself).
+        let inline = crate::InstallOptions { variants: VariantCompile::Inline, ..Default::default() };
+        let own = Pipeline::new(&r, true, false, false, engine_features(engine), 0, true, None, false, &inline, &pipelines)?;
+        assert!(!own.draws_engine(true) && !own.draws_engine(false));
+        Ok(())
+    }
+    fn engine_features(kernel: crate::pipelines::ProgramKernel) -> FeatureMask {
+        let crate::pipelines::ProgramKernel::Path { features, .. } = kernel else { unreachable!() };
+        features
+    }
 
     #[test]
     fn native_path_bindings_are_dense_for_both_sampling_entries() {
@@ -674,9 +887,32 @@ mod tests {
     }
 
     #[test]
+    fn camera_exterior_requires_resting_solids_and_missing_origin_balls() {
+        let solid=|rest_bounds|PathSolid {lo:Vec3::splat(-1.),hi:Vec3::splat(1.),row:0,
+            contact_bounds:(Vec3::splat(f32::NEG_INFINITY),Vec3::splat(f32::INFINITY)),shadow_bounds:None,rest_bounds};
+        let unit=Some((Vec3::splat(-1.),Vec3::splat(1.)));
+        let far=Some((Vec3::new(9.,-1.,-1.),Vec3::new(11.,1.,1.)));
+        let ball=|x:f32,radius:f32|(Vec3::new(x,0.,0.),radius);
+        // Without a solid no camera can be inside one: a tracked, programmed or
+        // otherwise unknown camera holds the proof as a known one does.
+        assert!(camera_exterior(&[],None));
+        assert!(camera_exterior(&[],Some(&[ball(0.,1.)])));
+        // With a solid, unknown origins prove nothing.
+        assert!(!camera_exterior(&[solid(unit)],None));
+        assert!(!camera_exterior(&[solid(far)],None));
+        assert!(camera_exterior(&[solid(unit),solid(far)],Some(&[ball(4.,2.5)])));
+        // Inside, touching, and a ball reaching the box all keep the query.
+        assert!(!camera_exterior(&[solid(unit)],Some(&[ball(0.,0.)])));
+        assert!(!camera_exterior(&[solid(unit)],Some(&[ball(3.,2.)])));
+        assert!(!camera_exterior(&[solid(unit),solid(far)],Some(&[ball(4.,5.5)])));
+        // Every camera and every solid must pass.
+        assert!(!camera_exterior(&[solid(unit)],Some(&[ball(4.,1.),ball(1.5,1.)])));
+        assert!(!camera_exterior(&[solid(unit),solid(None)],Some(&[ball(4.,1.)])));
+    }
+    #[test]
     fn plain_boundary_proof_requires_disjoint_surfaces_and_equal_priorities() {
         let solid=|lo,hi|PathSolid {lo:Vec3::splat(f32::NEG_INFINITY),hi:Vec3::splat(f32::INFINITY),row:0,
-            contact_bounds:(Vec3::new(lo,0.,0.),Vec3::new(hi,1.,1.)),shadow_bounds:None};
+            contact_bounds:(Vec3::new(lo,0.,0.),Vec3::new(hi,1.,1.)),shadow_bounds:None,rest_bounds:None};
         assert!(plain_boundaries(&[],[].into_iter()));
         assert!(plain_boundaries(&[solid(0.,1.),solid(2.,3.)],[0,0].into_iter()));
         assert!(plain_boundaries(&[solid(0.,1.),solid(2.,3.)],[-2,-2].into_iter()));
@@ -684,10 +920,14 @@ mod tests {
         assert!(!plain_boundaries(&[solid(0.,1.),solid(1.,2.)],[0,0].into_iter()));
         assert!(!plain_boundaries(&[solid(0.,2.),solid(1.,3.)],[0,0].into_iter()));
         assert!(!plain_boundaries(&[solid(f32::NEG_INFINITY,f32::INFINITY)],[0].into_iter()));
-        let mut scene=crate::slang_forward::SlangScene::default();
-        let key=|s:&crate::slang_forward::SlangScene|crate::pipelines::CachedPipelines::identity("","",1,true,s,wgpu::TextureFormat::Rgba8Unorm);
-        let ordinary=key(&scene);scene.no_boundary_transactions=true;
-        assert_ne!(ordinary,key(&scene),"the proof must separate persistent pipeline identities");
+        let scene=crate::slang_forward::SlangScene::default();
+        let kernel=crate::pipelines::ProgramKernel::Path {adaptive:false,catchers:false,random_walk:false,features:0,boundaries:0,emitter_profiles:false,media:None};
+        let (ordinary,identity)=scene.test_entry_inputs("path_programs_fixed",("path_programs_fixed","compute"),Some(kernel));
+        let proven=crate::slang_forward::SlangScene {no_boundary_transactions:true,..scene};
+        let (args,changed)=proven.test_entry_inputs("path_programs_fixed",("path_programs_fixed","compute"),Some(kernel));
+        assert!(!ordinary.iter().any(|arg|arg=="-DVORK_NO_BOUNDARY_TRANSACTIONS"));
+        assert!(args.iter().any(|arg|arg=="-DVORK_NO_BOUNDARY_TRANSACTIONS"));
+        assert_ne!(identity,changed,"the consumed proof must separate persistent identities");
     }
 
     #[test]
@@ -724,10 +964,9 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
     fn retained_pipeline_and_optional_moments() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else {
-            return Ok(());
-        };
+        let r = crate::test_renderer()?;
         if !r
                 .device
                 .features()
@@ -759,11 +998,13 @@ mod tests {
                 s.path.as_ref().unwrap().kernel else { unreachable!() };
             assert_eq!(features & crate::forward_variant::FEATURE_IMPLICIT_GEOMETRY, 0, "triangle-only scene retains implicit graphs");
             s.path = Some(Pipeline::new(&r, adaptive, false, random_walk, features, boundaries,
-                emitter_profiles, media, &crate::InstallOptions::default(), &s.pipelines)?);
+                emitter_profiles, media, false, &crate::InstallOptions::default(), &s.pipelines)?);
             assert!(matches!(s.path.as_ref().unwrap().kernel, crate::pipelines::ProgramKernel::Path { media: None, .. }), "no-medium paths installed medium state/code");
             let rays = s.rays.as_ref().expect("path rays");
-            assert_eq!(rays.film_filter, rays.boundaries,
-                "no-solid paths installed an unused boundary descriptor table");
+            assert_eq!(rays.object_boundaries, rays.boundaries+rays.instances.len() as u32,
+                "no-solid paths need sentinel instance identities for side admission");
+            assert_eq!(rays.film_filter, rays.object_boundaries+s.objects.len() as u32,
+                "no-solid paths need sentinel object identities without solid descriptors");
             assert_eq!(rays.alpha.size(), u64::from(rays.film_filter)*4
                 + std::mem::size_of::<crate::sampling::PathFilterTable>() as u64);
             assert!(s.checked_shader_capacity, "display output must retain finite-result diagnostics without solids");
@@ -788,7 +1029,7 @@ mod tests {
             crate::test_linear::assert_linear_eq(first.linear_rgba.as_ref().expect("linear readback"), second.linear_rgba.as_ref().expect("linear readback"));
             // Same transport through the conservative fallback must preserve the
             // installed specialization's image, for both sampling entries.
-            s.path = Some(Pipeline::new(&r, adaptive, false, false, 0, 0, false, None, &crate::InstallOptions::default(), &s.pipelines)?);
+            s.path = Some(Pipeline::new(&r, adaptive, false, false, 0, 0, false, None, false, &crate::InstallOptions::default(), &s.pipelines)?);
             b.submit(&s, &r, 0.)?;
             let generic = b.collect(&r)?;
             crate::test_linear::assert_linear_eq(first.linear_rgba.as_ref().expect("linear readback"), generic.linear_rgba.as_ref().expect("linear readback"));

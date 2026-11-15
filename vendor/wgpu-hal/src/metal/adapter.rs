@@ -96,6 +96,7 @@ impl crate::Adapter for super::Adapter {
                 shared: Arc::clone(&self.shared),
                 features,
                 counters: Default::default(),
+                archive_additions: Default::default(),
             },
             queue: unsafe { super::Queue::queue_from_raw(queue, timestamp_period) },
         })

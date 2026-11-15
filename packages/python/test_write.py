@@ -12,6 +12,29 @@ from vork import std, write_scene
 class WriteScene(unittest.TestCase):
     """Mirrors packages/ts/test/serialization.test.mjs for writeScene."""
 
+    def test_text_font_paths_survive_relocation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / 'fonts').mkdir()
+            for name in ['a.ttf', 'b.otf']:
+                (root / 'fonts' / name).write_bytes(name.encode())
+            for font in ['fonts/a.ttf', ['fonts/a.ttf', 'fonts/b.otf']]:
+                with self.subTest(font=font):
+                    text = {'type': 'text', 'content': 'Hello', 'font': font}
+                    run = {'content': 'Hello', 'font': font}
+                    scene = {'version': 2, 'composition': {'space': '2d'},
+                             'nodes': [text, {'children': [{**text, 'content': [run]}]}]}
+                    original = copy.deepcopy(scene)
+                    path = Path(write_scene(scene, str(root / 'out/deep/scene.json'), directory))
+                    saved = self.read(path)
+                    expected = ['../../' + f for f in font] if isinstance(font, list) else '../../' + font
+                    nested = saved['nodes'][1]['children'][0]
+                    for node in [saved['nodes'][0], nested, nested['content'][0]]:
+                        self.assertEqual(node['font'], expected)
+                        for file in node['font'] if isinstance(node['font'], list) else [node['font']]:
+                            self.assertEqual((path.parent / file).read_bytes(), Path(file).name.encode())
+                    self.assertEqual(scene, original)
+
     def test_dense_fields_round_trip_across_binary_threshold(self):
         binary = os.environ.get('VORK_BIN', os.path.join(os.environ.get('CARGO_TARGET_DIR', str(Path(__file__).resolve().parents[2] / 'target')), 'release', 'vork'))
         for x in (15, 16, 17):
@@ -108,8 +131,8 @@ class WriteScene(unittest.TestCase):
              'skin': {'inverse_bind_matrices': buffer}},
             {'type': 'light', 'image': image, 'medium': material, 'material': material},
             {'type': 'asset', 'file': 'asset.glb', 'materials': {'slot': material}}],
-            'images': {'nested': {'render': {'compositor': [material]}}},
-            'render': {'compositor': [material], 'compositor_per_step': [material]},
+            'images': {'nested': {'composition':{'compositor':[material]},'render': {}}},
+            'composition':{'space':'3d','compositor':[material]},'render': {'compositor_per_step': [material]},
             'animation': [{'tracks': [{'keys': {'times': buffer, 'values': buffer}}]}]}
         with tempfile.TemporaryDirectory() as directory:
             saved = self.read(write_scene(scene, os.path.join(directory, 'out/scene.json'), directory))

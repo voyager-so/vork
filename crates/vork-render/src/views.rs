@@ -67,7 +67,8 @@ impl ViewTable {
                 .render
                 .as_ref()
                 .context("image view has no render source")?;
-            let reads = dependencies(settings.root.as_deref(), &settings.compositor, crate::compositor::dependencies(&s.compositor,&settings.compositor).0, &producers)?;
+            let graph = s.scene.images[name].compositor();
+            let reads = dependencies(settings.root.as_deref(), graph, crate::compositor::dependencies(&s.compositor,graph).0, &producers)?;
             let id = ViewId(entries.len());
             entries.push(ViewDesc {
                 kind: ViewKind::Image {

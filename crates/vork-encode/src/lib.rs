@@ -8,6 +8,10 @@
     allow(irrefutable_let_patterns)
 )]
 mod constants;
+mod ffmpeg;
+mod rate;
+pub use rate::validate_video_rate;
+pub use ffmpeg::{probe_video_clock_capabilities, validate_video_clock, validate_video_clock_capabilities};
 pub mod gpu_memory;
 mod pipe;
 pub use vork_time::Time;
@@ -30,8 +34,9 @@ impl std::error::Error for DeviceLimit {}
 
 /// Check external video dependencies before device startup or scene installation.
 /// Native macOS video does not need FFmpeg. PNG/EXR callers need no check.
-pub fn validate_video_output(path: &Path) -> Result<()> {
-    if cfg!(target_os = "macos") { return Ok(()); }
+/// Returns the dependency report for the persistent timing-capability identity.
+pub fn validate_video_output(path: &Path) -> Result<Vec<u8>> {
+    if cfg!(target_os = "macos") { return Ok(Vec::new()); }
     let mov = path.extension().is_some_and(|s| s.eq_ignore_ascii_case("mov"));
     if mov { return require_ffmpeg_encoder("prores_ks"); }
     // Linux native NVENC still requires FFmpeg as a muxer. Windows needs a
@@ -40,15 +45,39 @@ pub fn validate_video_output(path: &Path) -> Result<()> {
     let output = Command::new("ffmpeg").arg("-version").stdin(Stdio::null()).output()
         .with_context(|| format!("video output needs ffmpeg on PATH: {FFMPEG_REQUIREMENT}"))?;
     ensure!(output.status.success(), "ffmpeg on PATH is unusable: {FFMPEG_REQUIREMENT}");
-    Ok(())
+    let mut identity = output.stdout;
+    identity.extend_from_slice(&output.stderr);
+    Ok(identity)
 }
 
+/// The colour primaries of the display-encoded frames an encoder is given, which its stream names. Every
+/// backend converts with the BT.709 matrix to limited range and tags the BT.709 transfer, as for sRGB.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Primaries {
+    /// sRGB pictures: BT.709 primaries.
+    #[default]
+    Bt709,
+    /// Display P3 pictures: P3 primaries at D65 (SMPTE EG 432-1).
+    DisplayP3,
+}
+impl Primaries {
+    /// The ITU-T H.273 ColourPrimaries code, as H.264 VUI carries it.
+    pub fn h273(self) -> u32 {
+        match self { Self::Bt709 => 1, Self::DisplayP3 => 12 }
+    }
+    /// FFmpeg's name for the primaries.
+    pub fn ffmpeg(self) -> &'static str {
+        match self { Self::Bt709 => "bt709", Self::DisplayP3 => "smpte432" }
+    }
+}
 /// H.264 output policy, translated by each backend without changing defaults.
 #[derive(Clone, Copy, Debug)]
 pub struct EncodeSettings {
+    /// The primaries of the frames' display; the stream is tagged with them.
+    pub primaries: Primaries,
     /// Emit encoder stage timings when CLI diagnostics are enabled.
     pub diagnostics: bool,
-    /// Hardware VBR target in bits per second (NVENC/VideoToolbox).
+    /// Hardware bitrate target in bits per second (NVENC/VideoToolbox).
     pub hardware_bitrate: u32,
     /// Maximum keyframe spacing in seconds, shared by hardware and software.
     pub gop_seconds: u32,
@@ -58,6 +87,7 @@ pub struct EncodeSettings {
 impl Default for EncodeSettings {
     fn default() -> Self {
         Self {
+            primaries: Primaries::default(),
             diagnostics: false,
             hardware_bitrate: HARDWARE_BITRATE,
             gop_seconds: GOP_SECONDS,
@@ -71,9 +101,9 @@ pub enum Backend {
     Readback,
     HardwareReadback,
 }
-/// Handles belong to one device. Auto uses native Metal on macOS, Vulkan/CUDA NVENC on Linux,
-/// ffmpeg NVENC after readback on Windows, and falls back to portable readback (libx264)
-/// when hardware encoding is unavailable.
+/// Handles belong to one device. Auto uses native Metal on macOS, Vulkan/CUDA NVENC on NVIDIA
+/// Linux adapters, ffmpeg NVENC after readback on Windows, and portable readback (libx264 at
+/// its quality target) on other Linux adapters and when hardware encoding is unavailable.
 pub struct DeviceInfo {
     pub device: wgpu::Device,
     pub queue: wgpu::Queue,
@@ -87,6 +117,7 @@ pub struct Encoder {
     next: u64,
     sink: Sink,
     closed: bool,
+    staged_output: Option<tempfile::TempPath>,
     #[cfg(target_os = "linux")]
     diagnostics: bool,
 }
@@ -152,17 +183,36 @@ pub struct PreparedEncoder {
     settings: EncodeSettings,
     path: PathBuf,
     gop_frames: u32,
+    fallback_codec: std::sync::OnceLock<&'static str>,
     #[cfg(target_os = "macos")]
     metal: Option<native::Session>,
     #[cfg(target_os = "linux")]
     nvidia: Option<nvidia::Prepared>,
 }
 impl PreparedEncoder {
+    /// Validate the selected FFmpeg codec and clock before replacing existing output.
+    /// Native sessions do not need a readback codec unless attachment fails.
+    /// Supply the rendering device for Linux hardware selection; software-only
+    /// preparation and native macOS preparation need no device.
+    pub fn validate_fallback(&self, frames: u64, device: Option<&wgpu::Device>) -> Result<()> {
+        if let Some(device) = device { validate_device(device, self.width, self.height)?; }
+        #[cfg(target_os = "macos")]
+        if self.metal.is_some() { return Ok(()); }
+        #[cfg(target_os = "linux")]
+        if self.nvidia.is_some() && device.is_none_or(nvidia::is_adapter) { return ffmpeg::validate_mux_rate(self.fps); }
+        if self.fallback_codec.get().is_none() {
+            let codec = readback_codec(self.backend, self.width, self.height, &self.path, device)?;
+            let _ = self.fallback_codec.set(codec);
+        }
+        ffmpeg::validate_fallback_clock(self.fps, frames, &self.path)
+    }
     /// Attach the prepared output to the device used for rendering its frames.
+    /// `frames` is the selected clip length, used to preflight FFmpeg movie timing.
     pub fn open(
         self,
         device: wgpu::Device,
         queue: wgpu::Queue,
+        frames: u64,
         ring_depth: usize,
     ) -> Result<Encoder> {
         let Self {
@@ -173,6 +223,7 @@ impl PreparedEncoder {
             settings,
             path,
             gop_frames,
+            fallback_codec,
             #[cfg(target_os = "macos")]
             metal,
             #[cfg(target_os = "linux")]
@@ -196,7 +247,7 @@ impl PreparedEncoder {
             "HardwareReadback is not supported for MOV; use Auto for native Mac ProRes or Readback for software ProRes"
         );
         #[cfg(target_os = "linux")]
-        if let Some(prepared) = nvidia {
+        if let Some(prepared) = nvidia.filter(|_| nvidia::is_adapter(&gpu.device)) {
             match nvidia::Session::open(
                 &gpu,
                 prepared,
@@ -205,6 +256,7 @@ impl PreparedEncoder {
                 fps,
                 settings.hardware_bitrate,
                 gop_frames,
+                settings.primaries.h273(),
                 &path,
                 ring_depth,
             ) {
@@ -218,6 +270,7 @@ impl PreparedEncoder {
                         next: 0,
                         sink: Sink::Nvidia(session),
                         closed: false,
+                        staged_output: None,
                         #[cfg(target_os = "linux")]
                         diagnostics: settings.diagnostics,
                     });
@@ -237,6 +290,7 @@ impl PreparedEncoder {
                         next: 0,
                         sink: Sink::Metal(session),
                         closed: false,
+                        staged_output: None,
                         #[cfg(target_os = "linux")]
                         diagnostics: settings.diagnostics,
                     });
@@ -246,102 +300,24 @@ impl PreparedEncoder {
                 }
             }
         }
-        let mut codec = "libx264";
-        #[cfg(target_os = "macos")]
-        if !prores && matches!(gpu.backend, Backend::HardwareReadback) {
-            codec = "h264_videotoolbox";
-        }
-        // Windows has no zero-copy session; ffmpeg's NVENC still beats libx264 after readback.
-        #[cfg(any(target_os = "linux", windows))]
-        if !prores && !matches!(gpu.backend, Backend::Readback) {
-            match probe_ffmpeg_nvenc(width, height) {
-                Ok(()) => codec = "h264_nvenc",
-                Err(error) => {
-                    ensure!(!matches!(gpu.backend, Backend::HardwareReadback), "{error:#}");
-                    eprintln!("FFmpeg NVENC unavailable; using software libx264: {error:#}");
-                }
-            }
-        }
-        if prores {
-            codec = "prores_ks";
-        }
-        require_ffmpeg_encoder(codec)?;
+        rate::validate_ffmpeg_rate(fps, &path)?;
+        let codec = match fallback_codec.into_inner() {
+            Some(codec) => codec,
+            None => readback_codec(gpu.backend, width, height, &path, Some(&gpu.device))?,
+        };
         eprintln!("Video encoder: FFmpeg {codec} (readback)");
-        let mut command = Command::new("ffmpeg");
-        command.args([
-            "-v",
-            "error",
-            "-nostdin",
-            "-y",
-            "-f",
-            "rawvideo",
-            "-pixel_format",
-            "rgba",
-            "-video_size",
-            &format!("{width}x{height}"),
-            "-framerate",
-            &fps.to_string(),
-            "-i",
-            "pipe:0",
-            "-an",
-            "-c:v",
-            codec,
-        ]);
-        if codec == "libx264" {
-            command.args([
-                "-preset",
-                SOFTWARE_PRESET,
-                "-crf",
-                &settings.software_crf.to_string(),
-                "-threads",
-                SOFTWARE_THREADS,
-            ]);
-        } else if prores {
-            command.args([
-                "-profile:v",
-                PRORES_PROFILE,
-                "-alpha_bits",
-                PRORES_ALPHA_BITS,
-                "-threads",
-                PRORES_THREADS,
-            ]);
-        } else {
-            command.args(["-b:v", &settings.hardware_bitrate.to_string()]);
+        let mut staging = tempfile::Builder::new();
+        staging.prefix(".vork-video-").suffix(if prores { ".mov" } else { ".mp4" });
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // Match normal FFmpeg output creation, including the caller's umask.
+            staging.permissions(std::fs::Permissions::from_mode(0o666));
         }
-        // Set both frame and stream properties: encoders may prefer the
-        // converted frame's colour tags over the output codec options.
-        command.args([
-            "-vf",
-            "scale=out_color_matrix=bt709:out_range=tv,setparams=range=limited:color_primaries=bt709:color_trc=bt709:colorspace=bt709",
-            "-color_range",
-            "tv",
-            "-color_primaries",
-            "bt709",
-            "-color_trc",
-            "bt709",
-            "-colorspace",
-            "bt709",
-        ]);
-        let mut child = command
-            .args([
-                "-pix_fmt",
-                if prores {
-                    PRORES_PIXEL_FORMAT
-                } else {
-                    "yuv420p"
-                },
-                "-bf",
-                "0",
-                "-g",
-                &gop_frames.to_string(),
-                "-video_track_timescale",
-                &fps.numerator().to_string(),
-                "-map_metadata",
-                "-1",
-                "-f",
-                if prores { "mov" } else { "mp4" },
-            ])
-            .arg(&path)
+        let staged_output = staging
+            .tempfile_in(path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new(".")))
+            .with_context(|| format!("prepare video output {}", path.display()))?.into_temp_path();
+        let mut child = ffmpeg::readback_command(width, height, fps, frames, settings, codec, gop_frames, &staged_output)?
             .stdin(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
@@ -376,6 +352,7 @@ impl PreparedEncoder {
                 stderr,
             },
             closed: false,
+            staged_output: Some(staged_output),
                         #[cfg(target_os = "linux")]
                         diagnostics: settings.diagnostics,
         })
@@ -396,14 +373,64 @@ pub fn probe_ffmpeg_nvenc(width: u32, height: u32) -> Result<()> {
     Ok(())
 }
 
+fn readback_codec(backend: Backend, width: u32, height: u32, path: &Path, device: Option<&wgpu::Device>) -> Result<&'static str> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = device;
+    #[cfg(target_os = "macos")]
+    let _ = (width, height);
+    let prores = path.extension().is_some_and(|s| s.eq_ignore_ascii_case("mov"));
+    #[allow(unused_mut)]
+    let mut codec = if prores { "prores_ks" } else { "libx264" };
+    #[cfg(target_os = "macos")]
+    if !prores && matches!(backend, Backend::HardwareReadback) {
+        codec = "h264_videotoolbox";
+    }
+    // FFmpeg hardware H.264 follows the rendering adapter and encodes at a fixed bitrate. Only
+    // NVIDIA has it; every other adapter's MP4 is libx264 at its quality target (CRF).
+    #[cfg(target_os = "linux")]
+    if !prores && !matches!(backend, Backend::Readback) {
+        if nvidia::is_adapter(device.context("hardware H.264 selection requires the rendering device")?) {
+            match probe_ffmpeg_nvenc(width, height) {
+                // The probe initialised the encoder; listing FFmpeg's encoders again only costs a process.
+                Ok(()) => return Ok("h264_nvenc"),
+                Err(error) => {
+                    ensure!(!matches!(backend, Backend::HardwareReadback), "hardware H.264 unavailable: {error:#}");
+                    eprintln!("Hardware H.264 unavailable; using software libx264: {error:#}");
+                }
+            }
+        } else {
+            ensure!(
+                !matches!(backend, Backend::HardwareReadback),
+                "hardware H.264 unavailable: Linux hardware readback needs an NVIDIA rendering adapter"
+            );
+        }
+    }
+    #[cfg(windows)]
+    if !prores && !matches!(backend, Backend::Readback) {
+        match probe_ffmpeg_nvenc(width, height) {
+            Ok(()) => codec = "h264_nvenc",
+            Err(error) => {
+                ensure!(!matches!(backend, Backend::HardwareReadback), "{error:#}");
+                eprintln!("FFmpeg NVENC unavailable; using software libx264: {error:#}");
+            }
+        }
+    }
+    require_ffmpeg_encoder(codec)?;
+    Ok(codec)
+}
+
 // Check before opening the rawvideo pipe so codec errors retain their cause.
-fn require_ffmpeg_encoder(codec: &str) -> Result<()> {
+fn require_ffmpeg_encoder(codec: &str) -> Result<Vec<u8>> {
     let output = Command::new("ffmpeg")
-        .args(["-hide_banner", "-encoders"])
+        .arg("-encoders")
         .stdin(Stdio::null())
         .output()
         .with_context(|| format!("query ffmpeg encoders: {FFMPEG_REQUIREMENT}"))?;
-    validate_ffmpeg_encoder(output.status.success(), &output.stdout, codec)
+    validate_ffmpeg_encoder(output.status.success(), &output.stdout, codec)?;
+    // The banner includes the runtime library versions as well as the build.
+    let mut identity = output.stderr;
+    identity.extend_from_slice(&output.stdout);
+    Ok(identity)
 }
 
 fn validate_ffmpeg_encoder(success: bool, listing: &[u8], codec: &str) -> Result<()> {
@@ -465,16 +492,17 @@ fn validate_device(device: &wgpu::Device, width: u32, height: u32) -> Result<()>
 fn validate_device_limits(limits: &wgpu::Limits, width: u32, height: u32) -> Result<()> {
     ensure!(
         width <= limits.max_texture_dimension_2d && height <= limits.max_texture_dimension_2d,
-        DeviceLimit(gpu_memory::limit_message("encoder texture dimensions", format_args!("{width}x{height}"), format_args!("max_texture_dimension_2d={}", limits.max_texture_dimension_2d), "reduce the output resolution or use a GPU with larger texture limits"))
+        gpu_memory::device_limit("encoder texture dimensions", format_args!("{width}x{height}"), format_args!("max_texture_dimension_2d={}", limits.max_texture_dimension_2d), "reduce the output resolution or use a GPU with larger texture limits")
     );
     let padded = (width as u64 * 4).div_ceil(COPY_ROW_ALIGNMENT) * COPY_ROW_ALIGNMENT;
     ensure!(
         padded * height as u64 <= limits.max_buffer_size,
-        DeviceLimit(gpu_memory::limit_message("encoder readback", format_args!("{} bytes at {width}x{height}", padded * height as u64), format_args!("max_buffer_size={} bytes", limits.max_buffer_size), "reduce the output resolution or use a GPU with a larger buffer limit"))
+        gpu_memory::device_limit("encoder readback", format_args!("{} bytes at {width}x{height}", padded * height as u64), format_args!("max_buffer_size={} bytes", limits.max_buffer_size), "reduce the output resolution or use a GPU with a larger buffer limit")
     );
     Ok(())
 }
 impl Encoder {
+    /// Open an output for a selected clip of `frames` frames.
     pub fn open(
         gpu: DeviceInfo,
         width: u32,
@@ -482,10 +510,11 @@ impl Encoder {
         fps: Time,
         settings: EncodeSettings,
         path: impl AsRef<Path>,
+        frames: u64,
         ring_depth: usize,
     ) -> Result<Self> {
         Self::prepare(gpu.backend, width, height, fps, settings, path)?
-            .open(gpu.device, gpu.queue, ring_depth)
+            .open(gpu.device, gpu.queue, frames, ring_depth)
     }
     /// Prepare CPU/native codec resources without creating or truncating output.
     /// Device validation and file creation happen in PreparedEncoder::open.
@@ -501,12 +530,13 @@ impl Encoder {
             width > 0
                 && height > 0
                 && width % 2 == 0
-                && height % 2 == 0
-                && fps > Time::ZERO
-                && fps.numerator() <= i64::from(i32::MAX)
-                && fps.denominator() <= i64::from(i32::MAX),
-            "dimensions must be positive/even; fps must be positive"
+                && height % 2 == 0,
+            "dimensions must be positive/even"
         );
+        validate_video_rate(fps, path.as_ref())?;
+        if !matches!(backend, Backend::Auto) {
+            rate::validate_ffmpeg_rate(fps, path.as_ref())?;
+        }
         let gop_frames = u32::try_from((vork_time::exact::decimal(&fps.to_string())? * vork_time::exact::Rational::from_integer(settings.gop_seconds.into())).ceil().to_integer())?;
         ensure!(gop_frames > 0 && gop_frames <= i32::MAX as u32, "keyframe interval must fit a positive signed 32-bit frame count");
         ensure!(
@@ -544,6 +574,7 @@ impl Encoder {
                 gop_frames,
                 path.extension()
                     .is_some_and(|s| s.eq_ignore_ascii_case("mov")),
+                settings.primaries,
             ) {
                 Ok(session) => Some(session),
                 Err(error) => {
@@ -562,6 +593,7 @@ impl Encoder {
             settings,
             path,
             gop_frames,
+            fallback_codec: std::sync::OnceLock::new(),
             #[cfg(target_os = "macos")]
             metal,
             #[cfg(target_os = "linux")]
@@ -882,6 +914,9 @@ impl Encoder {
             #[cfg(target_os = "macos")]
             Sink::Metal(session) => session.finish()?,
         }
+        if let Some(staged) = self.staged_output.take() {
+            staged.persist(&self.path).map_err(|error| error.error).context("publish completed video")?;
+        }
         Ok(self.path.clone())
     }
 }
@@ -916,6 +951,7 @@ mod native {
             bitrate: u32,
             gop_frames: u32,
             prores: bool,
+            primaries: u32,
         ) -> *mut c_void;
         fn enc_attach(ctx: *mut c_void, path: *const i8) -> i32;
         fn enc_acquire(ctx: *mut c_void, device: *mut c_void) -> *mut c_void;
@@ -943,8 +979,9 @@ mod native {
             bitrate: u32,
             gop_frames: u32,
             prores: bool,
+            primaries: Primaries,
         ) -> Result<Self> {
-            let ptr = unsafe { enc_prepare(w, h, fps.numerator() as u32, fps.denominator() as u32, bitrate, gop_frames, prores) };
+            let ptr = unsafe { enc_prepare(w, h, fps.numerator() as u32, fps.denominator() as u32, bitrate, gop_frames, prores, primaries.h273()) };
             ensure!(!ptr.is_null(), "native VideoToolbox initialization failed");
             Ok(Self(ptr))
         }

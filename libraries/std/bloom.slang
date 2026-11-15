@@ -36,7 +36,7 @@ float3 box(Image original,int2 pixel,int2 extent,uint divisor) {
     return c/float(divisor*divisor);
 }
 public float4 composite(CompositeContext ctx, Inputs inputs) {
-    if(inputs.stage==BloomStage::Prepare) {
+    if(int(inputs.stage) == int(BloomStage::Prepare)) {
         // Box reduction precedes the nonlinear highlight threshold.
         uint divisor=max(inputs.divisor,1u);
         int2 extent=int2(ceil(compositor_size(inputs.original)/float(divisor)));
@@ -51,13 +51,13 @@ public float4 composite(CompositeContext ctx, Inputs inputs) {
         if(inputs.clamp) h=min(h,inputs.maximum);
         return intermediate(peak>0. ? c*(h/peak) : float3(0.));
     }
-    if(inputs.stage==BloomStage::Downsample) {
+    if(int(inputs.stage) == int(BloomStage::Downsample)) {
         float3 c=.5*quad(inputs.source,ctx.uv,0.,inputs.karis);
         for(int y=-1;y<=1;y+=2) for(int x=-1;x<=1;x+=2)
             c+=.125*quad(inputs.source,ctx.uv,float2(x,y),inputs.karis);
         return intermediate(c);
     }
-    if(inputs.stage==BloomStage::Upsample) {
+    if(int(inputs.stage) == int(BloomStage::Upsample)) {
         float3 c=0.;
         for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++)
             c+=float((2-abs(x))*(2-abs(y)))/16.*filtered(inputs.source,ctx.uv+float2(x,y)/ctx.size);

@@ -1,4 +1,40 @@
 use super::*;
+/// Where a graph's entries read what is not the graph's own: a world's channels, AOVs and installed images,
+/// or a canvas's image files. A canvas has no world channels; its scene refuses them
+/// (`vork_scene` `validate_canvas`).
+#[derive(Clone, Copy)]
+pub(super) enum Sources<'a> {
+    World(&'a InstalledScene, &'a crate::view::Targets),
+    /// Each image input's texture, and whether its colour is associated.
+    Canvas(&'a std::collections::BTreeMap<String, (wgpu::TextureView, bool)>),
+}
+impl<'a> Sources<'a> {
+    fn world(self, channel: &str) -> Result<(&'a InstalledScene, &'a crate::view::Targets)> {
+        match self {
+            Self::World(scene, targets) => Ok((scene, targets)),
+            Self::Canvas(_) => anyhow::bail!("compositor channel {channel} is a 3D world's; a 2D canvas has color"),
+        }
+    }
+    /// An image input's texture and whether its colour is associated. File and video textures carry straight
+    /// alpha; render images and OpenEXR files hold associated RGBA.
+    fn image(self, name: &str) -> Result<(&'a wgpu::TextureView, bool)> {
+        match self {
+            Self::Canvas(images) => images.get(name).map(|(view, associated)| (view, *associated)).context("uninstalled compositor image"),
+            Self::World(s, _) => {
+                let view = if let Some(view) = s.file_images.get(name) { view } else {
+                    &s.graph.views.entries.iter().find_map(|entry| match &entry.kind {
+                        crate::views::ViewKind::Image { name: image, render } if image == name => Some(render.as_ref()), _ => None,
+                    }).context("uninstalled compositor image")?.output
+                };
+                Ok((view, !s.file_images.contains_key(name) || associated_file(&s.scene.images[name])))
+            }
+        }
+    }
+}
+/// Whether an image file's pixels are stored associated: OpenEXR's are.
+pub(super) fn associated_file(image: &vork_scene::v2::Image) -> bool {
+    image.file.as_ref().is_some_and(|path| Path::new(path).extension().is_some_and(|e| e.eq_ignore_ascii_case("exr")))
+}
 fn buffer<'a>(
     layout: &mut Vec<wgpu::BindGroupLayoutEntry>,
     bindings: &mut Vec<wgpu::BindGroupEntry<'a>>,
@@ -15,10 +51,9 @@ fn buffer<'a>(
 }
 #[allow(clippy::too_many_arguments)]
 pub(super) fn pass(
-    s: &InstalledScene,
+    sources: Sources<'_>,
     r: &Renderer,
     uniform: &wgpu::Buffer,
-    targets: &crate::view::Targets,
     program: &Program,
     words: &wgpu::Buffer,
     source: &wgpu::Buffer,
@@ -56,8 +91,8 @@ pub(super) fn pass(
     sizes[1] = [full[0], full[1], source_size[0], source_size[1]];
     for (index, channel) in program.channels.iter().enumerate() {
         if !program.reads(index as u32+1) {continue;}
-        if let Some(name) = channel.strip_prefix("node:") {
-            let (_, extent) = nodes.get(name).with_context(|| format!("unknown earlier compositor node {name}"))?;
+        if let Some(name) = channel.strip_prefix("step:") {
+            let (_, extent) = nodes.get(name).with_context(|| format!("unknown earlier compositor step {name}"))?;
             sizes[2 + index] = [extent[0], extent[1], 0, 0];
         }
     }
@@ -111,6 +146,7 @@ pub(super) fn pass(
                 format!("return {name}[u32(q.y)*image_sizes[1].x+u32(q.x)]/{original_normalization};"),
                 "image_sizes[1].xy".to_owned())
         } else if channel=="shadow_catcher" {
+            let (s, targets) = sources.world(channel)?;
             if new {
                 buffer(&mut layout,&mut bindings,binding,&targets.catcher,Storage {read_only:true});
             }
@@ -118,29 +154,24 @@ pub(super) fn pass(
                 format!("let p=u32(q.y)*image_sizes[1].x+u32(q.x);let a={name}[p*3u];let b={name}[p*3u+1u];let valid=b.xyz!=vec3(0.);let ratio=select(vec3(1.),a.xyz/select(vec3(1.),b.xyz,valid),valid);return vec4(mix(vec3(1.),ratio,a.w/max(b.w,1.)),1.);")
             } else {"return vec4(1.);".into()};
             (format!("var<storage,read> {name}:array<vec4<f32>>;"),load,"image_sizes[1].xy".to_owned())
-        } else if let Some(node) = channel.strip_prefix("node:") {
-            let (value, _) = nodes.get(node).context("unknown earlier compositor node")?;
+        } else if let Some(node) = channel.strip_prefix("step:") {
+            let (value, _) = nodes.get(node).context("unknown earlier compositor step")?;
             buffer(&mut layout, &mut bindings, binding, value, Storage { read_only: true });
             let extent = format!("image_sizes[{}].xy", 1 + slot);
             (format!("var<storage,read> {name}:array<vec4<f32>>;"),
                 format!("let extent={extent};let at=vec2<u32>(clamp(p,vec2(0),vec2<i32>(extent)-1));return {name}[at.y*extent.x+at.x];"), extent)
         } else if let Some(image) = channel.strip_prefix("image:") {
-            let view = if let Some(view)=s.file_images.get(image) {view} else {
-                &s.graph.views.entries.iter().find_map(|entry| match &entry.kind {crate::views::ViewKind::Image {name,render} if name==image => Some(render.as_ref()), _=>None}).context("uninstalled compositor image")?.output
-            };
+            let (view, associated) = sources.image(image)?;
             if new {
                 let mut item=pipelines::texture_entry(binding,wgpu::TextureSampleType::Float {filterable:false},false);
                 item.visibility=wgpu::ShaderStages::COMPUTE;
                 layout.push(item);bindings.push(entry(binding,wgpu::BindingResource::TextureView(view)));
             }
-            // File/video textures carry straight alpha, while render images
-            // and OpenEXR files use associated scene-linear RGBA. Associate each
-            // texel before interpolation, so hidden RGB cannot bleed into edges.
-            let associated=!s.file_images.contains_key(image) || s.scene.images[image].file.as_ref()
-                .is_some_and(|path|Path::new(path).extension().is_some_and(|e|e.eq_ignore_ascii_case("exr")));
+            // Associate each straight-alpha texel before interpolation, so hidden RGB cannot bleed into edges.
             let result=if associated {"value"} else {"vec4(value.rgb*value.a,value.a)"};
             (format!("var {name}:texture_2d<f32>;"),format!("let at=clamp(p,vec2(0),vec2<i32>(textureDimensions({name}))-1);let value=textureLoad({name},at,0);return {result};"),format!("textureDimensions({name})"))
         } else if channel.starts_with("aov:") {
+            let (s, targets) = sources.world(channel)?;
             if new {
                 buffer(
                     &mut layout,
@@ -165,6 +196,7 @@ pub(super) fn pass(
                 "image_sizes[1].xy".to_owned(),
             )
         } else {
+            let (_, targets) = sources.world(channel)?;
             let view = match channel.as_str() {
                 "depth" => &targets.post_depth,
                 "view_normal" => &targets.post_normals,
@@ -276,6 +308,10 @@ pub(super) fn pass(
         group[0],
         group[1]
     );
+    if r.adapter_info.backend==wgpu::Backend::Metal {
+        crate::pipelines::check_stage_limits("compositor image pass",&[&layout],wgpu::ShaderStages::COMPUTE)
+            .context("reduce compositor pass image and buffer inputs")?;
+    }
     let limits = r.device.limits();
     let buffers = layout
         .iter()
@@ -297,7 +333,7 @@ pub(super) fn pass(
     ensure!(
         storage_textures<=limits.max_storage_textures_per_shader_stage && buffers <= limits.max_storage_buffers_per_shader_stage
             && textures <= limits.max_sampled_textures_per_shader_stage,
-        "{}", crate::gpu_memory::limit_message("compositor pass", format_args!("{storage_textures} storage textures, {buffers} storage buffers, {textures} sampled textures"), format_args!("{} storage textures, {} storage buffers, {} sampled textures",limits.max_storage_textures_per_shader_stage,limits.max_storage_buffers_per_shader_stage,limits.max_sampled_textures_per_shader_stage), "reduce compositor pass image and buffer inputs")
+        crate::gpu_memory::device_limit("compositor pass", format_args!("{storage_textures} storage textures, {buffers} storage buffers, {textures} sampled textures"), format_args!("{} storage textures, {} storage buffers, {} sampled textures",limits.max_storage_textures_per_shader_stage,limits.max_storage_buffers_per_shader_stage,limits.max_sampled_textures_per_shader_stage), "reduce compositor pass image and buffer inputs")
     );
     ensure!(
         group[0] > 0
@@ -306,14 +342,14 @@ pub(super) fn pass(
             && group[1] <= limits.max_compute_workgroup_size_y
             && u64::from(group[0]) * u64::from(group[1])
                 <= u64::from(limits.max_compute_invocations_per_workgroup),
-        "{}", crate::gpu_memory::limit_message("compositor workgroup", format_args!("{}x{} threads ({} invocations)",group[0],group[1],u64::from(group[0])*u64::from(group[1])), format_args!("{}x{} threads, {} invocations; each axis must be positive",limits.max_compute_workgroup_size_x,limits.max_compute_workgroup_size_y,limits.max_compute_invocations_per_workgroup), "set the compositor program workgroup to positive dimensions within these limits")
+        crate::gpu_memory::device_limit("compositor workgroup", format_args!("{}x{} threads ({} invocations)",group[0],group[1],u64::from(group[0])*u64::from(group[1])), format_args!("{}x{} threads, {} invocations; each axis must be positive",limits.max_compute_workgroup_size_x,limits.max_compute_workgroup_size_y,limits.max_compute_invocations_per_workgroup), "set the compositor program workgroup to positive dimensions within these limits")
     );
     let groups = [w.div_ceil(group[0]), h.div_ceil(group[1]), 1];
     ensure!(
         groups
             .iter()
             .all(|n| *n <= limits.max_compute_workgroups_per_dimension),
-        "{}", crate::gpu_memory::limit_message("compositor dispatch", format_args!("{groups:?} workgroups at {w}x{h}"), format_args!("{} workgroups per axis",limits.max_compute_workgroups_per_dimension), "reduce compositor image resolution or increase the program workgroup within its limits")
+        crate::gpu_memory::device_limit("compositor dispatch", format_args!("{groups:?} workgroups at {w}x{h}"), format_args!("{} workgroups per axis",limits.max_compute_workgroups_per_dimension), "reduce compositor image resolution or increase the program workgroup within its limits")
     );
     let d = &r.device;
     let module=if r.check_only {
@@ -323,8 +359,9 @@ pub(super) fn pass(
         // automatic shader remapping applies to Naga modules, not passthrough.
         let mut authored:Vec<_>=layout.iter().map(|entry|entry.binding).collect();authored.sort_unstable();
         let slots:Vec<_>=authored.into_iter().enumerate().map(|(physical,authored)|(0,authored,physical as u32)).collect();
-        let mut hash=blake3::Hasher::new();hash.update(b"native-image-hlsl-9");hash.update(vork_slang::VERSION.as_bytes());hash.update(&serde_json::to_vec(&slots)?);hash.update(shader.as_bytes());
-        let code:Vec<u8>=programs::cached_generated(r,hash.finalize(),||Compiler::discover().compile_image_spirv(&shader,&slots))?;
+        let mut hash=blake3::Hasher::new();hash.update(b"native-image-hlsl-9");let compiler=Compiler::discover();
+        hash.update(programs::admit(&|key|r.disk_cache.path("slang-input",1,key),&compiler)?.version().as_bytes());hash.update(&serde_json::to_vec(&slots)?);hash.update(shader.as_bytes());
+        let code:Vec<u8>=programs::cached_generated(r,hash.finalize(),||compiler.compile_image_spirv(&shader,&slots))?;
         crate::native::module(d,"compositor image pass",Some(&code),None,(group[0],group[1],1))
     } else {
         crate::timing::shader_module(d,wgpu::ShaderModuleDescriptor {label:Some("compositor image pass"),source:wgpu::ShaderSource::Wgsl(shader.into())})

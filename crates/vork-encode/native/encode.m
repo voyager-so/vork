@@ -23,11 +23,12 @@ typedef struct {
     dispatch_queue_t handoff,writer_queue;
     dispatch_group_t writing;
     bool started,finished,prores;
+    CFStringRef primaries;
 } Encoder;
 // BGRA input is full-range RGB; VT converts ProRes to video-range BT.709 Y'CbCr.
 static void tag_surface(Encoder *e,CVPixelBufferRef pixel) {
     if(e->prores)CVBufferSetAttachment(pixel,kCVImageBufferAlphaChannelModeKey,kCVImageBufferAlphaChannelMode_StraightAlpha,kCVAttachmentMode_ShouldPropagate);
-    CVBufferSetAttachment(pixel,kCVImageBufferColorPrimariesKey,kCVImageBufferColorPrimaries_ITU_R_709_2,kCVAttachmentMode_ShouldPropagate);
+    CVBufferSetAttachment(pixel,kCVImageBufferColorPrimariesKey,e->primaries,kCVAttachmentMode_ShouldPropagate);
     CVBufferSetAttachment(pixel,kCVImageBufferTransferFunctionKey,kCVImageBufferTransferFunction_ITU_R_709_2,kCVAttachmentMode_ShouldPropagate);
     CVBufferSetAttachment(pixel,kCVImageBufferYCbCrMatrixKey,kCVImageBufferYCbCrMatrix_ITU_R_709_2,kCVAttachmentMode_ShouldPropagate);
 }
@@ -98,9 +99,11 @@ void enc_drop(void *ctx) {
     e->pending=nil;e->handoff=nil;e->writing=nil;e->writer_queue=nil;
     free(e);
 }
-void *enc_prepare(unsigned w,unsigned h,unsigned fps_num,unsigned fps_den,unsigned bitrate,unsigned gop_frames,bool prores) {
+// `primaries` is the H.273 code of the frames' display: 12 is P3 at D65, anything else BT.709.
+void *enc_prepare(unsigned w,unsigned h,unsigned fps_num,unsigned fps_den,unsigned bitrate,unsigned gop_frames,bool prores,unsigned primaries) {
     @autoreleasepool {
     Encoder *e=calloc(1,sizeof(*e));e->width=w;e->height=h;e->fps_num=fps_num;e->fps_den=fps_den;e->prores=prores;
+    e->primaries=primaries==12 ? kCVImageBufferColorPrimaries_P3_D65 : kCVImageBufferColorPrimaries_ITU_R_709_2;
     e->ready=(void *)CFBridgingRetain([NSMutableDictionary new]);
     e->surfaces=(void *)CFBridgingRetain([NSMutableDictionary new]);
     e->pending=dispatch_group_create();
@@ -120,7 +123,7 @@ void *enc_prepare(unsigned w,unsigned h,unsigned fps_num,unsigned fps_den,unsign
     if(!s && prores)s=VTSessionSetProperty(e->session,kVTCompressionPropertyKey_PreserveAlphaChannel,kCFBooleanTrue);
     if(!s && !prores)s=VTSessionSetProperty(e->session,kVTCompressionPropertyKey_AverageBitRate,(__bridge CFNumberRef)@(bitrate));
     if(!s && !prores)s=VTSessionSetProperty(e->session,kVTCompressionPropertyKey_MaxKeyFrameInterval,(__bridge CFNumberRef)@(gop_frames));
-    if(!s)s=VTSessionSetProperty(e->session,kVTCompressionPropertyKey_ColorPrimaries,kCVImageBufferColorPrimaries_ITU_R_709_2);
+    if(!s)s=VTSessionSetProperty(e->session,kVTCompressionPropertyKey_ColorPrimaries,e->primaries);
     if(!s)s=VTSessionSetProperty(e->session,kVTCompressionPropertyKey_TransferFunction,kCVImageBufferTransferFunction_ITU_R_709_2);
     if(!s)s=VTSessionSetProperty(e->session,kVTCompressionPropertyKey_YCbCrMatrix,kCVImageBufferYCbCrMatrix_ITU_R_709_2);
     if(!s)s=VTCompressionSessionPrepareToEncodeFrames(e->session);

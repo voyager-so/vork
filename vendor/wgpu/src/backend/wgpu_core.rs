@@ -2851,6 +2851,14 @@ impl dispatch::CommandEncoderInterface for CoreCommandEncoder {
     ) {
         let blas = blas.map(|e: &crate::BlasBuildEntry<'_>| {
             let geometries = match e.geometry {
+                crate::BlasGeometries::AabbGeometries(ref geometries) => {
+                    wgc::ray_tracing::BlasGeometries::AabbGeometries(Box::new(geometries.iter().map(|g| {
+                        wgc::ray_tracing::BlasAabbGeometry {
+                            size: g.size, buffer: g.buffer.inner.as_core().id,
+                            offset: g.offset, stride: g.stride,
+                        }
+                    })))
+                }
                 crate::BlasGeometries::TriangleGeometries(ref triangle_geometries) => {
                     let iter = triangle_geometries.iter().map(|tg| {
                         wgc::ray_tracing::BlasTriangleGeometry {

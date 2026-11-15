@@ -50,6 +50,7 @@ def export_gltf(*, bake_sources=False, **options):
     deps = bpy.context.evaluated_depsgraph_get()
     tagged = []
     from .visibility import METADATA as ray_metadata, flags
+    from .instances import SOURCE
     try:
         for obj in bpy.data.objects:
             if obj.type not in ('MESH', 'CURVE', 'SURFACE', 'META', 'FONT'):
@@ -65,7 +66,7 @@ def export_gltf(*, bake_sources=False, **options):
                 mesh = obj.evaluated_get(deps).data if options.get('export_apply', False) else obj.data
                 layers = mesh.uv_layers
                 active = next((i for i, layer in enumerate(layers) if layer.active_render), None)
-                obj[_METADATA] = json.dumps([[layer.name for layer in layers], active, obj.name if bake_sources else None])
+                obj[_METADATA] = json.dumps([[layer.name for layer in layers], active, obj.get(SOURCE, obj.name) if bake_sources else None])
         options['export_extras'] = True
         result = bpy.ops.export_scene.gltf(**options)
         if 'FINISHED' not in result:

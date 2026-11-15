@@ -1,5 +1,6 @@
 blender: "program":"blender/<m>"; import blender.<m>; prefer std/openpbr for new scenes.
-Programs: blender/filmic: render.display program; look, exposure, gamma and dither_intensity inputs.
+Programs: blender/filmic: composition.view material; look, exposure and gamma inputs.
+Diffuse_BSDF uses EEVEE (Lambert); Roughness is Cycles-only in Blender.
 <!-- all -->
 blender/filmic look: none|very_high_contrast|high_contrast|medium_high_contrast|medium_contrast|
   medium_low_contrast|low_contrast|very_low_contrast.

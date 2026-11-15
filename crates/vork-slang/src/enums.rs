@@ -30,6 +30,70 @@ fn parent(record: &str) -> Option<&str> {
         .find_map(|line| line.trim().strip_prefix("parentDecl : "))
 }
 
+fn records(ast: &str) -> BTreeMap<&str, &str> {
+    ast.split("\n}\n")
+        .filter_map(|record| record.trim().split_once(" {\n"))
+        .collect()
+}
+
+fn declarations(records: &BTreeMap<&str, &str>) -> Result<BTreeMap<String, Vec<String>>> {
+    let mut enums = BTreeMap::new();
+    for (id, record) in records {
+        if !id.starts_with("EnumDecl:") { continue; }
+        let mut cases: Vec<_> = records.iter()
+            .filter(|(key, r)| key.starts_with("EnumCaseDecl:") && parent(r) == Some(*id))
+            .map(|(_, r)| Ok((offset(r)?, name(r)?.to_owned())))
+            .collect::<Result<_>>()?;
+        cases.sort_by_key(|(position, _)| *position);
+        if !cases.is_empty() {
+            enums.insert(name(record)?.to_owned(), cases.into_iter().map(|(_, name)| name).collect());
+        }
+    }
+    Ok(enums)
+}
+
+/// Missing enum members use the same supported-name diagnostic as authored enum
+/// inputs. Slang supplies both the failed lookup and the actual declarations;
+/// authored source is never scanned or rewritten.
+pub(super) fn missing_members(directory: &Path, diagnostics: &str) -> Result<Option<String>> {
+    let mut missing = BTreeSet::new();
+    let mut errors = 0;
+    let mut lookups = 0;
+    let mut location = "";
+    for line in diagnostics.lines() {
+        if line.starts_with("error[") {
+            if !line.starts_with("error[E30027]:") { return Ok(None); }
+            errors += 1;
+        }
+        if let Some(path) = line.trim().strip_prefix("--> ") { location = path; }
+        let Some((marker, message)) = line.trim().strip_prefix('|')
+            .and_then(|s| s.trim().split_once(" '")) else { continue };
+        if marker.is_empty() || !marker.chars().all(|c| c == '^' || c == '~') { continue; }
+        let Some((member, ty)) = message.split_once("' is not a member of 'typeof(") else { continue };
+        let Some(ty) = ty.strip_suffix(")'.") else { continue };
+        missing.insert((location, ty, member));
+        lookups += 1;
+    }
+    if errors == 0 || errors != lookups { return Ok(None); }
+    let needed: BTreeSet<_> = missing.iter().map(|(_, ty, _)| *ty).collect();
+    let mut enums = BTreeMap::new();
+    for entry in fs::read_dir(directory)? {
+        let path = entry?.path();
+        if path.extension().is_none_or(|ext| ext != "slang-ast") { continue; }
+        for (ty, cases) in declarations(&records(&read_compiler_text(path)?))? {
+            if !needed.contains(ty.as_str()) { continue; }
+            if enums.get(&ty).is_some_and(|previous| previous != &cases) { return Ok(None); }
+            enums.insert(ty, cases);
+        }
+    }
+    let mut messages = Vec::new();
+    for (location, ty, member) in missing {
+        let Some(cases) = enums.get(ty) else { return Ok(None) };
+        messages.push(format!("{location}: {ty}: {}", vork_scene::diagnostics::unknown("member", member, cases.iter().map(String::as_str))));
+    }
+    Ok(Some(messages.join("; ")))
+}
+
 pub(super) fn reflect(directory: &Path, inputs: &mut InputLayout) -> Result<()> {
     let mut enums = BTreeMap::<String, Vec<String>>::new();
     let mut fields = Vec::new();
@@ -39,30 +103,14 @@ pub(super) fn reflect(directory: &Path, inputs: &mut InputLayout) -> Result<()> 
             continue;
         }
         let ast = read_compiler_text(&path)?;
-        let records: BTreeMap<_, _> = ast
-            .split("\n}\n")
-            .filter_map(|record| record.trim().split_once(" {\n"))
-            .collect();
+        let records = records(&ast);
         let Some((_, module)) = records
             .iter()
             .find(|(key, _)| key.starts_with("ModuleDecl:"))
         else {
             continue;
         };
-        for (id, record) in &records {
-            if id.starts_with("EnumDecl:") {
-                let mut cases: Vec<_> = records
-                    .iter()
-                    .filter(|(key, r)| key.starts_with("EnumCaseDecl:") && parent(r) == Some(*id))
-                    .map(|(_, r)| Ok((offset(r)?, name(r)?.to_owned())))
-                    .collect::<Result<_>>()?;
-                cases.sort_by_key(|(position, _)| *position);
-                let cases: Vec<_> = cases.into_iter().map(|(_, name)| name).collect();
-                if !cases.is_empty() {
-                    enums.insert(name(record)?.to_owned(), cases);
-                }
-            }
-        }
+        enums.extend(declarations(&records)?);
         let Some((input_id, _)) = records.iter().find(|(key, record)| {
             key.starts_with("StructDecl:") && name(record).ok() == Some("Inputs")
         }) else {

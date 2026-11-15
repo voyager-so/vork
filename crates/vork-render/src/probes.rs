@@ -97,16 +97,16 @@ pub(crate) fn read_layout(d: &wgpu::Device) -> wgpu::BindGroupLayout {
 pub(crate) fn update_entries() -> Vec<wgpu::BindGroupLayoutEntry> {
     let compute = wgpu::ShaderStages::COMPUTE;
     let mut entries = pipelines::global_entries();
-    entries.extend(rt::layout_entries(10, compute));
+    entries.extend(rt::layout_entries(11, compute));
     let writable = wgpu::BufferBindingType::Storage { read_only: false };
-    entries.extend((12..16).map(|binding| pipelines::buffer_entry(binding, compute, writable)));
+    entries.extend((13..17).map(|binding| pipelines::buffer_entry(binding, compute, writable)));
     entries.push(wgpu::BindGroupLayoutEntry {
-        binding: 16,
+        binding: 17,
         visibility: compute,
         ty: wgpu::BindingType::Buffer { ty: wgpu::BufferBindingType::Uniform, has_dynamic_offset: true, min_binding_size: None },
         count: None,
     });
-    entries.push(pipelines::buffer_entry(17,compute,wgpu::BufferBindingType::Storage {read_only:true}));
+    entries.push(pipelines::buffer_entry(18,compute,wgpu::BufferBindingType::Storage {read_only:true}));
     for e in &mut entries {
         e.visibility = compute;
     }
@@ -508,16 +508,16 @@ impl Volume {
         let table = &s.rays.as_ref().context("probes need the scene ray table")?.alpha;
         let lighting = &view.lighting;
         let binds = [0, 1].map(|write| {
-            let mut entries = pipelines::ray_globals(s, &lighting.uniform, objects, &lighting.lights, &lighting.cluster_config, &lighting.cluster_lights);
+            let mut entries = pipelines::ray_globals(s, &lighting.uniform, objects, &lighting.lights, &lighting.cluster_config, &lighting.cluster_lights, &lighting.analytic_light_tree);
             entries.extend([
-                entry(10, rays.tlas.as_binding()),
-                entry(11, table.as_entire_binding()),
-                entry(12, storage.traced.as_entire_binding()),
-                entry(13, storage.sums.as_entire_binding()),
-                entry(14, storage.irradiance[write].as_entire_binding()),
-                entry(15, storage.visibility[1].as_entire_binding()),
-                entry(17,rays.emitter_weights.as_ref().map_or(table,|weights|&weights.buffer).as_entire_binding()),
-                entry(16, wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                entry(11, rays.tlas.as_binding()),
+                entry(12, table.as_entire_binding()),
+                entry(13, storage.traced.as_entire_binding()),
+                entry(14, storage.sums.as_entire_binding()),
+                entry(15, storage.irradiance[write].as_entire_binding()),
+                entry(16, storage.visibility[1].as_entire_binding()),
+                entry(18,rays.emitter_weights.as_ref().map_or(table,|weights|&weights.buffer).as_entire_binding()),
+                entry(17, wgpu::BindingResource::Buffer(wgpu::BufferBinding {
                     buffer: &storage.batches, offset: 0, size: std::num::NonZeroU64::new(16),
                 })),
             ]);

@@ -18,7 +18,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Profile> {
     let tilt = lines
         .find(|line| line.trim().starts_with("TILT="))
         .context("IES missing TILT declaration")?;
-    ensure!(tilt.trim() == "TILT=NONE", "IES supports TILT=NONE only");
+    ensure!(tilt.trim() == "TILT=NONE", "IES supports TILT=NONE only; re-export the profile without a tilt table");
     let values = lines
         .collect::<Vec<_>>()
         .join("\n")
@@ -41,7 +41,7 @@ pub(crate) fn parse(bytes: &[u8]) -> Result<Profile> {
     };
     let nv = count(3)?;
     let nh = count(4)?;
-    ensure!(values[5] == 1., "IES supports Type C photometry only");
+    ensure!(values[5] == 1., "IES supports Type C photometry only; re-export the profile as LM-63 Type C");
     ensure!(values[2] >= 0., "negative IES candela multiplier");
     let size = nv.checked_mul(nh).context("IES table size overflow")?;
     ensure!(
@@ -146,7 +146,7 @@ mod tests {
     #[ignore="requires pinned Slang and Vulkan (lavapipe works)"]
     fn exact_knots_and_source_rotations_on_gpu() -> anyhow::Result<()> {
         use crate::*;
-        let Some(r)=crate::test_renderer()? else {return Ok(());};
+        let r = crate::test_renderer()?;
         let profile=super::parse(include_bytes!("../tests/fixtures/emitter-knot.ies"))?;
         let mut data=vec![0u32];data.extend(profile.words());
         let source=r#"

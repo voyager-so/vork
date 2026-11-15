@@ -4,6 +4,18 @@ use glam::Quat;
 use vork_scene::v2;
 mod exact;
 mod weights;
+mod clocks;
+mod sound;
+use clocks::ClockSpec;
+pub(crate) use clocks::{ClockNode, FootageClock};
+pub(crate) use sound::SoundPlan;
+use vork_time::exact::Germ;
+
+/// A clock-valued track: its keys are exact seconds or rates, not IEEE numbers.
+pub(super) fn is_clock_track(path: &[String]) -> bool {
+    matches!(path, [root, _, field] if root == "images" && field == "time")
+        || matches!(path, [.., time, speed] if time == "time" && speed == "speed")
+}
 
 fn hermite_basis<T>(u: T, one: T, two: T, three: T) -> [T; 4]
 where T: Clone + std::ops::Add<Output=T> + std::ops::Sub<Output=T> + std::ops::Mul<Output=T> {
@@ -115,7 +127,7 @@ impl Curve {
             Ok(angles)
         };
         let components = |value:&serde_json::Value| -> Result<Vec<f32>> {
-            if matches!(track.path.as_slice(),[root,_,field] if root=="images" && field=="time") {
+            if is_clock_track(&track.path) {
                 let value=value.as_array().filter(|v|v.len()==1).map_or(value,|v|&v[0]);
                 Ok(vec![serde_json::from_value::<vork_time::Clock>(value.clone())?.as_f32()])
             } else {components(value)}
@@ -144,7 +156,7 @@ impl Curve {
         width: usize,
     ) -> Result<Self> {
         let path = v2::display_path(&track.path);
-        let clock=matches!(track.path.as_slice(),[root,_,field] if root=="images" && field=="time");
+        let clock=is_clock_track(&track.path);
         ensure!(
             width > 0
                 && !times.is_empty()
@@ -204,9 +216,9 @@ pub(crate) enum Combine {
     /// Quaternions post-multiply: base × slerp(identity, sample, weight).
     Rotation,
 }
-/// Replace layers mix toward the sample (three.js AnimationMixer / NLA Replace);
+/// Replace layers mix toward the sample (Blender NLA Replace);
 /// additive layers follow Blender NLA Combine for the value's kind.
-pub(super) fn blend(base: &mut [f32], sample: &[f32], weight: f32, additive: bool, kind: Combine) {
+pub(crate) fn blend(base: &mut [f32], sample: &[f32], weight: f32, additive: bool, kind: Combine) {
     if kind == Combine::Rotation {
         let current = Quat::from_slice(base);
         let sampled = Quat::from_slice(sample).normalize();
@@ -313,9 +325,11 @@ pub(crate) enum Sample {
     Numeric(Vec<f32>),
     String(std::sync::Arc<str>),
     Bool(bool),
+    Style(std::sync::Arc<super::style::StyleValue>),
 }
 #[derive(Clone)]
 pub(crate) enum Channel {
+    Style(super::style::StyleTrack),
     Numeric(std::sync::Arc<Curve>),
     Discrete {
         times: Vec<f32>,
@@ -343,12 +357,32 @@ pub(crate) struct PropertyTrack {
     node_targets: Vec<NodeBinding>,
     material_targets: Option<Vec<usize>>,
 }
+/// How one track is read at one sample.
+struct TrackRead {
+    /// The key interval, when the track's keys are read exactly.
+    upper: Option<usize>,
+    /// The layer's exact local instant, for a channel that reads it.
+    exact_local: Option<Germ>,
+}
+impl CompiledLayer {
+    /// A looping layer's numeric local time, wrapped into its tracks' key span.
+    fn looped(&self, local: f32) -> f32 {
+        match self.span {
+            Some((a, b)) if self.source.looping && b > a => a + (local - a).rem_euclid(b - a),
+            _ => local,
+        }
+    }
+}
 #[derive(Clone)]
 pub(crate) struct CompiledLayer {
     pub source: v2::Layer,
     pub tracks: Vec<PropertyTrack>,
     span: Option<(f32, f32)>,
     time_span: Option<std::sync::Arc<exact::TimeSpan>>,
+    /// A node-owned layer: the owner's pre-order address (child indices from the root).
+    owner: Option<Vec<usize>>,
+    /// The owner's installed node index, bound by `mark_nodes`; sampled at its local time.
+    pub owner_node: Option<usize>,
 }
 /// One immutable ordered layer plan. glTF import appends channels to these layers.
 #[derive(Clone)]
@@ -369,6 +403,62 @@ pub(crate) struct Samples {
     layer_weights: Vec<f32>,
     pub render: Option<v2::Render>,
     material_values: Vec<Sample>,
+    /// Each node's local instant at this sample; `None` is an absent node (A7 rule 1).
+    pub clocks: Vec<Option<Germ>>,
+    /// Per track, how long the value it was last sampled to stands ([`Held`]). It is read from the track's keys
+    /// each time the track is sampled, and from nothing else.
+    held: Vec<Held>,
+    /// For a consumer that asked for it ([`Plan::samples_naming_changes`]): the tracks whose value or weight the
+    /// last sampling call changed, as flat track indices, ascending: that call's account of what changed. Each
+    /// sampling call starts it again. `None` for a consumer that reads every value it uses each time (the 3D
+    /// renderer, the sound mix): nothing is compared to make an account nobody reads.
+    changed: Option<Vec<u32>>,
+    /// Scratch for one numeric sample when changes are named: a track is sampled here, compared with the value it
+    /// holds, and copied into the track's own storage only when it differs. It grows to the widest track and is
+    /// never handed to one.
+    scratch: Vec<f32>,
+}
+impl Samples {
+    /// The tracks whose value or weight the last sampling call changed (flat track indices, ascending). A track
+    /// the call did not consume (weight zero before and after) is not among them: nothing reads its value.
+    /// Only samples made by [`Plan::samples_naming_changes`] have this account.
+    pub(crate) fn changed(&self) -> &[u32] {
+        self.changed.as_deref().expect("these samples were not asked to name what changes")
+    }
+}
+/// How long a track's sampled value stands, as its keys say at the time it was sampled. While it stands and the
+/// track's weight is the same, the track is not sampled and is not reported as changed.
+///
+/// Only spans where the sampler's own arithmetic returns the same bits are held: before the first key, after
+/// the last, and between the keys of a stepped track. Two equal keys joined by a line or a cubic are sampled:
+/// `a * (1 - u) + a * u` is not `a` for every `u`.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum Held {
+    /// Not sampled yet, or the value moves with time.
+    No,
+    /// It stands while the layer's local time is in `[from, until)`: the keys around the time it was sampled at.
+    Span { from: f32, until: f32 },
+    /// A track whose keys are compared exactly: it stands while the same number of keys are at or before the
+    /// layer's exact local time.
+    Key(usize),
+}
+impl Channel {
+    /// Whether the channel's value is the same at every time that has `upper` keys at or before it.
+    fn constant_at(&self, upper: usize) -> bool {
+        match self {
+            Channel::Numeric(curve) => curve.interpolation == Interpolation::Step || upper == 0 || upper >= curve.times.len(),
+            Channel::Style(track) => track.step || upper == 0 || upper >= track.times.len(),
+            Channel::Discrete { .. } => true,
+        }
+    }
+    /// The channel's key times.
+    fn times(&self) -> &[f32] {
+        match self {
+            Channel::Numeric(curve) => &curve.times,
+            Channel::Style(track) => &track.times,
+            Channel::Discrete { times, .. } => times,
+        }
+    }
 }
 #[derive(Clone, Default)]
 struct AssetBindings {
@@ -393,6 +483,20 @@ pub(crate) struct Plan {
     camera_tracks: bool,
     camera_weight_animation: bool,
     discrete_tracks: bool,
+    /// Node clocks (A7), one per installed node, bound by `mark_nodes`.
+    clocks: Vec<ClockSpec>,
+    clock_names: Vec<String>,
+    /// Flat index of each layer's first track, for clock-consumed tracks.
+    layer_starts: Vec<usize>,
+    has_clocks: bool,
+    /// Footage image -> the node whose clock selects its frames.
+    footage_owner: std::collections::BTreeMap<String, usize>,
+    /// Per flat track, the installed node it evaluates for; an absent node's tracks are not sampled.
+    subjects: Vec<Option<usize>>,
+    /// Compile-time tables keyed by pre-order node address, resolved in `mark_nodes`.
+    image_samplers: std::collections::BTreeMap<String, Vec<Vec<usize>>>,
+    images_with_time: std::collections::BTreeSet<String>,
+    source_lengths: std::collections::BTreeMap<Vec<usize>, vork_time::exact::Rational>,
 }
 impl Plan {
     /// Resolve host inputs after all imported channels and material bindings
@@ -439,6 +543,17 @@ impl Plan {
         base: &std::path::Path,
         workspace: Option<&std::collections::BTreeMap<String, crate::buffers::AttributeData>>,
     ) -> Result<Self> {
+        Self::compile_in(scene, base, workspace, &Default::default())
+    }
+    /// Compile within a document open: inferred spans come from the sources that open read
+    /// (`opened`), the same ones installation uses. [`Self::compile_with_buffers`] is a
+    /// compile on its own, reading the sources itself.
+    pub(crate) fn compile_in(
+        scene: &v2::Scene,
+        base: &std::path::Path,
+        workspace: Option<&std::collections::BTreeMap<String, crate::buffers::AttributeData>>,
+        opened: &crate::footage::Opened,
+    ) -> Result<Self> {
         use std::collections::HashMap;
         let names: HashMap<_, _> = scene
             .animation
@@ -449,16 +564,44 @@ impl Plan {
         let targets = scene.track_targets()?;
         let mut layers = Vec::new();
         for (source, targets) in scene.animation.iter().zip(targets) {
+            layers.push(Self::compile_layer(scene, base, workspace, &names, source, source.tracks.as_deref().unwrap_or(&[]), targets, None)?);
+        }
+        for owned in scene.node_owned_layers()? {
+            let source = v2::Layer {
+                source_span: None, source_clock_span: Vec::new(), name: owned.layer.name.clone(), tracks: None,
+                clip: owned.layer.clip.clone(), weight: owned.layer.weight, blend: owned.layer.blend,
+                offset: owned.layer.offset, speed: owned.layer.speed, looping: owned.layer.looping,
+            };
+            layers.push(Self::compile_layer(scene, base, workspace, &names, &source, owned.layer.tracks.as_deref().unwrap_or(&[]), owned.targets, Some(owned.path))?);
+        }
+        let (image_samplers, images_with_time, source_lengths) = clocks::scene_tables(scene, base, opened)?;
+        Self::finish_compile(layers, image_samplers, images_with_time, source_lengths)
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn compile_layer(
+        scene: &v2::Scene,
+        base: &std::path::Path,
+        workspace: Option<&std::collections::BTreeMap<String, crate::buffers::AttributeData>>,
+        names: &std::collections::HashMap<&str, usize>,
+        source: &v2::Layer,
+        source_tracks: &[v2::Track],
+        targets: Vec<v2::TrackTarget>,
+        owner: Option<Vec<usize>>,
+    ) -> Result<CompiledLayer> {
+        {
             ensure!(
                 source.weight.is_finite() && source.offset.is_finite() && source.speed.is_finite(),
                 "layer weight, offset and speed must be finite"
             );
             let mut tracks = Vec::new();
             let mut span: Option<(f32, f32)> = source.source_span;
-            let time_slice = targets.iter().any(|target| matches!(target, v2::TrackTarget::ImageTime {..} | v2::TrackTarget::Render(v2::RenderProperty::Camera)))
-                || source.tracks.iter().flatten().any(|track| matches!(track.interpolation, v2::Interpolation::Step) || matches!(&track.values,v2::Values::Inline(values) if values.first().is_some_and(|v| v.is_boolean() || v.is_string())));
+            let time_slice = targets.iter().zip(source_tracks).any(|(target,track)| matches!(target, v2::TrackTarget::ImageTime {..} | v2::TrackTarget::Render(v2::RenderProperty::Camera)) || target.is_speed()
+                || target.style_interpolation().is_some_and(|kind| matches!(&track.values,v2::Values::Inline(values)
+                    if !((matches!(kind,v2::StyleInterpolation::Number | v2::StyleInterpolation::FontWeight) && values.iter().all(|v|v.is_number()))
+                    || (kind==v2::StyleInterpolation::Paint && values.first().is_some_and(|v|v.is_array()))))))
+                || source_tracks.iter().any(|track| matches!(track.interpolation, v2::Interpolation::Step) || matches!(&track.values,v2::Values::Inline(values) if values.first().is_some_and(|v| v.is_boolean() || v.is_string())));
             let mut clock_endpoints=if time_slice {source.source_clock_span.clone()}else{Vec::new()};
-            for (track, target) in source.tracks.iter().flatten().zip(targets) {
+            for (track, target) in source_tracks.iter().zip(targets) {
                 use v2::{NodeProperty, TrackTarget};
                 let rotation = matches!(
                     target,
@@ -467,6 +610,9 @@ impl Plan {
                         ..
                     } | TrackTarget::Imported {
                         property: NodeProperty::Rotation,
+                        ..
+                    } | TrackTarget::Text {
+                        property: v2::UnitProperty::Rotation,
                         ..
                     }
                 );
@@ -478,7 +624,7 @@ impl Plan {
                         times
                     }
                 };
-                if matches!(target,TrackTarget::ImageTime {..}|TrackTarget::Render(v2::RenderProperty::Camera)) || matches!(track.interpolation,v2::Interpolation::Step) {
+                if matches!(target,TrackTarget::ImageTime {..}|TrackTarget::Render(v2::RenderProperty::Camera)) || target.is_speed() || matches!(track.interpolation,v2::Interpolation::Step) {
                     exact::times(track,&times)?;
                 } else {
                 ensure!(
@@ -499,6 +645,21 @@ impl Plan {
                     None
                 };
                 let channel = match &track.values {
+                    v2::Values::Inline(values) if target.style_interpolation().is_some()
+                        && !(matches!(target.style_interpolation(), Some(v2::StyleInterpolation::Number | v2::StyleInterpolation::FontWeight)) && values.iter().all(|v|v.is_number()))
+                        && !(matches!(target.style_interpolation(), Some(v2::StyleInterpolation::Paint)) && values.first().is_some_and(|v|v.is_array())) => {
+                        let kind=target.style_interpolation().unwrap();
+                        if kind==v2::StyleInterpolation::Paint && !matches!(track.interpolation,v2::Interpolation::Step) {
+                            for pair in values.windows(2) {if let (Some(a),Some(b))=(pair[0].as_str(),pair[1].as_str()) {
+                                if a.contains("gradient(") && b.contains("gradient(") {crate::canvas_draw::interpolate_gradient(a,b,0.5,[0.,0.,100.,100.])?;}
+                            }}
+                        }
+
+                        let values=values.iter().map(|v|super::style::StyleValue::parse(kind,v).map(std::sync::Arc::new)).collect::<Result<Vec<_>>>()?;
+                        let step=matches!(track.interpolation,v2::Interpolation::Step);
+                        let clocks=(!step && values.windows(2).any(|p|p[0].discrete_with(&p[1],kind))).then(||exact::raw_times(track,&times)).transpose()?;
+                        Channel::Style(super::style::StyleTrack {times:times.clone(),kind,step,values,clocks})
+                    }
                     v2::Values::Inline(values)
                         if !matches!(target,TrackTarget::ImageTime {..}) && values
                             .first()
@@ -548,11 +709,12 @@ impl Plan {
                     let times=exact::raw_times(track,&times)?;
                     clock_endpoints.extend([times.first().unwrap().clone(),times.last().unwrap().clone()]);
                 }
-                let time_curve = if matches!(target, TrackTarget::ImageTime {..}) {
+                let time_curve = if matches!(target, TrackTarget::ImageTime {..}) || target.is_speed() {
                     let Channel::Numeric(curve) = &channel else { anyhow::bail!("image time needs a scalar track") };
                     Some(std::sync::Arc::new(exact::DeferredTimeCurve::new(track,curve.clone())))
                 } else { None };
-                let discrete_keys = (!matches!(target, TrackTarget::ImageTime {..}|TrackTarget::Render(v2::RenderProperty::Camera)) && match &channel {
+                let discrete_keys = (!matches!(target, TrackTarget::ImageTime {..}|TrackTarget::Render(v2::RenderProperty::Camera)) && !target.is_speed() && match &channel {
+                    Channel::Style(track) => track.step || track.clocks.is_some(),
                     Channel::Discrete {..} => true,
                     Channel::Numeric(curve) => curve.interpolation == Interpolation::Step,
                 }).then(|| exact::raw_times(track,&times).map(exact::DiscreteKeys::new).map(std::sync::Arc::new)).transpose()?;
@@ -569,7 +731,7 @@ impl Plan {
                     material_targets: None,
                 });
             }
-            layers.push(CompiledLayer {
+            Ok(CompiledLayer {
                 source: v2::Layer {
                     source_span: source.source_span,
                     source_clock_span: source.source_clock_span.clone(),
@@ -585,8 +747,17 @@ impl Plan {
                 tracks,
                 span,
                 time_span: time_slice.then(||std::sync::Arc::new(exact::TimeSpan::new(clock_endpoints))),
-            });
+                owner,
+                owner_node: None,
+            })
         }
+    }
+    fn finish_compile(
+        layers: Vec<CompiledLayer>,
+        image_samplers: std::collections::BTreeMap<String, Vec<Vec<usize>>>,
+        images_with_time: std::collections::BTreeSet<String>,
+        source_lengths: std::collections::BTreeMap<Vec<usize>, vork_time::exact::Rational>,
+    ) -> Result<Self> {
         let discrete_tracks=layers.iter().flat_map(|layer|&layer.tracks).any(|track|track.discrete_keys.is_some());
         let camera_tracks=layers.iter().flat_map(|layer|&layer.tracks).any(|track|track.camera_keys.is_some());
         let mut needed:std::collections::BTreeSet<_>=layers.iter().enumerate().filter(|(_,layer)|layer.tracks.iter().any(|t|t.camera_keys.is_some())).map(|(i,_)|i).collect();
@@ -610,7 +781,20 @@ impl Plan {
             material_bindings: vec![],
             material_offsets: vec![],
             cameras: Default::default(),
+            clocks: vec![],
+            clock_names: vec![],
+            layer_starts: vec![],
+            has_clocks: false,
+            footage_owner: Default::default(),
+            subjects: vec![],
+            image_samplers,
+            images_with_time,
+            source_lengths,
         })
+    }
+    fn refresh_layer_starts(&mut self) {
+        let mut start = 0;
+        self.layer_starts = self.layers.iter().map(|layer| { let s = start; start += layer.tracks.len(); s }).collect();
     }
     /// Clip declarations retain their global layer indices in the compiled plan.
     pub fn clips_for_asset<'a>(
@@ -791,6 +975,7 @@ impl Plan {
                 index += 1;
             }
         }
+        self.refresh_layer_starts();
         Ok(())
     }
     /// Content identity includes decoded buffer-backed keys, not their file names.
@@ -808,6 +993,7 @@ impl Plan {
             for track in layer.tracks.iter().filter(relevant) {
                 hash.update(track.target.as_ref().map(ToString::to_string).unwrap_or_default().as_bytes());
                 match &track.channel {
+                    Channel::Style(_) => unreachable!("style is not a material input"),
                     Channel::Numeric(curve) => {
                         hash.update(&[match curve.interpolation {Interpolation::Step=>0,Interpolation::Linear=>1,Interpolation::Cubic=>2}]);
                         hash.update(bytemuck::cast_slice(&curve.times));
@@ -943,6 +1129,7 @@ impl Plan {
                 .iter()
                 .flat_map(|l| &l.tracks)
                 .map(|track| match &track.channel {
+                    Channel::Style(track) => Sample::Style(track.values[0].clone()),
                     Channel::Numeric(curve) => Sample::Numeric(vec![0.; curve.width]),
                     Channel::Discrete { values, .. } => values[0].clone(),
                 })
@@ -955,9 +1142,57 @@ impl Plan {
                 .iter()
                 .map(|b| b.default.clone())
                 .collect(),
+            clocks: vec![None; self.clocks.len()],
+            held: vec![Held::No; self.layers.iter().map(|l| l.tracks.len()).sum()],
+            changed: None,
+            scratch: Vec::new(),
         }
     }
+    /// Samples that also name, after each sampling call, the tracks it changed ([`Samples::changed`]): for a
+    /// consumer that works only on what changed (the 2D canvas). Holding a constant track is the same for every
+    /// consumer; naming costs a comparison of each sampled value with the one it replaces.
+    pub(crate) fn samples_naming_changes(&self) -> Samples {
+        Samples { changed: Some(Vec::new()), ..self.samples() }
+    }
     pub fn has_discrete_tracks(&self)->bool {self.discrete_tracks}
+    /// Every authored track's sampled value after `sample_into`, in layer then track order: its target,
+    /// value, effective weight and whether its layer combines (additive). The 2D canvas applies these
+    /// to its own nodes.
+    pub(crate) fn sampled<'a>(&'a self, samples: &'a Samples) -> impl Iterator<Item = (&'a v2::TrackTarget, &'a Sample, f32, bool)> + 'a {
+        self.layers.iter().flat_map(|layer| layer.tracks.iter().map(move |track| (layer, track))).enumerate()
+            .filter_map(move |(index, (layer, track))| {
+                let target = track.target.as_ref()?;
+                Some((target, &samples.values[index], samples.weights[index], matches!(layer.source.blend, v2::Blend::Add)))
+            })
+    }
+    /// The track at flat index `index` as [`Plan::sampled`] yields it; `None` for a track without an authored
+    /// target. Flat indices are what [`Samples::changed`] names.
+    pub(crate) fn sampled_at<'a>(&'a self, samples: &'a Samples, index: usize) -> Option<(&'a v2::TrackTarget, &'a Sample, f32, bool)> {
+        let layer_index = self.layer_of(index);
+        let layer = self.layers.get(layer_index)?;
+        let track = layer.tracks.get(index.checked_sub(*self.layer_starts.get(layer_index)?)?)?;
+        Some((track.target.as_ref()?, &samples.values[index], samples.weights[index], matches!(layer.source.blend, v2::Blend::Add)))
+    }
+    /// How many tracks the plan samples, authored or imported: one more than the largest flat index.
+    pub(crate) fn track_count(&self) -> usize {
+        self.layers.iter().map(|layer| layer.tracks.len()).sum()
+    }
+    /// Per sampled track, in [`Plan::sampled`] order: the one paint form every value it can take has (numeric
+    /// channels are colours; a CSS paint track's keys must all be colours, or gradients of one form).
+    pub(crate) fn sampled_paint_forms(&self) -> impl Iterator<Item = Option<crate::canvas_draw::PaintForm>> + '_ {
+        self.layers.iter().flat_map(|layer| layer.tracks.iter()).filter(|track| track.target.is_some()).map(|track| match &track.channel {
+            Channel::Numeric(_) => Some(crate::canvas_draw::PaintForm::Solid),
+            Channel::Style(style) => {
+                let mut forms = style.values.iter().map(|value| match value.as_ref() {
+                    super::style::StyleValue::Paint(paint) => paint.form(),
+                    _ => None,
+                });
+                let first = forms.next().flatten()?;
+                forms.all(|form| form.as_ref() == Some(&first)).then_some(first)
+            }
+            _ => None,
+        })
+    }
     pub fn sample_into(&self, time: f32, samples: &mut Samples) {
         self.sample_into_where(time, samples, |_| true);
     }
@@ -987,80 +1222,216 @@ impl Plan {
         {
             value.clone_from(&binding.default);
         }
-        for (weight, layer) in samples.layer_weights.iter_mut().zip(&self.layers) {
-            *weight = layer.source.weight;
+        self.start_sample(samples, 0..self.layers.len());
+        if self.has_clocks {
+            let scene = match request { Some(request) => request.exact()?, None => Germ::point(vork_time::exact::ieee(time)?) };
+            samples.clocks = self.clocks(&scene)?;
         }
         let mut index = 0;
         let mut exact_request = None;
         for (layer_index, layer) in self.layers.iter().enumerate() {
-            let weight = samples.layer_weights[layer_index];
-            let mut local = layer.source.offset + time * layer.source.speed;
-            if layer.source.looping {
-                if let Some((a, b)) = layer.span {
-                    if b > a {
-                        local = a + (local - a).rem_euclid(b - a);
-                    }
-                }
-            }
-            let mut exact_local = None;
-            let additive = matches!(layer.source.blend, v2::Blend::Add);
-            for track in &layer.tracks {
-                let weight = if track.weight_target.is_some() || wanted(track) {
-                    weight
-                } else {
-                    0.
-                };
-                samples.weights[index] = weight;
-                if weight != 0. {
-                    let upper = if let (Some(request),Some(keys)) = (request,track.discrete_keys.as_ref()) {
-                        if exact_request.is_none() {exact_request=Some(request.exact()?);}
-                        if exact_local.is_none() {exact_local=Some(layer.exact_local(exact_request.as_ref().unwrap())?);}
-                        Some(keys.upper(exact_local.as_ref().unwrap()))
-                    } else {None};
-                    match &track.channel {
-                        Channel::Numeric(curve) => {
-                            let Sample::Numeric(value) = &mut samples.values[index] else {
-                                unreachable!()
-                            };
-                            if track.time_curve.is_none() {
-                                if let Some(upper)=upper {curve.sample_interval(local,upper,value);}
-                                else {curve.sample(local, value);}
+            // A node-owned layer runs on its owner's clock, retimed by its own offset, speed and loop.
+            let mut exact_local = match layer.owner_node.and_then(|owner| samples.clocks.get(owner).cloned().flatten()) {
+                Some(instant) => Some(layer.exact_local(&instant)?),
+                None => None,
+            };
+            let owner_local = exact_local.as_ref().map(|local| local.numeric()).transpose()?;
+            let count = layer.tracks.len();
+            self.sample_layer(layer_index, index, time, owner_local, (index..index + count).map(|flat| (flat, ())), |samples, flat, track, ()| {
+                // Rule 1: a track on an absent node, or inside an absent subtree, is not evaluated.
+                let absent = self.subjects.get(flat).copied().flatten().is_some_and(|node| self.absent(samples, node));
+                if absent || !(track.weight_target.is_some() || wanted(track)) { return Ok(None); }
+                let upper = match track.discrete_keys.as_ref() {
+                    Some(keys) => {
+                        if exact_local.is_none() {
+                            if let Some(request) = request {
+                                if exact_request.is_none() {exact_request=Some(request.exact()?);}
+                                exact_local=Some(layer.exact_local(exact_request.as_ref().unwrap())?);
                             }
                         }
-                        Channel::Discrete { times, values } => {
-                            if track.camera_keys.is_none() {samples.values[index] = values
-                                [upper.unwrap_or_else(||times.partition_point(|t| *t <= local)).saturating_sub(1)]
-                            .clone();}
-                        }
+                        exact_local.as_ref().map(|local| keys.upper(local))
                     }
-                    if let Some(value) = live.as_ref().and_then(|values| values.values.get(&index)) {
-                        let Sample::Numeric(sample) = &mut samples.values[index] else { unreachable!() };
-                        sample.clone_from(value);
+                    None => None,
+                };
+                // Only a style channel reads the exact instant itself.
+                let exact_local = if matches!(track.channel, Channel::Style(_)) { exact_local.clone() } else { None };
+                Ok(Some(TrackRead { upper, exact_local }))
+            }, samples, live.as_deref())?;
+            index += count;
+        }
+        Ok(())
+    }
+    /// The start of one sample, for pictures and for sound: layer weights start at their authored values (weight
+    /// tracks then key them), and the account of which tracks changed ([`Samples::changed`]) starts again.
+    fn start_sample(&self, samples: &mut Samples, layers: impl IntoIterator<Item = usize>) {
+        for layer in layers { samples.layer_weights[layer] = self.layers[layer].source.weight; }
+        if let Some(changed) = &mut samples.changed { changed.clear(); }
+    }
+    /// One layer at one sample: what a layer does with its clock, its weight and its tracks,
+    /// for pictures and for sound. `first` is the flat index of the layer's first track and
+    /// `tracks` the flat indices to evaluate, in order, each with whatever `read` needs.
+    /// A scene layer reads the sample's `time`; a node-owned layer reads `owner_local`, its
+    /// owner's instant as the layer's numeric local time, and with an absent owner (`None`)
+    /// evaluates nothing. `read` says how a track is read, or `None` when it is not evaluated
+    /// (its node is absent, or the caller does not consume it).
+    #[allow(clippy::too_many_arguments)]
+    fn sample_layer<T>(
+        &self,
+        layer_index: usize,
+        first: usize,
+        time: f32,
+        owner_local: Option<f32>,
+        tracks: impl IntoIterator<Item = (usize, T)>,
+        mut read: impl FnMut(&Samples, usize, &PropertyTrack, T) -> Result<Option<TrackRead>>,
+        samples: &mut Samples,
+        live: Option<&LiveValues>,
+    ) -> Result<()> {
+        let layer = &self.layers[layer_index];
+        let weight = samples.layer_weights[layer_index];
+        let local = match layer.owner_node {
+            Some(_) => owner_local,
+            None => Some(layer.source.offset + time * layer.source.speed),
+        }.map(|local| layer.looped(local));
+        let additive = matches!(layer.source.blend, v2::Blend::Add);
+        for (index, given) in tracks {
+            let track = &layer.tracks[index - first];
+            let read = match local {
+                Some(_) if weight != 0. => read(&*samples, index, track, given)?,
+                _ => None,
+            };
+            match (local, read) {
+                (Some(local), Some(read)) => self.sample_track(index, track, local, read.upper, read.exact_local.as_ref(), weight, additive, samples, live),
+                _ => {
+                    // A track that is no longer consumed changed: its weight went to zero.
+                    if samples.weights[index].to_bits() != 0f32.to_bits() {
+                        if let Some(named) = &mut samples.changed { named.push(index as u32); }
                     }
-                    for &target in track.material_targets.iter().flatten() {
-                        blend_sample(
-                            &mut samples.material_values[target],
-                            &samples.values[index],
-                            weight,
-                            additive,
-                        );
-                    }
-                    if let Some(target) = track.weight_target {
-                        if let Sample::Numeric(value) = &samples.values[index] {
-                            blend(
-                                std::slice::from_mut(&mut samples.layer_weights[target]),
-                                value,
-                                weight,
-                                additive,
-                                Combine::Add,
-                            );
-                        }
-                    }
+                    samples.weights[index] = 0.;
                 }
-                index += 1;
             }
         }
         Ok(())
+    }
+    /// One track at its layer's local time, with the weight its layer and its node's presence
+    /// give it: the channel's value (inside key interval `upper` when its keys are read exactly),
+    /// then the material inputs and the layer weight it keys. Pictures and sound both sample here.
+    ///
+    /// The track is sampled when its weight changed or the value it holds no longer stands ([`Held`]): a track
+    /// past its last key, before its first, or between the keys of a step is left as it is and costs one
+    /// comparison. It is named in [`Samples::changed`] when its weight changed or its new value differs from the
+    /// one it held. What a sample sums afresh from every weighted track (material inputs, layer weights) is
+    /// summed from each of them, with the value it holds.
+    #[allow(clippy::too_many_arguments)]
+    fn sample_track(
+        &self,
+        index: usize,
+        track: &PropertyTrack,
+        local: f32,
+        upper: Option<usize>,
+        exact_local: Option<&Germ>,
+        weight: f32,
+        additive: bool,
+        samples: &mut Samples,
+        live: Option<&LiveValues>,
+    ) {
+        let mut changed = samples.weights[index].to_bits() != weight.to_bits();
+        samples.weights[index] = weight;
+        if weight == 0. {
+            if changed { if let Some(named) = &mut samples.changed { named.push(index as u32); } }
+            return;
+        }
+        // An image's time and a clock's speed are read from their curves by the clocks, and a camera cut from
+        // its exact keys: no value is written here for them.
+        let keyed = match &track.channel {
+            Channel::Numeric(_) => track.time_curve.is_none(),
+            Channel::Discrete { .. } => track.camera_keys.is_none(),
+            Channel::Style(_) => true,
+        };
+        if let Some(value) = live.and_then(|values| values.values.get(&index)) {
+            // A published live value stands in for the track's keys.
+            let Sample::Numeric(sample) = &mut samples.values[index] else { unreachable!() };
+            if sample.len() != value.len() || sample.iter().zip(value).any(|(a, b)| a.to_bits() != b.to_bits()) {
+                sample.clone_from(value);
+                changed = true;
+            }
+            samples.held[index] = Held::No;
+        } else if keyed {
+            // The value stands when the weight does and the time is still where the keys said the value is
+            // constant.
+            let stands = !changed && match (samples.held[index], upper) {
+                (Held::Key(held), Some(upper)) => held == upper,
+                (Held::Span { from, until }, None) => from <= local && local < until,
+                _ => false,
+            };
+            if !stands {
+                let times = track.channel.times();
+                let exact = upper.is_some();
+                let upper = upper.unwrap_or_else(|| times.partition_point(|t| *t <= local));
+                match &track.channel {
+                    Channel::Style(style) => {
+                        let value = style.sample(local, Some(upper), exact_local);
+                        let Sample::Style(held) = &mut samples.values[index] else { unreachable!() };
+                        if samples.changed.is_some() && !std::sync::Arc::ptr_eq(held, &value) && **held != *value { changed = true; }
+                        *held = value;
+                    }
+                    Channel::Numeric(curve) => {
+                        let Sample::Numeric(value) = &mut samples.values[index] else {
+                            unreachable!()
+                        };
+                        // Into the scratch, then into the track's own storage when it differs: each track
+                        // keeps the allocation it was given, of its own width.
+                        if samples.changed.is_some() {
+                            curve.sample_interval(local, upper, &mut samples.scratch);
+                            if value.len() != samples.scratch.len() || value.iter().zip(&samples.scratch).any(|(a, b)| a.to_bits() != b.to_bits()) {
+                                value.clear();
+                                value.extend_from_slice(&samples.scratch);
+                                changed = true;
+                            }
+                        } else {
+                            // Nobody reads this consumer's account: the value is sampled where it is kept.
+                            curve.sample_interval(local, upper, value);
+                        }
+                    }
+                    Channel::Discrete { values, .. } => {
+                        let value = &values[upper.saturating_sub(1)];
+                        if samples.values[index] != *value {
+                            samples.values[index] = value.clone();
+                            changed = true;
+                        }
+                    }
+                }
+                samples.held[index] = if !track.channel.constant_at(upper) {
+                    Held::No
+                } else if exact {
+                    Held::Key(upper)
+                } else {
+                    Held::Span {
+                        from: upper.checked_sub(1).map_or(f32::NEG_INFINITY, |key| times[key]),
+                        until: times.get(upper).copied().unwrap_or(f32::INFINITY),
+                    }
+                };
+            }
+        }
+        for &target in track.material_targets.iter().flatten() {
+            blend_sample(
+                &mut samples.material_values[target],
+                &samples.values[index],
+                weight,
+                additive,
+            );
+        }
+        if let Some(target) = track.weight_target {
+            if let Sample::Numeric(value) = &samples.values[index] {
+                blend(
+                    std::slice::from_mut(&mut samples.layer_weights[target]),
+                    value,
+                    weight,
+                    additive,
+                    Combine::Add,
+                );
+            }
+        }
+        if changed { if let Some(named) = &mut samples.changed { named.push(index as u32); } }
     }
     pub fn apply_asset_visibility(&self, asset: usize, samples: &Samples, visibility: &mut [v2::Visibility]) {
         let Some(bindings) = self.asset_bindings.get(asset) else { return; };
@@ -1129,6 +1500,12 @@ impl Plan {
                     }
                 }
                 index += 1;
+            }
+        }
+        // Rule 1: an absent node has no picture and lights nothing, its subtree included.
+        for (node, spec) in self.clocks.iter().enumerate() {
+            if spec.gated && wanted(node) && samples.clocks.get(node).is_some_and(Option::is_none) {
+                if let Some(value) = values[node].as_mut() { value.node.visibility.visible = false; }
             }
         }
     }
@@ -1226,6 +1603,67 @@ mod live_tests {
         Ok(())
     }
 }
+#[cfg(test)]
+mod held_tests {
+    use super::*;
+    /// Equal to the bit, for numeric samples.
+    fn same_bits(a: &Sample, b: &Sample) -> bool {
+        match (a, b) {
+            (Sample::Numeric(a), Sample::Numeric(b)) => a.len() == b.len() && a.iter().zip(b).all(|(a, b)| a.to_bits() == b.to_bits()),
+            _ => a == b,
+        }
+    }
+    /// Sampling with holds equals sampling everything, and the tracks it names are exactly those whose value or
+    /// weight differs from the call before: before the first key, after the last and between step keys a track
+    /// is not named; on a ramp it is.
+    #[test]
+    fn a_constant_track_is_not_named_and_the_values_equal_a_fresh_sampling() -> Result<()> {
+        let scene = v2::Scene::from_json(br#"{"version":2,"nodes":[{"type":"camera","name":"camera"}],
+            "animation":[
+                {"tracks":[
+                    {"path":["nodes","camera","translation"],"keys":[[1,[0,0,0]],[2,[10,10,10]]]},
+                    {"path":["nodes","camera","scale"],"keys":[[0,[1,1,1]],[1,[2,2,2]],[2,[3,3,3]]],"interpolation":"STEP"},
+                    {"path":["animation","late","weight"],"keys":[[0,0],[3,0],[3.5,1]]}]},
+                {"name":"late","weight":0,"tracks":[
+                    {"path":["nodes","camera","translation"],"keys":[[0,[5,5,5]],[1,[5,5,5]]]}]}]}"#)?;
+        let plan = Plan::compile(&scene, std::path::Path::new("."))?;
+        let mut samples = plan.samples_naming_changes();
+        // The same sampling for a consumer that asks for no account: the same holds, the same values.
+        let mut unnamed = plan.samples();
+        let mut named = Vec::new();
+        for time in [0., 0.5, 0.75, 1., 1.5, 1.75, 2., 2.5, 3., 3.25, 3.5, 4., 1.5, 1.5] {
+            let before = (samples.values.clone(), samples.weights.clone());
+            plan.sample_into(time, &mut samples);
+            plan.sample_into(time, &mut unnamed);
+            // A sampling that holds nothing: the same plan from fresh samples.
+            let mut fresh = plan.samples();
+            plan.sample_into(time, &mut fresh);
+            for index in 0..samples.values.len() {
+                assert_eq!(samples.weights[index].to_bits(), fresh.weights[index].to_bits(), "weight of track {index} at {time}");
+                assert_eq!(unnamed.weights[index].to_bits(), fresh.weights[index].to_bits(), "unnamed weight of track {index} at {time}");
+                if samples.weights[index] != 0. {
+                    assert!(same_bits(&samples.values[index], &fresh.values[index]), "track {index} at {time}");
+                    assert!(same_bits(&unnamed.values[index], &fresh.values[index]), "unnamed track {index} at {time}");
+                }
+            }
+            let differs: Vec<u32> = (0..samples.values.len())
+                .filter(|&index| before.1[index].to_bits() != samples.weights[index].to_bits()
+                    || (samples.weights[index] != 0. && !same_bits(&before.0[index], &samples.values[index])))
+                .map(|index| index as u32).collect();
+            assert_eq!(samples.changed(), differs, "at {time}");
+            named.push(samples.changed().to_vec());
+        }
+        // The ramp is named while it ramps (1 to 2); the step when a key is crossed; the weight track on its ramp,
+        // with the track it drives.
+        assert_eq!(named[1], Vec::<u32>::new(), "nothing moves before the ramp's first key");
+        assert_eq!(named[4], vec![0], "only the ramp moves at 1.5");
+        assert_eq!(named[7], Vec::<u32>::new(), "everything stands after the last keys");
+        assert_eq!(named[9], vec![2, 3], "the weight ramps and the layer it drives arrives");
+        assert_eq!(named[13], Vec::<u32>::new(), "the same time again changes nothing");
+        Ok(())
+    }
+}
+
 pub(super) fn numeric_buffer(
     scene: &v2::Scene,
     name: &str,
@@ -1285,9 +1723,24 @@ impl Plan {
             .filter(|(_, n)| !n.node.name.is_empty())
             .map(|(i, n)| (n.node.name.clone(), i))
             .collect();
+        self.bind_clocks(nodes)?;
+        let mut flat = 0;
         for layer in &mut self.layers {
             for track in &mut layer.tracks {
+                let flat_index = flat;
+                flat += 1;
                 if track.weight_target.is_some() {
+                    continue;
+                }
+                if let Some(v2::TrackTarget::Node { node, property: property @ (v2::NodeProperty::Active | v2::NodeProperty::Speed) }) = &track.target {
+                    // Read by the owning clock, never blended into the node's values.
+                    let index = *by_name.get(node).with_context(|| format!("unknown track node {node}"))?;
+                    match property {
+                        v2::NodeProperty::Active => { self.clocks[index].active_track = Some(flat_index); self.clocks[index].gated = true; }
+                        _ => self.clocks[index].speed_track = Some(flat_index),
+                    }
+                    self.has_clocks = true;
+                    nodes[index].dynamic = true;
                     continue;
                 }
                 let path = || {
@@ -1310,6 +1763,8 @@ impl Plan {
                         continue;
                     }
                     Some(v2::TrackTarget::LayerWeight { .. } | v2::TrackTarget::ImageTime { .. }) => continue,
+                    // Text tracks belong to a 2D canvas, which installs no 3D scene (canvas.rs applies them).
+                    Some(v2::TrackTarget::Text { .. }) => anyhow::bail!("{}: a 2D text track in a 3D scene", path()),
                     Some(v2::TrackTarget::Render(property)) => {
                         use v2::RenderProperty as R;
                         if *property == R::Camera {
@@ -1367,9 +1822,58 @@ impl Plan {
         }
         for i in 0..nodes.len() {
             nodes[i].dynamic |= nodes[i].parent.is_some_and(|p| nodes[p].dynamic);
+            // Existence is inherited: a gated ancestor gates the subtree.
+            if nodes[i].parent.is_some_and(|p| self.clocks[p].gated) { self.clocks[i].gated = true; }
         }
-
+        for i in 0..nodes.len() {
+            if self.clocks[i].gated {
+                let binding = NodeBinding { node: i, property: v2::NodeProperty::Visibility(v2::Ray::All), base: Sample::Bool(nodes[i].node.visibility.visible) };
+                if !self.reset_bindings.iter().any(|b| b.node == i && b.property == binding.property) { self.reset_bindings.push(binding); }
+            }
+        }
+        self.refresh_layer_starts();
+        self.subjects = self.layers.iter().flat_map(|layer| layer.tracks.iter().map(move |track| (layer, track)))
+            .map(|(layer, track)| match &track.target {
+                Some(v2::TrackTarget::Node { node, .. } | v2::TrackTarget::Imported { asset: node, .. }) => by_name.get(node).copied(),
+                None => layer.source.clip.as_ref().and_then(|clip| by_name.get(&clip.target).copied()),
+                Some(_) => None,
+            })
+            .collect();
         let _=default_camera;
+        Ok(())
+    }
+    /// The 2D canvas's binding (§8): its nodes' clocks, the parent- or scene-owned tracks that key a node's
+    /// `active` or `time.speed`, and each track's subject, so a track on an absent node is not evaluated. The
+    /// canvas applies the other tracks' values to its own nodes (`sampled`).
+    pub(crate) fn mark_canvas_nodes<N: ClockNode>(&mut self, nodes: &mut [N]) -> Result<()> {
+        self.bind_clocks(nodes)?;
+        let by_name: std::collections::HashMap<&str, usize> = nodes.iter().enumerate()
+            .filter(|(_, n)| !n.node().name.is_empty()).map(|(i, n)| (n.node().name.as_str(), i)).collect();
+        let mut flat = 0;
+        for layer in &mut self.layers {
+            for track in &mut layer.tracks {
+                let flat_index = flat;
+                flat += 1;
+                if let Some(v2::TrackTarget::Node { node, property: property @ (v2::NodeProperty::Active | v2::NodeProperty::Speed) }) = &track.target {
+                    let index = *by_name.get(node.as_str()).with_context(|| format!("unknown track node {node}"))?;
+                    match property {
+                        v2::NodeProperty::Active => { self.clocks[index].active_track = Some(flat_index); self.clocks[index].gated = true; }
+                        _ => self.clocks[index].speed_track = Some(flat_index),
+                    }
+                    self.has_clocks = true;
+                }
+            }
+        }
+        for i in 0..nodes.len() {
+            if nodes[i].parent().is_some_and(|p| self.clocks[p].gated) { self.clocks[i].gated = true; }
+        }
+        self.refresh_layer_starts();
+        self.subjects = self.layers.iter().flat_map(|layer| layer.tracks.iter())
+            .map(|track| match &track.target {
+                Some(v2::TrackTarget::Node { node, .. } | v2::TrackTarget::Text { node, .. }) => by_name.get(node.as_str()).copied(),
+                _ => None,
+            })
+            .collect();
         Ok(())
     }
     pub fn camera_at(&self, time: f32, fallback: usize) -> usize {
@@ -1444,6 +1948,10 @@ fn node_numeric(
         }};
     }
     match (&mut node.kind, property) {
+        (_, P::AudioGain) => match &mut node.audio {
+            Some(audio) => scalar!(&mut audio.gain),
+            None => false,
+        },
         (_, P::Translation) => {
             apply(&mut node.transform.translation, Combine::Add);
             true
@@ -1663,14 +2171,14 @@ mod camera_cut_tests {
                 "path":["nodes","a","visible"],"keys":[[0,false],[1,true]],"interpolation":interpolation
             }]}])).is_err());
         }
-        assert!(plan(serde_json::json!([{"blend":"add","tracks":[{
+        assert!(plan(serde_json::json!([{"blend":"combine","tracks":[{
             "path":["nodes","a","visible"],"keys":[[0,false],[1,true]]
         }]}])).is_err());
         Ok(())
     }
     #[test]
     fn additive_boolean_tracks_fail_validation() {
-        assert!(plan(serde_json::json!([{"blend":"add","tracks":[{
+        assert!(plan(serde_json::json!([{"blend":"combine","tracks":[{
             "path":["nodes","a","visible_camera"],"keys":[[0,true],[1,false]],"interpolation":"STEP"
         }]}])).is_err());
     }
@@ -1802,7 +2310,7 @@ mod envelope_tests {
     fn cubic_envelope_covers_interior_overshoot_and_layer_combination() -> Result<()> {
         let scene: v2::Scene = vork_scene::v2::from_test_value(serde_json::json!({"version":2,
             "nodes":[{"type":"camera","name":"camera"}],
-            "animation":[{"tracks":[{"path":["nodes","camera","scale"],"keys":[[0,[35,35,35],[0,0,0],[50,50,50]],[2,[35,35,35],[-50,-50,-50],[0,0,0]]],"interpolation":"CUBICSPLINE"}]},{"weight":0.5,"blend":"add","tracks":[{"path":["nodes","camera","scale"],"keys":[[0,[2,2,2]],[2,[4,4,4]]]}]}]
+            "animation":[{"tracks":[{"path":["nodes","camera","scale"],"keys":[[0,[35,35,35],[0,0,0],[50,50,50]],[2,[35,35,35],[-50,-50,-50],[0,0,0]]],"interpolation":"CUBICSPLINE"}]},{"weight":0.5,"blend":"combine","tracks":[{"path":["nodes","camera","scale"],"keys":[[0,[2,2,2]],[2,[4,4,4]]]}]}]
         }))?;
         let plan = Plan::compile(&scene, std::path::Path::new("."))?;
         let bounds = plan.node_envelope("camera", &v2::NodeProperty::Scale, &[50.;3])[0];
@@ -1823,10 +2331,11 @@ mod envelope_tests {
 
 /// Bake time-invariant material tracks before any stage installs resources. Keep
 /// layer spans so removing a constant endpoint cannot change another track's loop.
-pub(crate) fn fold_material_inputs(scene: &mut v2::Scene, base: &std::path::Path) -> Result<()> {
+pub(crate) fn fold_material_inputs(scene: &mut v2::Scene, base: &std::path::Path, opened: &crate::footage::Opened) -> Result<()> {
     if !scene.animation.iter().any(|l| l.tracks.iter().flatten().any(|t| t.path.first().is_some_and(|p| p == "materials"))) { return Ok(()); }
-    let mut plan = Plan::compile_with_buffers(scene, base, None)?;
+    let mut plan = Plan::compile_in(scene, base, None, opened)?;
     let constant = |channel: &Channel| match channel {
+        Channel::Style(track) => track.values.iter().all(|v|v==&track.values[0]),
         Channel::Numeric(curve) => {
             let cubic = curve.interpolation == Interpolation::Cubic;
             let stride = curve.width * if cubic {3} else {1};
@@ -1911,7 +2420,7 @@ mod asset_index_tests {
     #[test]
     fn asset_index_work_is_independent_of_unrelated_population() -> Result<()> {
         let mut plan = Plan::default();
-        plan.layers.push(CompiledLayer { source: serde_json::from_value(json!({"tracks":[]}))?, tracks: vec![], span: None, time_span: None });
+        plan.layers.push(CompiledLayer { owner: None, owner_node: None, source: serde_json::from_value(json!({"tracks":[]}))?, tracks: vec![], span: None, time_span: None });
         let curve = std::sync::Arc::new(Curve { times: vec![0.,1.], values: vec![0.,0.,0.,1.,2.,3.], width: 3,
             interpolation: Interpolation::Linear, rotation: false, euler: false });
         for asset in 0..1024 {
@@ -1942,7 +2451,7 @@ mod asset_index_tests {
                     {"path":["nodes","a","nodes","joint","translation"],"keys":[[0,[1,2,3]],[2,[3,4,5]]]},
                     {"path":["nodes","b","nodes","joint","scale"],"keys":[[0,[1,1,1]],[2,[2,3,4]]]},
                     {"path":["nodes","a","nodes","joint","visible"],"keys":[[0,false],[1,true]]}]},
-                {"name":"add","blend":"add","weight":0.75,"tracks":[
+                {"name":"add","blend":"combine","weight":0.75,"tracks":[
                     {"path":["nodes","a","nodes","joint","translation"],"keys":[[0,[0,0,0]],[2,[0,2,0]]]}]}
             ]}))?;
         let doc = gltf::Gltf::from_slice(br#"{"asset":{"version":"2.0"},"nodes":[{"name":"joint"}]}"#)?;

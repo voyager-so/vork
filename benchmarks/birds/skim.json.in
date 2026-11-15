@@ -981,7 +981,7 @@
       ]
     }
   },
-  "programs": {"bloom_graph":{"source":"// Blender Bloom arithmetic, expressed as ordinary image-graph nodes.\nimport vork;\npublic enum BloomStage { Prepare, Downsample, Upsample, Combine };\npublic struct Inputs {\n    BloomStage stage = BloomStage::Combine;\n    Image source;\n    Image original;\n    Image fine;\n    uint divisor = 1;\n    bool karis = false;\n    uint levels = 1;\n    [InputRange(0.0, 3.402823466e+38, true, true)] float threshold = 1.;\n    [InputRange(0.0, 1.0, true, true)] float smoothness = 0.1;\n    bool clamp = false;\n    [InputRange(0.0, 3.402823466e+38, true, true)] float maximum = 10.;\n    [InputRange(0.0, 3.402823466e+38, true, true)] float strength = 1.;\n    [InputRange(0.0, 3.402823466e+38, true, true)] float saturation = 1.;\n    [InputRange(0.0, 3.402823466e+38, true, true)] float3 tint = float3(1);\n};\nfloat4 intermediate(float3 c) { return float4(c,1.); }\nfloat3 filtered(Image source,float2 uv) { return compositor_sample(source,uv).rgb; }\nfloat3 quad(Image source,float2 uv,float2 center,bool karis) {\n    float3 sum=0.;float weights=0.;\n    for(int y=-1;y<=1;y+=2) for(int x=-1;x<=1;x+=2) {\n        float3 c=filtered(source,uv+(center+float2(x,y))/compositor_size(source));\n        float w=karis ? 1./(1.+max(c.r,max(c.g,c.b))) : 1.;\n        sum+=c*w;weights+=w;\n    }\n    return sum/weights;\n}\nfloat3 box(Image original,int2 pixel,int2 extent,uint divisor) {\n    int2 p=clamp(pixel,int2(0),extent-1)*int(divisor);\n    float3 c=0.;\n    for(uint y=0;y<divisor;y++) for(uint x=0;x<divisor;x++)\n        c+=compositor_load(original,p+int2(x,y)).rgb;\n    return c/float(divisor*divisor);\n}\npublic float4 composite(CompositeContext ctx, Inputs inputs) {\n    if(inputs.stage==BloomStage::Prepare) {\n        // Box reduction precedes the nonlinear highlight threshold.\n        uint divisor=max(inputs.divisor,1u);\n        int2 extent=int2(ceil(compositor_size(inputs.original)/float(divisor)));\n        float2 p=ctx.uv*float2(extent)-.5;int2 q=int2(floor(p));float2 f=frac(p);\n        float3 a=lerp(box(inputs.original,q,extent,divisor),box(inputs.original,q+int2(1,0),extent,divisor),f.x);\n        float3 b=lerp(box(inputs.original,q+int2(0,1),extent,divisor),box(inputs.original,q+int2(1,1),extent,divisor),f.x);\n        float3 c=max(lerp(a,b,f.y),0.);\n        float peak=max(c.r,max(c.g,c.b));\n        float width=min(inputs.threshold,inputs.smoothness);\n        float h=max(peak-inputs.threshold,0.);\n        if(width>0.) {float d=max(width-abs(peak-inputs.threshold),0.);h+=d*d/(4.*width);}\n        if(inputs.clamp) h=min(h,inputs.maximum);\n        return intermediate(peak>0. ? c*(h/peak) : float3(0.));\n    }\n    if(inputs.stage==BloomStage::Downsample) {\n        float3 c=.5*quad(inputs.source,ctx.uv,0.,inputs.karis);\n        for(int y=-1;y<=1;y+=2) for(int x=-1;x<=1;x+=2)\n            c+=.125*quad(inputs.source,ctx.uv,float2(x,y),inputs.karis);\n        return intermediate(c);\n    }\n    if(inputs.stage==BloomStage::Upsample) {\n        float3 c=0.;\n        for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++)\n            c+=float((2-abs(x))*(2-abs(y)))/16.*filtered(inputs.source,ctx.uv+float2(x,y)/ctx.size);\n        return intermediate(compositor_load(inputs.fine,int2(ctx.uv*ctx.size)).rgb+c);\n    }\n    float4 original=max(compositor_sample(inputs.original,ctx.uv),0.);\n    float3 bloom=filtered(inputs.source,ctx.uv);\n    float peak=max(bloom.r,max(bloom.g,bloom.b));\n    float minimum=min(bloom.r,min(bloom.g,bloom.b));\n    if(peak>minimum) {\n        float saturation=clamp((peak-minimum)/peak*inputs.saturation,0.,1.);\n        bloom=lerp(float3(peak),bloom,saturation*peak/(peak-minimum));\n    }\n    return float4(original.rgb+bloom*inputs.tint*inputs.strength/float(max(inputs.levels,1u)),original.a);\n}\n"},
+  "programs": {"bloom_graph":{"source":"// Blender Bloom arithmetic, expressed as ordinary image-graph nodes.\nimport vork;\npublic enum BloomStage { Prepare, Downsample, Upsample, Combine };\npublic struct Inputs {\n    BloomStage stage = BloomStage::Combine;\n    Image source;\n    Image original;\n    Image fine;\n    uint divisor = 1;\n    bool karis = false;\n    uint levels = 1;\n    [InputRange(0.0, 3.402823466e+38, true, true)] float threshold = 1.;\n    [InputRange(0.0, 1.0, true, true)] float smoothness = 0.1;\n    bool clamp = false;\n    [InputRange(0.0, 3.402823466e+38, true, true)] float maximum = 10.;\n    [InputRange(0.0, 3.402823466e+38, true, true)] float strength = 1.;\n    [InputRange(0.0, 3.402823466e+38, true, true)] float saturation = 1.;\n    [InputRange(0.0, 3.402823466e+38, true, true)] float3 tint = float3(1);\n};\nfloat4 intermediate(float3 c) { return float4(c,1.); }\nfloat3 filtered(Image source,float2 uv) { return compositor_sample(source,uv).rgb; }\nfloat3 quad(Image source,float2 uv,float2 center,bool karis) {\n    float3 sum=0.;float weights=0.;\n    for(int y=-1;y<=1;y+=2) for(int x=-1;x<=1;x+=2) {\n        float3 c=filtered(source,uv+(center+float2(x,y))/compositor_size(source));\n        float w=karis ? 1./(1.+max(c.r,max(c.g,c.b))) : 1.;\n        sum+=c*w;weights+=w;\n    }\n    return sum/weights;\n}\nfloat3 box(Image original,int2 pixel,int2 extent,uint divisor) {\n    int2 p=clamp(pixel,int2(0),extent-1)*int(divisor);\n    float3 c=0.;\n    for(uint y=0;y<divisor;y++) for(uint x=0;x<divisor;x++)\n        c+=compositor_load(original,p+int2(x,y)).rgb;\n    return c/float(divisor*divisor);\n}\npublic float4 composite(CompositeContext ctx, Inputs inputs) {\n    if(int(inputs.stage) == int(BloomStage::Prepare)) {\n        // Box reduction precedes the nonlinear highlight threshold.\n        uint divisor=max(inputs.divisor,1u);\n        int2 extent=int2(ceil(compositor_size(inputs.original)/float(divisor)));\n        float2 p=ctx.uv*float2(extent)-.5;int2 q=int2(floor(p));float2 f=frac(p);\n        float3 a=lerp(box(inputs.original,q,extent,divisor),box(inputs.original,q+int2(1,0),extent,divisor),f.x);\n        float3 b=lerp(box(inputs.original,q+int2(0,1),extent,divisor),box(inputs.original,q+int2(1,1),extent,divisor),f.x);\n        float3 c=max(lerp(a,b,f.y),0.);\n        float peak=max(c.r,max(c.g,c.b));\n        float width=min(inputs.threshold,inputs.smoothness);\n        float h=max(peak-inputs.threshold,0.);\n        if(width>0.) {float d=max(width-abs(peak-inputs.threshold),0.);h+=d*d/(4.*width);}\n        if(inputs.clamp) h=min(h,inputs.maximum);\n        return intermediate(peak>0. ? c*(h/peak) : float3(0.));\n    }\n    if(int(inputs.stage) == int(BloomStage::Downsample)) {\n        float3 c=.5*quad(inputs.source,ctx.uv,0.,inputs.karis);\n        for(int y=-1;y<=1;y+=2) for(int x=-1;x<=1;x+=2)\n            c+=.125*quad(inputs.source,ctx.uv,float2(x,y),inputs.karis);\n        return intermediate(c);\n    }\n    if(int(inputs.stage) == int(BloomStage::Upsample)) {\n        float3 c=0.;\n        for(int y=-1;y<=1;y++) for(int x=-1;x<=1;x++)\n            c+=float((2-abs(x))*(2-abs(y)))/16.*filtered(inputs.source,ctx.uv+float2(x,y)/ctx.size);\n        return intermediate(compositor_load(inputs.fine,int2(ctx.uv*ctx.size)).rgb+c);\n    }\n    float4 original=max(compositor_sample(inputs.original,ctx.uv),0.);\n    float3 bloom=filtered(inputs.source,ctx.uv);\n    float peak=max(bloom.r,max(bloom.g,bloom.b));\n    float minimum=min(bloom.r,min(bloom.g,bloom.b));\n    if(peak>minimum) {\n        float saturation=clamp((peak-minimum)/peak*inputs.saturation,0.,1.);\n        bloom=lerp(float3(peak),bloom,saturation*peak/(peak-minimum));\n    }\n    return float4(original.rgb+bloom*inputs.tint*inputs.strength/float(max(inputs.levels,1u)),original.a);\n}\n"},
     "initialize": {
       "file": "initialize.slang",
       "bindings": {
@@ -44313,19 +44313,7 @@
       ]
     }
   ],
-  "render": {
-    "camera": "camera",
-    "resolution": [
-      1920,
-      1080
-    ],
-    "fps": 24,
-    "duration": 17,
-    "motion_blur": {
-      "shutter": 0.2,
-      "position": "center"
-    },
-    "compositor": [
+  "composition":{"space":"3d","compositor":[
       {
         "name": "bloom.original",
         "material": {
@@ -44342,11 +44330,11 @@
             "strength": 0.08,
             "stage": "prepare",
             "source": {
-              "node": "bloom.original"
+              "step": "bloom.original"
             },
             "divisor": 2,
             "original": {
-              "node": "bloom.original"
+              "step": "bloom.original"
             }
           }
         },
@@ -44364,7 +44352,7 @@
             "strength": 0.08,
             "stage": "downsample",
             "source": {
-              "node": "bloom.0"
+              "step": "bloom.0"
             },
             "karis": true
           }
@@ -44383,7 +44371,7 @@
             "strength": 0.08,
             "stage": "downsample",
             "source": {
-              "node": "bloom.1"
+              "step": "bloom.1"
             },
             "karis": false
           }
@@ -44402,7 +44390,7 @@
             "strength": 0.08,
             "stage": "downsample",
             "source": {
-              "node": "bloom.2"
+              "step": "bloom.2"
             },
             "karis": false
           }
@@ -44421,7 +44409,7 @@
             "strength": 0.08,
             "stage": "downsample",
             "source": {
-              "node": "bloom.3"
+              "step": "bloom.3"
             },
             "karis": false
           }
@@ -44440,7 +44428,7 @@
             "strength": 0.08,
             "stage": "downsample",
             "source": {
-              "node": "bloom.4"
+              "step": "bloom.4"
             },
             "karis": false
           }
@@ -44459,10 +44447,10 @@
             "strength": 0.08,
             "stage": "upsample",
             "source": {
-              "node": "bloom.5"
+              "step": "bloom.5"
             },
             "fine": {
-              "node": "bloom.4"
+              "step": "bloom.4"
             }
           }
         },
@@ -44480,10 +44468,10 @@
             "strength": 0.08,
             "stage": "upsample",
             "source": {
-              "node": "bloom.stage7"
+              "step": "bloom.stage7"
             },
             "fine": {
-              "node": "bloom.3"
+              "step": "bloom.3"
             }
           }
         },
@@ -44501,10 +44489,10 @@
             "strength": 0.08,
             "stage": "upsample",
             "source": {
-              "node": "bloom.stage8"
+              "step": "bloom.stage8"
             },
             "fine": {
-              "node": "bloom.2"
+              "step": "bloom.2"
             }
           }
         },
@@ -44522,10 +44510,10 @@
             "strength": 0.08,
             "stage": "upsample",
             "source": {
-              "node": "bloom.stage9"
+              "step": "bloom.stage9"
             },
             "fine": {
-              "node": "bloom.1"
+              "step": "bloom.1"
             }
           }
         },
@@ -44543,10 +44531,10 @@
             "strength": 0.08,
             "stage": "upsample",
             "source": {
-              "node": "bloom.stage10"
+              "step": "bloom.stage10"
             },
             "fine": {
-              "node": "bloom.0"
+              "step": "bloom.0"
             }
           }
         },
@@ -44564,10 +44552,10 @@
             "strength": 0.08,
             "stage": "combine",
             "source": {
-              "node": "bloom.stage11"
+              "step": "bloom.stage11"
             },
             "original": {
-              "node": "bloom.original"
+              "step": "bloom.original"
             },
             "levels": 6
           }
@@ -44575,6 +44563,17 @@
         "resolution": 1,
         "name": "bloom.stage12"
       }
-    ]
+    ]},"render": {
+    "camera": "camera",
+    "resolution": [
+      1920,
+      1080
+    ],
+    "fps": 24,
+    "duration": 17,
+    "motion_blur": {
+      "shutter": 0.2,
+      "position": "center"
+    }
   }
 }

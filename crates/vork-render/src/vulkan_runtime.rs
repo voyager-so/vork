@@ -34,7 +34,7 @@ fn nvidia_instance(desc: wgpu::InstanceDescriptor, entry: ash::Entry) -> Result<
         // pointers even when adapter admission fails and we try the next path.
         static EGL: OnceLock<libloading::Library> = OnceLock::new();
         static GLX: OnceLock<libloading::Library> = OnceLock::new();
-        let slot = if name == NVIDIA_DRIVERS[0] { &EGL } else { &GLX };
+        let slot = if name == "libGLX_nvidia.so.0" { &GLX } else { &EGL };
         if slot.get().is_none() {
             let library = unsafe { libloading::Library::new(name) }
                 .with_context(|| format!("could not load {name}"))?;
@@ -133,9 +133,12 @@ pub(crate) fn adapter_failure(instance: &wgpu::Instance, error: &impl std::fmt::
     }
 }
 
+// Follow NVIDIA's desktop ICD choice: EGL is the fallback when X11 client
+// libraries (and thus GLX) are unavailable. EGL can expose an adapter yet crash
+// in Xlib surface queries, so adapter admission alone cannot prefer it to GLX.
 // Discovery candidates must succeed through adapter admission, not just dlopen.
 #[cfg(target_os = "linux")]
-const NVIDIA_DRIVERS: [&str; 2] = ["libEGL_nvidia.so.0", "libGLX_nvidia.so.0"];
+const NVIDIA_DRIVERS: [&str; 2] = ["libGLX_nvidia.so.0", "libEGL_nvidia.so.0"];
 
 #[cfg(target_os = "linux")]
 fn discover<T>(
@@ -186,11 +189,10 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires Vulkan; set VORK_GPU_TESTS=1"]
     fn imported_instance_preserves_indirect_validation_policy() -> Result<()> {
-        if std::env::var("VORK_GPU_TESTS").as_deref() != Ok("1") {
-            eprintln!("SKIP GPU test: set VORK_GPU_TESTS=1 with a supported GPU");
-            return Ok(());
-        }
+        anyhow::ensure!(std::env::var("VORK_GPU_TESTS").as_deref() == Ok("1"),
+            "GPU test requires VORK_GPU_TESTS=1 and a working Vulkan adapter");
         for enabled in [false, true] {
             let mut desc = wgpu::InstanceDescriptor::new_without_display_handle();
             desc.flags = wgpu::InstanceFlags::DEBUG;
@@ -220,26 +222,26 @@ mod tests {
     }
 
     #[test]
-    fn glx_is_tried_after_egl_fails() {
+    fn egl_is_tried_after_glx_fails() {
         for stage in ["library load", "symbol lookup", "extension enumeration", "instance initialization", "adapter request"] {
             let mut tried = Vec::new();
             let result = discover(false, || Ok(true), |name| {
                 tried.push(name);
                 if name == NVIDIA_DRIVERS[0] { anyhow::bail!(stage); }
-                Ok("GLX adapter")
-            }, || panic!("working GLX must win"));
-            assert_eq!(result.unwrap(), "GLX adapter");
+                Ok("headless EGL adapter")
+            }, || panic!("working EGL fallback must win"));
+            assert_eq!(result.unwrap(), "headless EGL adapter");
             assert_eq!(tried, NVIDIA_DRIVERS);
         }
     }
 
     #[test]
-    fn first_usable_candidate_wins() {
+    fn desktop_icd_is_preferred_even_when_egl_can_render() {
         let result = discover(false, || Ok(true), |name| {
-            assert_eq!(name, NVIDIA_DRIVERS[0]);
-            Ok("EGL adapter")
-        }, || panic!("working EGL must win"));
-        assert_eq!(result.unwrap(), "EGL adapter");
+            assert_eq!(name, "libGLX_nvidia.so.0");
+            Ok("GLX adapter")
+        }, || panic!("working GLX must win"));
+        assert_eq!(result.unwrap(), "GLX adapter");
     }
 
     #[test]

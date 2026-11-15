@@ -2,7 +2,7 @@ use super::*;
 use serde_json::{Value, json};
 
 fn scene() -> Value {
-    json!({"version":2,"render":{"resolution":[32,32],"background":[0,0,0],"settings":{"integrator":"raster","samples":1},"display":{"program":"std/standard","inputs":{"dither_intensity":0}}},
+    json!({"version":2,"composition":{"space":"3d","view":{"program":"std/standard","inputs":{}}},"render":{"dither":false,"resolution":[32,32],"background":[0,0,0],"settings":{"integrator":"raster","samples":1}},
         "buffers":{"p":{"type":"vec3","data":[[-0.4,-0.6,0],[0.4,-0.6,0],[0,0.6,0]]},
             "translation":{"type":"vec3","data":[[-0.5,0,0],[0.5,0,0]]},
             "paint":{"type":"vec4","data":[[0.8,0.2,0.1,1],[0.1,0.6,0.9,1]]},
@@ -32,8 +32,9 @@ fn instance_attribute_validation() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn instance_attributes_match_split_meshes_in_surface_and_displacement() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else { return Ok(()) };
+    let r = crate::test_renderer()?;
     let render=|value:Value| -> Result<_> {
         let mut installed=r.install(vork_scene::v2::from_test_value(value)?,Path::new("."))?;
         let mut slot=installed.create_frame_slot(&r,crate::ReadbackPrecision::Float)?;
@@ -79,8 +80,9 @@ fn instance_attributes_match_split_meshes_in_surface_and_displacement() -> Resul
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn zero_scale_geometry_is_absent_and_animation_stays_finite() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let render=|value:Value,time:f32| -> Result<FrameOutput> {
         let installed=r.install(vork_scene::v2::from_test_value(value)?,Path::new("."))?;
         let mut slot=installed.create_frame_slot(&r,ReadbackPrecision::Float)?;
@@ -158,8 +160,9 @@ fn zero_scale_validation_keeps_nonfinite_and_zero_rotation_errors() -> Result<()
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn zero_scale_casts_no_shadow_and_lights_ignore_scale() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let render=|value:Value| -> Result<_> {
         let mut installed=r.install(vork_scene::v2::from_test_value(value)?,Path::new("."))?;
         let mut slot=installed.create_frame_slot(&r,crate::ReadbackPrecision::Float)?;
@@ -187,8 +190,9 @@ fn zero_scale_casts_no_shadow_and_lights_ignore_scale() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn zero_scale_path_geometry_and_emission_are_absent() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     if !r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY | crate::rt::HIT_BUFFER_FEATURES) {return Ok(())}
     let render=|value:Value| -> Result<_> {
         let mut installed=r.install(vork_scene::v2::from_test_value(value)?,Path::new("."))?;
@@ -215,8 +219,9 @@ fn zero_scale_path_geometry_and_emission_are_absent() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn zero_scale_skinned_displacement_stays_finite() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let mut value=scene();
     value["buffers"]["joints"]=json!({"type":"uvec4","data":[[0,0,0,0],[0,0,0,0],[0,0,0,0]]});
     value["buffers"]["weights"]=json!({"type":"vec4","data":[[1,0,0,0],[1,0,0,0],[1,0,0,0]]});
@@ -242,8 +247,9 @@ fn zero_scale_skinned_displacement_stays_finite() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn zero_scale_imported_parent_hides_rotated_static_and_animated_meshes() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let root=std::env::temp_dir().join(format!("vork-zero-scale-import-{}",std::process::id()));
     std::fs::create_dir_all(&root)?;
     let positions=[[-0.6f32,-0.6,0.],[0.6,-0.6,0.],[0.,0.6,0.]];
@@ -277,8 +283,9 @@ fn zero_scale_imported_parent_hides_rotated_static_and_animated_meshes() -> Resu
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn simulation_pixels_are_independent_of_seek_slots_and_fps() -> Result<()> {
-    let Some(r)=crate::test_renderer()? else {return Ok(())};
+    let r = crate::test_renderer()?;
     let mut value=scene();
     value["simulation"]=json!({"t0":0,"dt":0.015625,"seed":7,"state":["translation"],"init":["initialize"],"steps":["step"]});
     value["programs"]=json!({

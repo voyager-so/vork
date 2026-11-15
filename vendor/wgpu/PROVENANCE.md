@@ -36,3 +36,8 @@ Metal AS fence ownership is preserved. Remove when upstream supplies an equivale
 tracked descriptor-buffer build and backend layout/template contract. Regressions:
 core native descriptor range tests, renderer GPU packing/error tests and the real-device
 build/query/rebuild lifetime contract in `scripts/check-metal-contracts`.
+
+Local native geometry extension: axis-aligned bounding-box BLAS descriptions and
+build inputs use the existing Vulkan/Metal HAL AABB implementation. Core checks
+geometry counts, compatible flags, stride/alignment, buffer range, usage and device
+ownership, and tracks initialization and build-input transitions.

@@ -15,7 +15,7 @@ Slang modules: `import vork;`, one `struct Inputs {...}` whose initializers are
 defaults; surface meshes require surface (lit/displace supplement surface);
 medium-only carriers require medium instead (vork help fog):
   Closure|Blend|Hair surface(ShadingContext, Inputs)
-    OpenPBR emission is shared by hits and light samples; lit output is authored shading.
+    OpenPBR emission, including unlit, is shared by hits and light samples and added to the shaded lit result.
     Light samples use zero differentials; hits retain their shading footprint.
   float3 displace(DisplacementContext, Inputs)       object-local offset after deformation/subdivision; fixed topology
     Use displacement on ordinary meshes with consistent assignments and attributes at shared vertices.
@@ -27,7 +27,7 @@ medium-only carriers require medium instead (vork help fog):
   float4 composite(CompositeContext, Inputs)         vork help compositor
   CameraRay camera(CameraContext, Inputs)           camera.material; vork help light-paths
   float3 sensor(SensorContext, Inputs)               per arriving contribution
-  float3 display(DisplayContext, Inputs)
+  ViewResult view(ViewContext, Inputs)               view_from_xyz(XYZ D65 cd/m²) or view_from_codes(codes, ctx.display)
   void compute(ComputeContext, Inputs)               buffers: <binding>_load/_store/_count; dense grids also <binding>_dims (uint3)
 Initialized read-only global tables (including static const arrays) are allowed.
 Global resources and mutable globals are refused; use Inputs or compute buffers.
@@ -45,10 +45,10 @@ ShadingContext and T directly for DisplacementContext; names and types must matc
 every bound geometry or instance column.
 ShadingContext: time (s), instance_index (authored row), primitive_id, front_facing,
 tangent_sign; wavelength (nm; 0 in RGB) is available in surface.
-ShadingContext.POSITION is world-space metres; NORMAL, true_normal, TANGENT and
-incoming are world-space vectors. world_to_object converts a world position to
+ShadingContext.POSITION is world-space metres; NORMAL, true_normal and TANGENT are world-space vectors, and incoming is the unit direction toward the preceding ray vertex. world_to_object converts a world position to
 the shaded object's local coordinates.
 world_normal_to_object normalizes after transforming to object space.
+Use object_direction_to_world for local vectors and object_normal_to_world for local surface normals; both return unit world directions.
 DisplacementContext has only undisplaced object-local POSITION, NORMAL and time (s).
 Per-instance displacement values use bound Attribute<T> inputs.
 For topology:"points", displace evaluates once per undisplaced object-local point centre and translates the whole sphere without changing its width; NORMAL and generated surface UV/tangent inputs are unavailable.
@@ -105,8 +105,7 @@ Native triangle morphs and skinning evaluate before these reads: simulation
 initialization samples t0, and each tick samples its left endpoint, including replay.
 Each object's input preserves authored vertex rows, including unreferenced rows.
 
-A named compute input may use {"geometry":"body"}, where body names a native mesh
-object. Declare Geometry body in Inputs. geometry_POSITION_load(inputs.body,i)
+Geometry inputs bind {geometry: mesh-node-name}. For an input named body, geometry_POSITION_load(inputs.body,i)
 and geometry_NORMAL_load(inputs.body,i) read its local vertices;
 geometry_to_world(inputs.body,p) applies its sampled placement.
 geometry_vertex_count(inputs.body), geometry_triangle_count(inputs.body), and
@@ -127,7 +126,8 @@ existing nominal frame clock. These inputs expose no stores or atomics and need 
 binding fields. Reads do not publish writes or become checkpoint state.
 
 EnvironmentContext: normalized direction, time (seconds), camera (camera escape versus lighting).
-Environment programs depend on direction and may sample file images.
+Environment programs depend on direction and may sample file images. Camera rays
+evaluate the program at every sample; lighting reads a baked lat-long copy.
 Displacement may sample static file images. For points use POSITION, time and bound
 attributes. Fixed computed triangles support displacement, including historical
 vertex attributes; computed points and implicit fields need producer offsets or
@@ -138,5 +138,5 @@ Context: `position` (metres), unit `direction`, `time` (seconds), `previous_dist
 Use std/path for authored propagation; use sampled shutter blur rather than motion channels.
 Segments use ordinary ray transport; leaving bounds continues straight and samples the sky along the exit direction.
 
-Image inputs bind only `{image: name}`. Programs own channel selection, factors and UV transforms.
+Programs own image channel selection, factors and UV transforms.
 `std.texture` provides footprint filtering and tangent-frame normal mapping; `ShadingContext.sample_spread` retains sample-centre covariance, while UV derivatives remain geometric.

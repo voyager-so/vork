@@ -1,13 +1,13 @@
 {
   "version": 2,
+  "composition": {"space": "3d", "view": {
+      "program": "std/agx"
+    }},
   "render": {
     "resolution": [
       640,
       360
-    ],
-    "display": {
-      "program": "std/agx"
-    }
+    ]
   },
   "geometry": {
     "box": {"attributes":{"POSITION":{"type":"vec3","file":"fog-interior.json.geometry.bin","offset":0,"count":24},"NORMAL":{"type":"vec3","file":"fog-interior.json.geometry.bin","offset":288,"count":24},"TEXCOORD_0":{"type":"vec2","file":"fog-interior.json.geometry.bin","offset":576,"count":24}},"indices":{"type":"u32","file":"fog-interior.json.geometry.bin","offset":768,"count":36}}

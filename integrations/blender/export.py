@@ -29,6 +29,7 @@ from integrations.blender.world import translate as translate_world, preprocess_
 from integrations.blender.geometry import export_gltf, filter_material_overrides
 from integrations.blender.display import translate as translate_display
 from integrations.blender.material_export import MaterialWriter
+from integrations.blender.instances import particle_occurrences
 from integrations.blender.render_geometry import direct_render_objects, render_selection, gltf_render_settings
 report = dict(stages={}, omissions=[], materials={}, warnings=[])
 clip = None
@@ -50,7 +51,7 @@ for ob in sc.objects:
     if ob.hide_render: continue
     for p in getattr(ob, 'particle_systems', []):
         s = p.settings
-        if s.type == 'HAIR' or s.render_type in ('OBJECT', 'COLLECTION', 'HALO', 'PATH'):
+        if s.render_type not in ('OBJECT', 'COLLECTION', 'NONE'):
             wall('particles/hair not exported', f'{ob.name}/{p.name}: {s.type} render_as={s.render_type} count={s.count} children={s.child_type}x{s.rendered_child_count}')
     if ob.type in ('CURVES', 'VOLUME', 'POINTCLOUD'): wall(f'{ob.type} object not exported', ob.name)
     if ob.type == 'CURVE' and (ob.data.bevel_depth == 0 and ob.data.extrude == 0 and not ob.data.bevel_object): pass
@@ -63,7 +64,8 @@ if comp is not None and len(comp.nodes) > 2:
 # Geometry
 t0 = time.perf_counter()
 try:
-    with gltf_render_settings(sc), render_selection(sc):
+    with gltf_render_settings(sc), particle_occurrences(sc, animated=animated) as count, render_selection(sc):
+        report['particle_occurrences'] = count
         if animated:
             clip = export_clip(out/'scene.glb', 'model', apply_modifiers=args.apply_modifiers,
                                export_lights=False, export_cameras=False, use_renderable=True, use_selection=True, use_active_scene=True, bake_sources=args.bake_values is not None)
@@ -131,7 +133,7 @@ try:
 except ValueError as e:
     wall('display export refused', f'{e}; use sRGB with Standard, AgX or Filmic and a matching look; disable unsupported display curves'); save(); raise
 path_transport = r.engine == 'CYCLES'
-render = dict(resolution=res, fps=r.fps/r.fps_base, duration=2.0, **display)
+render = dict(resolution=res, fps=r.fps/r.fps_base, duration=2.0)
 render['background'] = 'transparent' if r.film_transparent else camera_background
 # Render settings live in a sibling profile: vork render shot.json --profile shot.profile.json.
 level = 2 if path_transport else 1
@@ -193,7 +195,7 @@ with gltf_render_settings(sc):
         elif animated:
             wall('instanced light animation', obj.name + ': current occurrence snapshot')
 report['lights'] = dict(lights)
-scene_doc = dict(version=2, render=render, nodes=nodes, images={**images, **writer.images}, programs=writer.programs,
+scene_doc = dict(version=2, composition=dict(space="3d", **display), render=render, nodes=nodes, images={**images, **writer.images}, programs=writer.programs,
                  materials={**materials, **writer.materials})
 if animated:
     controls = sample_controls(sc, control_bindings)

@@ -18,19 +18,36 @@ p.add_argument('--starter-render', action='store_true',
                help='render the installed starter through both CLIs; VORK_GPU=cpu is supported')
 a = p.parse_args()
 
-def run(args):
+def run(args, env=None):
     print('+', *args, flush=True)
     args[0] = shutil.which(args[0]) or args[0]
-    subprocess.run(args, check=True)
+    subprocess.run(args, check=True, env=env)
 
-# pip supplies only the SDK; use the renderer installed by npm on PATH.
+# Keep the pip leg independent of npm, global vork and development overrides.
+pip_env = os.environ.copy()
+pip_env['PATH'] = ''
+for key in ('VORK_BIN', 'VORK_SLANGC', 'VORK_SLANG_FILESYSTEM', 'VORK_OIDN', 'PYTHONPATH'):
+    pip_env.pop(key, None)
+# npm's own CLI leg retains its project-local launcher.
 os.environ['PATH'] = str(Path('node_modules/.bin').resolve()) + os.pathsep + os.environ['PATH']
 run(['npx', '--no-install', 'vork', '--version'])
-run([sys.executable, '-c', 'from vork._engine import engine; import subprocess; subprocess.run([engine(), "--version"], check=True)'])
-run(['node', '--input-type=module', '-e', 'import {extrude} from "@voyager-so/vork"; console.log(Object.keys(extrude("shape", {outline:[[0,0],[1,0],[0,1]]})));'])
-run([sys.executable, '-c', 'from vork import std; print(list(std("rounded_box", name="ball")))'])
-# Check the installed npm runtime and the SDK-only pip metadata.
 target = {'linux': 'linux-x64', 'darwin': 'darwin-arm64', 'win32': 'windows-x64'}[sys.platform]
+probe = """
+import importlib, os, subprocess
+from pathlib import Path
+from vork._engine import engine
+native = importlib.import_module('vork_native_' + TARGET.replace('-', '_'))
+expected = Path(native.__file__).parent / 'runtime' / ('vork.exe' if os.name == 'nt' else 'vork')
+assert Path(engine()).resolve() == expected.resolve(), (engine(), expected)
+subprocess.run([engine(), '--version'], check=True)
+print(expected.resolve())
+""".replace('TARGET', repr(target))
+run([sys.executable, '-c', probe], env=pip_env)
+pip_binary = subprocess.check_output([sys.executable, '-c',
+    'from vork._engine import engine; print(engine())'], env=pip_env, text=True).strip()
+run(['node', '--input-type=module', '-e', 'import {extrude} from "@voyager-so/vork"; console.log(Object.keys(extrude("shape", {outline:[[0,0],[1,0],[0,1]]})));'])
+run([sys.executable, '-c', 'from vork import std; print(list(std("rounded_box", name="ball")))'], env=pip_env)
+# Check the installed npm runtime and the SDK-only pip metadata.
 npm_runtime = Path('node_modules/@voyager-so') / ('vork-' + target) / 'runtime'
 runtime = npm_runtime.resolve()
 from importlib.metadata import distribution
@@ -46,14 +63,15 @@ if a.starter_render:
     for key in ('VORK_BIN', 'VORK_SLANGC', 'VORK_SLANG_FILESYSTEM', 'VORK_OIDN'):
         os.environ.pop(key, None)
     for name, command in [('npm', ['npx', '--no-install', 'vork']),
-                          ('pip', [shutil.which('vork')])]:
+                          ('pip', [pip_binary])]:
         starter = Path(name + '-starter')
-        run(command + ['init', str(starter), '--language', 'json'])
+        command_env = pip_env.copy() if name == 'pip' else os.environ.copy()
+        run(command + ['init', str(starter), '--language', 'json'], env=command_env)
         # Fresh per-install receipts force the installed companion to execute.
-        os.environ['VORK_CACHE_DIR'] = str((starter / 'cache').resolve())
+        command_env['VORK_CACHE_DIR'] = str((starter / 'cache').resolve())
         frame = starter / 'frame.png'
         run(command + ['render', str(starter / 'scene.json'), '--profile', 'std/draft',
-                       '--set', 'resolution=[128,96]', '--out', str(frame)])
+                       '--set', 'resolution=[128,96]', '--out', str(frame)], env=command_env)
         assert frame.read_bytes().startswith(b'\x89PNG\r\n\x1a\n'), frame
 
 run([str(runtime / 'slang/bin' / ('slangc.exe' if os.name == 'nt' else 'slangc')), '-version'])
@@ -70,11 +88,12 @@ if a.gpu:
     from vork import std
     scene.update(std('rounded_box', name='ball'))
     Path('smoke.json').write_text(json.dumps(scene))
-    for i, command in enumerate([['npx', '--no-install', 'vork'], [shutil.which('vork')]]):
-        run(command + ['setup'])
-        run(command + ['render', 'smoke.json', '--out', ('npm.png' if i == 0 else 'pip.png')])
+    for i, command in enumerate([['npx', '--no-install', 'vork'], [pip_binary]]):
+        command_env = pip_env if i == 1 else None
+        run(command + ['setup'], env=command_env)
+        run(command + ['render', 'smoke.json', '--out', ('npm.png' if i == 0 else 'pip.png')], env=command_env)
     run(['node', '--input-type=module', '-e', 'import {render} from "@voyager-so/vork"; render("smoke.json", {out:"ts-api.png"});'])
-    run([sys.executable, '-c', 'from vork import render; render("smoke.json", "python-api.png")'])
+    run([sys.executable, '-c', 'from vork import render; render("smoke.json", "python-api.png")'], env=pip_env)
     run(['npx', '--no-install', 'vork', 'render', 'smoke.json', '--frame-start', '0', '--frame-end', '2', '--out', 'smoke.mp4'])
     scene['programs'] = {'paint': {'source': 'import vork; struct Inputs {}; Closure surface(ShadingContext ctx, Inputs inputs) { Closure c = {}; c.base_color = float3(0.8, 0.15, 0.05); c.specular_roughness = 0.4; return c; }'}}
     scene['materials'] = {'paint': {'program': 'paint'}}

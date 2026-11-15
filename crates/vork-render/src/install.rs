@@ -68,17 +68,34 @@ pub(crate) fn admit_delivery_effects(r:&Renderer,scene:&Scene,base:&Path,allow_m
         // Hair is a closure type; only its bound scattering effect needs a path owner.
         if program.effect_probe()?.capabilities(&words).physical_hair {hair_materials.insert(name.clone());}
     }
+    let (facts, _) = bound_effects(scene, base, &stages, allow_media, &hair_materials)?;
+    Ok((stages,facts))
+}
+
+/// Source admission and installation use the same stage and binding decision.
+/// No surface callback needs compilation to refuse this unsupported combination.
+pub(crate) fn admit_stage_effects(scene:&Scene,base:&Path,stages:&std::collections::BTreeMap<String,programs::Stages>)->Result<()> {
+    if !scene.materials.iter().any(|(name,material)| stages.get(name).is_some_and(|stage|stage.surface) && material.program!="std/openpbr") { return Ok(()); }
+    let (_, media) = bound_effects(scene, base, stages, true, &Default::default())?;
+    if let Some(material) = media.first() {
+        bail!("material {material}: fog with custom surface callbacks is not supported; remove its medium stage or use std/openpbr for surface materials");
+    }
+    Ok(())
+}
+
+fn bound_effects(scene:&Scene,base:&Path,stages:&std::collections::BTreeMap<String,programs::Stages>,allow_media:bool,hair_materials:&std::collections::BTreeSet<String>)->Result<(TransportFacts,std::collections::BTreeSet<String>)> {
     let mut refused=std::collections::BTreeSet::new();
     let mut environments=Vec::new();
     let mut documents=std::collections::HashMap::new();
     let mut facts=TransportFacts::default();
+    let mut media=std::collections::BTreeSet::new();
     fn visit(nodes:&[Node],scene:&Scene,base:&Path,stages:&std::collections::BTreeMap<String,programs::Stages>,
-        documents:&mut std::collections::HashMap<PathBuf,gltf::Document>,environments:&mut Vec<String>,refused:&mut std::collections::BTreeSet<String>,next:&mut usize,allow_media:bool,facts:&mut TransportFacts,hair_materials:&std::collections::BTreeSet<String>)->Result<()> {
+        documents:&mut std::collections::HashMap<PathBuf,gltf::Document>,environments:&mut Vec<String>,refused:&mut std::collections::BTreeSet<String>,next:&mut usize,allow_media:bool,facts:&mut TransportFacts,hair_materials:&std::collections::BTreeSet<String>,media:&mut std::collections::BTreeSet<String>)->Result<()> {
         for node in nodes {
             let index=*next;*next+=1;
             let label=format!("node {index} ({:?})",node.name);
             let mut medium=|slot:String,name:&str| {
-                facts.media |= stages.get(name).is_some_and(|stage|stage.medium);
+                if stages.get(name).is_some_and(|stage|stage.medium) { facts.media=true; media.insert(name.to_owned()); }
                 facts.hair |= hair_materials.contains(name);
                 if !allow_media && stages.get(name).is_some_and(|stage|stage.medium) {
                     refused.insert(format!("{label}.{slot}: participating media are unavailable in delivery (material {name:?}); bake the medium into an image plate and composite it, or render the medium externally"));
@@ -96,6 +113,9 @@ pub(crate) fn admit_delivery_effects(r:&Renderer,scene:&Scene,base:&Path,allow_m
                         refused.insert(format!("{label}: stage 1 fog does not support grid volume topology; use a homogeneous closed convex triangle carrier, or render the volume externally and composite an image plate"));
                     }
                 }
+                NodeKind::Asset {file,materials,..} if crate::splats::is_file(file) => {
+                    for name in materials.values() {medium("materials".into(),name);}
+                }
                 NodeKind::Asset {file,materials,..} if materials.values().any(|name|stages[name].medium || hair_materials.contains(name)) => {
                     // Only medium remaps need primitive reachability here. An
                     // ordinary asset contributes no unavailable effect and keeps
@@ -110,6 +130,7 @@ pub(crate) fn admit_delivery_effects(r:&Renderer,scene:&Scene,base:&Path,allow_m
                 }
                 NodeKind::Light {shape:vork_scene::LightShape::Environment,medium,..} => {
                     facts.media |= medium.is_some();
+                    media.extend(medium.iter().cloned());
                     environments.push(label.clone());
                     if let Some(name)=medium.as_ref().filter(|_|!allow_media) {
                         refused.insert(format!("{label}.medium: participating media are unavailable in delivery (world material {name:?}); bake the medium into an image plate and composite it, or render the medium externally"));
@@ -117,18 +138,18 @@ pub(crate) fn admit_delivery_effects(r:&Renderer,scene:&Scene,base:&Path,allow_m
                 }
                 _=>{}
             }
-            visit(&node.children,scene,base,stages,documents,environments,refused,next,allow_media,facts,hair_materials)?;
+            visit(&node.children,scene,base,stages,documents,environments,refused,next,allow_media,facts,hair_materials,media)?;
         }
         Ok(())
     }
-    visit(&scene.nodes,scene,base,&stages,&mut documents,&mut environments,&mut refused,&mut 0,allow_media,&mut facts,&hair_materials)?;
+    visit(&scene.nodes,scene,base,stages,&mut documents,&mut environments,&mut refused,&mut 0,allow_media,&mut facts,hair_materials,&mut media)?;
     if let Some(first)=environments.first() {
         for extra in &environments[1..] {
             refused.insert(format!("{extra}: additional environment lights are unavailable; combine its contribution with {first} in one environment program or precomposite the environment maps"));
         }
     }
     ensure!(refused.is_empty(),"unsupported effects:\n{}",refused.into_iter().collect::<Vec<_>>().join("\n"));
-    Ok((stages,facts))
+    Ok((facts,media))
 }
 
 /// Authored material names bound to a mesh's material slots (glTF material
@@ -141,7 +162,8 @@ struct MaterialBindings {
 }
 impl MaterialBindings {
     fn compile(input: &Scene, source: &Node, doc: Option<&gltf::Document>, stages: &std::collections::BTreeMap<String, programs::Stages>) -> Result<Self> {
-        let mut slots = vec![None; doc.map_or(0, |doc| doc.materials().len())];
+        let splats=matches!(&source.kind,NodeKind::Asset {file,..} if crate::splats::is_file(file));
+        let mut slots = vec![None; doc.map_or(usize::from(splats), |doc| doc.materials().len())];
         let mut default = None;
         match &source.kind {
             NodeKind::Mesh { materials, .. } => {
@@ -214,6 +236,7 @@ pub(crate) struct ImplicitField {
 }
 #[derive(Clone)]
 pub(crate) struct Draw {
+    pub(crate) splats: Option<std::sync::Arc<crate::splats::Geometry>>,
     pub(crate) implicit: Option<ImplicitField>,
     pub(crate) sort_order: usize,
     pub(crate) vertices: wgpu::Buffer,
@@ -259,6 +282,7 @@ pub(crate) struct Draw {
     pub(crate) displacement_leader: Option<usize>,
 }
 impl Draw {
+    pub(crate) fn rasterized(&self) -> bool {self.count>0 || self.computed}
     pub(crate) fn evaluated(&self) -> bool {self.computed || self.deform.is_some() || self.displacement.is_some()}
     pub(crate) fn evaluation_leader(&self) -> Option<usize> {
         self.displacement_leader.or_else(|| self.deform.as_ref().map(|d| d.leader))
@@ -310,8 +334,16 @@ pub struct InstallOptions {
     pub readback: crate::ReadbackOutputs,
     /// Internal delivery intent; library installs retain GPU colour by default.
     pub(crate) gpu_color: bool,
+    /// The display the view's result is encoded for: the render call's `output.display`. A world inside a
+    /// canvas keeps the default, sRGB: it renders for the canvas, whose encoding that is.
+    pub(crate) display: crate::output_device::Target,
+    /// The view also keeps its result floating point (dithered, unquantized and unclamped) in the frame's
+    /// staging planes: a world inside a canvas hands the canvas that picture.
+    pub(crate) view_picture: bool,
     /// Initial frame storage; collection can request growth through `FrameRedo`.
     pub reservations: crate::Reservations,
+    /// The pictures of the scene's canvas nodes, by image name, split from the scene before it installs.
+    pub(crate) canvases: std::collections::BTreeMap<String, crate::canvas_world::Picture>,
     pub(crate) variants: pipelines::VariantCompile,
     /// Internal transport fixtures only; delivery drivers retain release admission.
     #[cfg(any(test, feature = "test-support"))]
@@ -341,7 +373,10 @@ impl Default for InstallOptions {
                 ..crate::ReadbackOutputs::ALL
             },
             gpu_color: true,
+            display: Default::default(),
+            view_picture: false,
             reservations: Default::default(),
+            canvases: Default::default(),
             variants: Default::default(),
             #[cfg(any(test, feature = "test-support"))]
             test_participating_media: cfg!(test),
@@ -389,6 +424,7 @@ pub struct InstalledScene {
     pub(crate) reflections: Option<pipelines::Drawn<wgpu::ComputePipeline>>,
     /// Decoupled shading kernels and the camera's draw table.
     pub(crate) decoupled: Option<crate::passes::decoupled::Install>,
+    pub(crate) software_geometry: Option<crate::passes::decoupled::RasterGeometry>,
     pub(crate) gi: Option<pipelines::Drawn<wgpu::ComputePipeline>>,
     /// The irradiance volume when the scene enables probes.
     pub(crate) probes: Option<crate::probes::Volume>,
@@ -403,6 +439,8 @@ pub struct InstalledScene {
     pub(crate) surface_dependencies: Vec<vork_slang::ProgramDependencies>,
     pub(crate) links: lights::links::Links,
     pub(crate) medium_base: u32,
+    /// Environment program input words: the first program words after the records.
+    pub(crate) environment_base: u32,
     pub(crate) has_media: bool,
     pub(crate) medium_certified_times: Option<[f32;2]>,
     pub(crate) emitter_profiles: std::collections::HashMap<usize,u32>,
@@ -453,12 +491,17 @@ fn imported_material_slots(doc:&gltf::Document)->Result<std::collections::BTreeS
     Ok(slots)
 }
 
-fn refuse_screen_contents(draws:&[Draw],roots:&[MeshRoot],objects:&[Object],materials:&[Material])->Result<()> {
-    ensure!(!draws.iter().any(|draw|materials[draw.material].thin_transmission),
+fn refuse_screen_contents(draws:&[Draw],roots:&[MeshRoot],included:&[bool],objects:&[Object],materials:&[Material],records:&[materials::MaterialRecord])->Result<()> {
+    let in_view=|object:u32|included[roots[object as usize].node];
+    let visible=draws.iter().filter(|draw|draw.instances.clone().any(in_view));
+    ensure!(!visible.clone().any(|draw|materials[draw.material].thin_transmission),
         "thin-sheet refraction needs scene boundary transport; use ray refraction on a ray-query capable adapter, or std/path (screen refraction cannot represent rough transmission and rear interfaces)");
-    if !draws.iter().any(|draw|materials[draw.material].solid_transmission) {return Ok(());}
+    if !visible.clone().any(|draw|materials[draw.material].solid_transmission) {return Ok(());}
+    ensure!(!visible.clone().any(|draw|materials[draw.material].solid_transmission
+        && records[draw.material].screen_exit_needs_color(draw.layout.color)),
+        "solid glTF surface colour from COLOR_0 or a base-colour texture needs exit material evaluation; use ray refraction or std/path (screen refraction is unsupported); see vork help upgrade");
     let identities=crate::passes::path::mesh_identities(draws,roots)?;
-    let placed:Vec<_>=draws.iter().flat_map(|draw|draw.instances.clone().map(move |object|(draw,object))).map(|(draw,object)| {
+    let placed:Vec<_>=visible.flat_map(|draw|draw.instances.clone().filter(|&object|in_view(object)).map(move |object|(draw,object))).map(|(draw,object)| {
         let model=objects[object as usize].model;
         (draw,object,crate::shadow_envelope::transformed(model,draw.bounds))
     }).collect();
@@ -509,8 +552,9 @@ impl InstalledScene {
         background_pipelines: bool,
         automatic_probes: bool,
         options: &InstallOptions,
+        opened: &crate::footage::Opened,
     ) -> Result<Self> {
-        std::thread::scope(|scope| Self::new_scoped(r, scene, base, effects, background_pipelines, automatic_probes, options, scope))
+        std::thread::scope(|scope| Self::new_scoped(r, scene, base, effects, background_pipelines, automatic_probes, options, opened, scope))
     }
 
     fn new_scoped<'scope>(
@@ -521,6 +565,7 @@ impl InstalledScene {
         _background_pipelines: bool,
         automatic_probes: bool,
         options: &InstallOptions,
+        opened: &crate::footage::Opened,
         scope: &'scope std::thread::Scope<'scope, '_>,
     ) -> Result<Self> {
         let InstallOptions { readback, ref variants, reservations, .. } = *options;
@@ -528,8 +573,8 @@ impl InstalledScene {
         for (index,kind) in geometry_stages.iter().enumerate() {
             ensure!(!geometry_stages[..index].contains(kind),"geometry stages[{index}] repeats {kind:?}; remove the duplicate built-in stage");
         }
-        let compositor = compositor::install(r, &scene, base)?;
-        let (mut output_dependencies, _) = compositor::dependencies(&compositor, &scene.render.compositor);
+        let compositor = compositor::install(r, &scene, base, opened)?;
+        let (mut output_dependencies, _) = compositor::dependencies(&compositor, scene.compositor());
         if !options.gpu_color && !readback.color && !readback.color16 && !readback.float.color {output_dependencies=Default::default();}
         output_dependencies.depth |= readback.depth_ids || readback.float.depth;
         output_dependencies.ids |= readback.depth_ids;
@@ -554,21 +599,21 @@ impl InstalledScene {
                 crate::aov::check_storage(&r.device.limits(), &input.render)?;
             }
             for name in &planned_image_order {
-                let render=input.images[name].render.as_ref().unwrap();
+                let render=input.images[name].resolved_render(&input.render).expect("a rendered image");
                 let (d,_)=compositor::dependencies(&compositor,&render.compositor);
                 if d.beauty || d.aovs || d.catcher {
-                    crate::aov::check_storage(&r.device.limits(), &render.resolve(&input.render))?;
+                    crate::aov::check_storage(&r.device.limits(), &render)?;
                 }
             }
         }
-        let display_program = crate::display_program::prepare(r, &scene, base)?.install(r)?;
-        let mut render = scene.render.clone();
+        let display_program = crate::display_program::prepare(r, &scene, base, options.display, opened, options.view_picture)?.install(r)?;
+        let mut render = scene.main_render();
         let environment_start = Instant::now();
         let scene_inputs=allocation_dependencies.beauty || allocation_dependencies.controls()
             || allocation_dependencies.aovs || allocation_dependencies.catcher;
         if !scene_inputs {effects.implicit=false;}
-        let mut environment = if scene_inputs {environment::Environment::new(
-            r, environment_node::Settings::from_scene(&scene)?, &scene, base,
+        let mut environment = if scene_inputs {environment::Environment::new_in(
+            r, environment_node::Settings::from_scene(&scene)?, &scene, base, opened,
         )?} else {environment::Environment::unused(r)};
         let environment_install_ms = environment_start.elapsed().as_secs_f64() * 1000.;
         // Preorder: an authored node's index is its position in the scene tree walk.
@@ -599,7 +644,7 @@ impl InstalledScene {
         flatten(&scene.nodes, None, &mut nodes);
         let propagation=crate::propagation::prepare(r,input,base)?;
         let buffer_data = buffers::SceneBuffers::decode(input, base)?;
-        let mut animation = animation::Plan::compile_with_buffers(input, base, Some(&buffer_data.data))?;
+        let mut animation = animation::Plan::compile_in(input, base, Some(&buffer_data.data), opened)?;
         let camera_views=crate::camera_program::views(input,&nodes,&animation,&options.initial_time);
         let mut camera_programs=crate::camera_program::install(r,input,&mut nodes,base,&camera_views)?;
         let spectral=crate::camera_program::scene_spectral(r,input,base)?;
@@ -650,10 +695,13 @@ impl InstalledScene {
         let image_order = planned_image_order.clone();
         let image_slots = image_order.iter().enumerate().map(|(slot,name)|(name.clone(),slot)).collect();
         let mut textures = TextureInstaller::new(r, &image_slots);
+        textures.opened = opened.clone();
+        textures.canvases = options.canvases.clone();
         textures.fps = render.fps;
         let mut imported_materials=std::collections::BTreeMap::new();
         for node in &nodes {
             let NodeKind::Asset {file,..}=&node.node.kind else {continue;};
+            if crate::splats::is_file(file) {continue;}
             let asset_key=format!("asset:{file}");
             if !decoded.contains_key(&asset_key) {
                 let ((doc,buffers,images),keys)=materials::load_cached(&base.join(file),&r.disk_cache,&mut image_decoders,r.device.limits().max_texture_dimension_2d)?;
@@ -682,13 +730,19 @@ impl InstalledScene {
         let attributes=attribute_names.len() as u32;
         let required_locations=vork_slang::registry::VISIBILITY_LENS_LOCATION+1+attributes.saturating_sub(8);
         let limits=r.device.limits();
-        ensure!(required_locations <= limits.max_vertex_attributes,
-            "{}", crate::gpu_memory::limit_message("material attribute vertex layout", format_args!("{required_locations} locations ({attributes} named attributes)"), format_args!("max_vertex_attributes={}",limits.max_vertex_attributes), "reduce named material attributes"));
+        let raster_attributes=nodes.iter().any(|node|matches!(&node.node.kind,NodeKind::Mesh {..})
+            || matches!(&node.node.kind,NodeKind::Asset {file,..} if !crate::splats::is_file(file)));
+        // The most named attributes both checks below admit on this device; up
+        // to eight take no inter-stage check. Refusals state it (vork help limits).
+        let fit=(limits.max_vertex_attributes+8).saturating_sub(vork_slang::registry::VISIBILITY_LENS_LOCATION+1)
+            .min(limits.max_inter_stage_shader_variables.saturating_sub(14).max(8));
+        ensure!(!raster_attributes || required_locations <= limits.max_vertex_attributes,
+            crate::gpu_memory::device_limit("material attribute vertex layout", format_args!("{required_locations} locations ({attributes} named attributes)"), format_args!("max_vertex_attributes={}; this device fits {fit} named attributes on meshes",limits.max_vertex_attributes), "reduce named material attributes"));
 
-        if attributes>8 {
+        if attributes>8 && raster_attributes {
             let varying_locations=14+attributes;
             ensure!(varying_locations<=limits.max_inter_stage_shader_variables,
-                "{}", crate::gpu_memory::limit_message("material attribute pipeline", format_args!("{varying_locations} inter-stage locations"), format_args!("max_inter_stage_shader_variables={}",limits.max_inter_stage_shader_variables), "reduce named material attributes"));
+                crate::gpu_memory::device_limit("material attribute pipeline", format_args!("{varying_locations} inter-stage locations ({attributes} named attributes)"), format_args!("max_inter_stage_shader_variables={}; this device fits {fit} named attributes on meshes",limits.max_inter_stage_shader_variables), "reduce named material attributes"));
         }
         let programs = programs::install(r, input, native_program_materials.iter().map(|(name, p)| (*name, p)), base)?;
         let mut physical_hair_materials = std::collections::HashSet::new();
@@ -706,14 +760,20 @@ impl InstalledScene {
         // material validity. Program outputs need no sentinel input names.
         let mut transmission_materials=std::collections::BTreeSet::new();
         let mut spatial_subsurface = false;
+        let splat_materials:std::collections::HashSet<_>=nodes.iter().filter_map(|node|match &node.node.kind {
+            NodeKind::Asset {file,materials,..} if crate::splats::is_file(file)=>Some(materials.values().map(String::as_str)),
+            _=>None,
+        }).flatten().collect();
         for name in &program_material_names {
             if !stages[*name].surface { continue; }
             if let Some(instance) = programs::instance(input, name)? {
                 let capabilities=programs.as_ref().context("material program was not compiled")?.capabilities(&instance);
+                if splat_materials.contains(name.as_str()) {crate::splats::material_capabilities(&capabilities)?;}
                 spatial_subsurface|=capabilities.spatial_subsurface;
                 if capabilities.transmission {transmission_materials.insert(*name);}
             } else {
                 let record=materials::openpbr_values(input, Some(name), animated_inputs.get(*name).unwrap_or(&Default::default()), |_| Ok(0))?;
+                if splat_materials.contains(name.as_str()) {crate::splats::material_capabilities(&record.capabilities)?;}
                 spatial_subsurface|=record.spatial_subsurface();
                 if record.transmissive {transmission_materials.insert(*name);}
             }
@@ -781,6 +841,7 @@ impl InstalledScene {
         let program_trace=programs.as_ref().is_some_and(|p|p.dependencies().trace);
         effects.trace=program_trace;
         ensure!(!program_trace || !input.geometry.values().any(|g|matches!(g.topology,vork_scene::v2::Topology::Implicit)), "trace does not yet support implicit geometry; use evaluated triangle geometry");
+        ensure!(!program_trace || !crate::splats::present(input), "trace does not support Gaussian splats; remove trace from the program or the splat asset from the scene");
         let mut promoted_transport=spatial_subsurface || transmitting_casters;
         if promoted_transport {
             let raster=render.settings.integrator.raster_mut().unwrap();
@@ -798,7 +859,7 @@ impl InstalledScene {
         #[cfg(not(any(test, feature = "test-support")))]
         let qualified_media = true;
         if qualified_media && medium.is_some() {
-            ensure!(input.materials.iter().all(|(name, material)| !stages.get(name).is_some_and(|stage| stage.surface) || material.program == "std/openpbr"), "fog with custom surface callbacks is not yet supported; use std/openpbr until the cold-compile plug-in design is implemented");
+            admit_stage_effects(input,base,&stages)?;
             ensure!(!stages.values().any(|stage| stage.medium && stage.surface), "stage 1 fog does not support combined surface/medium programs; overlap an independent fog carrier with std/openpbr glass");
             if let Some(medium) = medium.as_mut() {
                 ensure!(medium.native.homogeneous || environment.settings.medium.as_deref().is_some_and(|world|medium.certified_world_exponential(world)), "stage 1 fog does not support varying finite media or arbitrary world density; use homogeneous coefficient programs for carriers and homogeneous or certified exponential-height world fog");
@@ -810,13 +871,11 @@ impl InstalledScene {
                 medium.native.work_limit = Some(131072);
                 #[cfg(any(test, feature = "test-support"))]
                 if options.test_convex_media || options.test_convex_work_limit.is_some() {medium.native.work_limit = options.test_convex_work_limit;}
-                if let Some(limit) = medium.native.work_limit {medium.native.identity.extend_from_slice(&limit.to_le_bytes());}
-                medium.native.identity.extend_from_slice(b"decision-d-path-cap-2");
             }
         }
 
         ensure!(medium.is_none() || effects.path,"internal error: participating media require complete-camera path transport");
-        if effects.path && let Some(error)=medium.as_ref().and_then(|m|m.native.sampled_error.as_ref()) {return Err(anyhow::anyhow!("{error}").context(crate::failure::FailureKind::Scene));}
+        if effects.path && let Some(error)=medium.as_ref().and_then(|m|m.native.sampled_error.as_ref()) {return Err(crate::failure::scene(anyhow::Error::new(crate::medium::SampledRefusal(error.clone()))));}
         let raster_samples = raster_samples(&scene.render);
         let mut light_shadow_rays=crate::rt::installed_shadow_rays(&scene,&nodes);
         let mut rays = crate::rt::uses_rays(&scene) || light_shadow_rays || promoted_transport || program_trace || compute_trace;
@@ -847,11 +906,12 @@ impl InstalledScene {
                 textures: 1, samplers: 1,
                 ray_refraction,
                 connection_transmission, surface_coverage:false, attribute_coverage:false, shadow_capacity:0,
-                no_shadow_containment: false, no_boundary_transactions: false, no_points: false,
+                no_shadow_containment: false, no_boundary_transactions: false, no_points: false, gaussians: false, unit_ior: false, unit_boundary_ior: false, no_gltf_tint: false, no_film: false,
                 probes: effects.probes,
                 fibre: effects.fibre,
                 denoise: effects.denoise,
                 field_controls,
+                software_raster: r.adapter_info.device_type == wgpu::DeviceType::Cpu,
                 medium: medium.as_ref().map(|m|std::sync::Arc::new(m.native.clone())),
             };
         // Program input words follow the material records in one buffer.
@@ -866,7 +926,7 @@ impl InstalledScene {
         let mut asset_decode_ms = 0.;
         let image_order = planned_image_order.clone();
         let mut views: Vec<_> = std::iter::once(render.clone()).chain(image_order.iter()
-            .map(|name| input.images[name].render.as_ref().unwrap().resolve(&render))).map(|mut view| {
+            .map(|name| input.images[name].resolved_render(&render).expect("a rendered image"))).map(|mut view| {
                 if let Some(raster)=view.settings.integrator.raster_mut() {
                     if spatial_subsurface {raster.subsurface_method=Some(vork_scene::v2::SubsurfaceMethod::Thickness);}
                     if transmitting_casters {raster.shadow_method=vork_scene::ShadowMethod::Ray;}
@@ -893,6 +953,7 @@ impl InstalledScene {
             &[0; 96],
             wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::INDEX | wgpu::BufferUsages::STORAGE,
         );
+        let mut splat_clouds=std::collections::HashMap::<String,std::sync::Arc<vork_splat::Cloud>>::new();
         let mut geometry_ranges = std::collections::HashMap::<
             (String, bool, Option<usize>),
             std::ops::Range<usize>,
@@ -926,17 +987,24 @@ impl InstalledScene {
                 ),
                 _ => unreachable!(),
             };
+            let is_splat=asset_source.is_some_and(|(path,..)|crate::splats::is_file(path));
             let stream_layout = native_mesh.is_some_and(|(name,_)| crate::computed_geometry::dynamic(input, &input.geometry[name.as_str()]));
             let evaluated_layout=stream_layout || match (native_mesh,asset_source) {
                 (Some((_,materials)),_)=>materials.iter().any(|name|stages.get(name).is_some_and(|s|s.displacement)),
                 (_,Some((_,materials,_)))=>materials.values().any(|name|stages.get(name).is_some_and(|s|s.displacement)),
                 _=>false,
             };
+            ensure!(!is_splat || !evaluated_layout,"Gaussian splats do not support displacement programs; transform their asset node or replace the surface material");
             let key=if evaluated_layout {format!("{key}:evaluated")} else {key};
             let loaded = if let Some(loaded) = decoded.get(&key) {
                 std::rc::Rc::clone(loaded)
             } else {
-                let (loaded, geometry, image_keys) = if let Some((path, ..)) = asset_source {
+                let (loaded, geometry, image_keys) = if is_splat {
+                    let (path,..)=asset_source.unwrap();
+                    let cloud=crate::splats::read(&base.join(path),crate::residency::available(&r.device).unwrap_or(u64::MAX))?;
+                    splat_clouds.insert(key.clone(),std::sync::Arc::new(cloud));
+                    ((None,std::sync::Arc::new(vec![]),vec![]),None,Vec::new())
+                } else if let Some((path, ..)) = asset_source {
                     let path = base.join(path);
                     let (loaded, keys) = materials::load_cached(
                         &path,
@@ -986,7 +1054,7 @@ impl InstalledScene {
                     objects[object as usize].material_index[2] = 1;
                 }
             }
-            if let Some((_, _, overrides)) = asset_source {
+            if let Some((_, _, overrides)) = asset_source.filter(|_|!is_splat) {
                 let doc = doc.as_ref().context("asset requires a glTF document")?;
                 let mut targets = std::collections::HashSet::new();
                 for key in overrides.keys() {
@@ -1015,7 +1083,7 @@ impl InstalledScene {
                 }
             }
             asset_decode_ms += decode_start.elapsed().as_secs_f64() * 1000.;
-            let asset_id = asset_source.is_some().then_some(assets.len());
+            let asset_id = (asset_source.is_some() && !is_splat).then_some(assets.len());
             if let (Some(asset), Some((_, _, overrides))) = (asset_id, asset_source) {
                 lights::import(
                     doc.as_ref().context("asset requires a glTF document")?,
@@ -1044,7 +1112,7 @@ impl InstalledScene {
             } else {
                 None
             };
-            if let Some((path, ..)) = asset_source {
+            if let Some((path, ..)) = asset_source.filter(|_|!is_splat) {
                 let doc = doc.as_ref().context("asset requires a glTF document")?;
                 // Clip layers bound to this asset, by plan layer index.
                 let clips: Vec<_> = animation.clips_for_asset(&node.node.name).collect();
@@ -1068,7 +1136,7 @@ impl InstalledScene {
             // Imported cameras and their animation remain live without mesh
             // consumers; material installation and geometry uploads do not.
             if !scene_inputs {continue;}
-            let asset_animated = if native_mesh.is_some() {
+            let asset_animated = if native_mesh.is_some() || is_splat {
                 native_deformation
             } else {
                 assets[asset_id.expect("glTF asset registered")].animated()
@@ -1100,6 +1168,24 @@ impl InstalledScene {
                                     attributes::validate(binding,width,accessor.dimensions().multiplicity() as u32)?;
                                 }
                             }
+                        }
+                    }
+                }
+                if is_splat {
+                    if let Some(name)=bindings.select(Some(0)) {
+                        let material=&input.materials[name];
+                        for (input_name,value) in &material.inputs {
+                            let vork_scene::v2::Input::Attribute(binding)=value else {continue;};
+                            let source=crate::splats::attribute(&splat_clouds[&key].metadata,&binding.attribute)?>>24;
+                            let width=if material.program=="std/openpbr" {
+                                match vork_scene::OpenPbrParam::find(input_name).context("OpenPBR attribute input")?.kind {
+                                    vork_scene::OpenPbrKind::Float=>1,vork_scene::OpenPbrKind::Color3=>3,_=>anyhow::bail!("attribute requires a numeric destination"),
+                                }
+                            } else {
+                                let instance=programs::instance(input,name)?.context("attribute program instance")?;
+                                programs.as_ref().and_then(|p|p.attribute_width(&instance,input_name)).context("attribute bindings require Attribute<T> Inputs")?
+                            };
+                            attributes::validate(binding,width,source)?;
                         }
                     }
                 }
@@ -1157,10 +1243,15 @@ impl InstalledScene {
                         material.physical_hair=programs.is_physical_hair(program);
                         let capabilities = programs.capabilities(program);
                         material.response_program = if capabilities.anisotropy {crate::forward_variant::FEATURE_ANISOTROPY} else {0}
+                            | if capabilities.coat_anisotropy {crate::forward_variant::FEATURE_COAT_ANISOTROPY} else {0}
                             | if capabilities.film {crate::forward_variant::FEATURE_FILM} else {0}
                             | if capabilities.coat {materials::FEATURE_COAT} else {0}
                             | if capabilities.fuzz {materials::FEATURE_FUZZ} else {0}
-                            | if capabilities.tint {materials::FEATURE_TINT} else {0};
+                            | if capabilities.tint {materials::FEATURE_TINT} else {0}
+                            // The surface stage's lobe is proven. A reflecting lit stage's
+                            // closure has no such proof, so it keeps the lobe possible.
+                            | if capabilities.subsurface || capabilities.lit_reflects {crate::forward_variant::FEATURE_SUBSURFACE} else {0}
+                            | if capabilities.weighted_ior {materials::FEATURE_WEIGHTED_IOR} else {0};
                         if !programs.is_hair(program) && (capabilities.opacity || capabilities.transmission) {
                             material.integrate_opacity(authored.opacity, capabilities.transmission, programs.coverage_varies(program));
                         }
@@ -1197,7 +1288,9 @@ impl InstalledScene {
                     Ok(index)
                 };
                 let mut map = Vec::new();
-                if let Some((_, slots)) = native_mesh {
+                if is_splat {
+                    map.push(make_material(None,Some(0))?);
+                } else if let Some((_, slots)) = native_mesh {
                     for slot in 0..slots.len().max(1) {
                         map.push(make_material(None, Some(slot))?);
                     }
@@ -1210,7 +1303,7 @@ impl InstalledScene {
                         map.push(if reachable.contains(&material.index()) {make_material(Some(&material),material.index())?} else {0});
                     }
                 }
-                let default = if native_mesh.is_some() {
+                let default = if native_mesh.is_some() || is_splat {
                     map.first().copied().context("native mesh requires material slots")?
                 } else if imported_material_slots(doc.as_ref().unwrap())?.contains(&None) {
                     make_material(None,None)?
@@ -1230,6 +1323,7 @@ impl InstalledScene {
                 for i in range.clone() {
                     let source = &draws[i];
                     draws.push(Draw {
+                        splats: source.splats.clone(),
                         implicit: source.implicit.clone(),
                         sort_order: 0,
                         vertices: source.vertices.clone(),
@@ -1316,7 +1410,9 @@ impl InstalledScene {
                 meshes: std::collections::HashMap::new(),
                 path: Vec::new(),
             };
-            if let Some(geometry) = geometry {
+            if is_splat {
+                crate::splats::upload(&mut import,&splat_clouds[&key])?;
+            } else if let Some(geometry) = geometry {
                 let (name, slots) = native_mesh.expect("native geometry has a mesh node");
                 let source = &input.geometry[name.as_str()];
                 let deform = if let Some(binding) = &native_binding {
@@ -1381,6 +1477,7 @@ impl InstalledScene {
             });
         }
         drop(decoded);
+        drop(splat_clouds);
         buffers::instances(&nodes, &mut roots, &mut objects, &mut draws, &buffer_data)?;
         let mut refused_geometry_effects = std::collections::BTreeSet::new();
         for draw in &mut draws {
@@ -1583,6 +1680,26 @@ impl InstalledScene {
             }
         }
         animation.mark_nodes(&mut nodes, camera)?;
+        // A program's `time` input is its node's local time (rule 7), which programs cannot read yet:
+        // a program that reads `time` under a node clock is refused with one line.
+        for (index, node) in nodes.iter().enumerate().filter(|(index, _)| animation.under_clock(*index)) {
+            let refuse = |what: String| anyhow::anyhow!("node {:?}: {what} reads time, and a program's time under a node clock is not in this release; key its inputs instead", node.node.name);
+            let materials: Vec<&String> = match &node.node.kind {
+                NodeKind::Mesh { materials, .. } => materials.iter().collect(),
+                NodeKind::Asset { materials, .. } => materials.values().collect(),
+                _ => Vec::new(),
+            };
+            for material in materials {
+                if let (Some(programs), Some(instance)) = (programs.as_ref(), programs::instance(input, material)?) {
+                    if programs.reads_time(&instance) { return Err(refuse(format!("material {material:?}"))); }
+                }
+            }
+            if let Some(program) = camera_programs.iter().find(|p| p.node == index && p.uses_time) {
+                return Err(refuse(format!("camera material {:?}", program.material)));
+            }
+            if environment.node == Some(index) && environment.uses_time() { return Err(refuse("the environment program".into())); }
+            if environment.node == Some(index) && medium.as_ref().is_some_and(|m| m.native.time_dependent) { return Err(refuse("the medium program".into())); }
+        }
         let targets = crate::targets::Plan::compile(&mut nodes)?;
         animation.finish_asset_bindings()?;
         let mut samples = animation.samples();
@@ -1642,7 +1759,7 @@ impl InstalledScene {
         // Captures share this installed light_plan. Media also consumes map transport.
         // The profile resolution is a quality floor. Large authored views and
         // captures need correspondingly sized maps, bounded by the actual GPU.
-        let fibre_view_side=std::iter::once(render.resolution).chain(input.images.values().filter_map(|i|i.render.as_ref()).map(|view|view.resolve(&render).resolution)).flatten().max().unwrap_or(1);
+        let fibre_view_side=std::iter::once(render.resolution).chain(input.images.values().filter_map(|i|i.render.as_ref()).map(|view|view.resolution)).flatten().max().unwrap_or(1);
         let mut light_plan = LightPlan::logical(&nodes, &limits, medium.is_some())?;
         if let Some(medium) = &mut medium {
             // Keep animated/imported reservations: an empty installed plan is
@@ -1651,7 +1768,7 @@ impl InstalledScene {
         }
         light_plan.blackbody = crate::light_temperature::table(r, &nodes)?;
         ensure!(r.device.features().contains(wgpu::Features::BUFFER_BINDING_ARRAY),
-            "shadow depth-bounds tables require buffer binding arrays on this backend");
+            crate::gpu_memory::DeviceLimit("shadow depth-bounds tables require buffer binding arrays on this backend".into()));
         // Thin and solid interfaces use the same scene continuation. Refine
         // transport against installed materials, independently of solid occupancy.
         let transport_rays = ray_refraction && draws.iter().any(|draw| materials[draw.material].transmissive);
@@ -1689,6 +1806,13 @@ impl InstalledScene {
         }
         // This is the lowered/compiled proof, including imported and program alpha.
         // Resolve it before choosing the shared opaque pipeline registry.
+        slang.unit_ior = materials.iter().all(|material|!material.weighted_ior());
+        slang.unit_boundary_ior = materials.iter().filter(|material|material.transmissive).all(|material|!material.weighted_ior());
+        slang.no_gltf_tint = materials.iter().all(|material|!material.gltf_tint());
+        slang.gaussians = draws.iter().any(|draw|draw.splats.is_some());
+        for draw in draws.iter().filter(|draw|draw.splats.is_some()) {
+            ensure!(!materials[draw.material].solid_transmission(),"Gaussian splats have no closed dielectric boundary; use a closed triangle mesh or a thin-walled std/openpbr material");
+        }
         slang.no_points = !draws.iter().any(|draw|draw.exit_geometry.as_ref().is_some_and(|g|!g.point_centers.is_empty()));
         slang.surface_coverage = draws.iter().any(|draw|materials[draw.material].surface_coverage());
         slang.attribute_coverage = attributes != 0 && draws.iter().any(|draw|materials[draw.material].attribute_coverage());
@@ -1757,32 +1881,29 @@ impl InstalledScene {
         // are known. Enforce transport requirements only after that reservation
         // has been refined against the actual lights and material draws.
         ensure!(!light_shadow_rays || r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY),
-            "effect unavailable: light shadows need hardware ray queries; use a ray-query capable adapter");
+            crate::gpu_memory::DeviceLimit("effect unavailable: light shadows need hardware ray queries; use a ray-query capable adapter".into()));
         if promoted_transport {
             ensure!(r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY | crate::rt::HIT_BUFFER_FEATURES),
-                "surface transport needs mesh-thickness or RGB light-connection ray queries and hit buffers; use a GPU supporting ray queries");
+                crate::gpu_memory::DeviceLimit("surface transport needs mesh-thickness or RGB light-connection ray queries and hit buffers; use a GPU supporting ray queries".into()));
 
         }
-        ensure!(!rays || !program_coverage || r.device.features().contains(crate::rt::HIT_BUFFER_FEATURES), "ray material visibility requires storage buffer binding arrays");
+        ensure!(!rays || !program_coverage || r.device.features().contains(crate::rt::HIT_BUFFER_FEATURES), crate::gpu_memory::DeviceLimit("ray material visibility requires storage buffer binding arrays".into()));
         (slang.textures,slang.samplers)=textures.counts()?;
         let descriptor_elements=u64::from(slang.textures)+u64::from(slang.samplers)
             +u64::from(crate::passes::decoupled::evaluation_pages(&limits,slang.aov_count))
             +u64::from(constants::VISIBILITY_REFLECTION_WORDS)+u64::from(constants::RAY_HIT_BUFFERS)+crate::camera_native::TABLES.iter().map(|t|t.resources.len() as u64).sum::<u64>();
         ensure!(slang.samplers <= limits.max_binding_array_sampler_elements_per_shader_stage,
-            "{}", crate::gpu_memory::limit_message("scene material samplers", format_args!("{} samplers",slang.samplers), format_args!("max_binding_array_sampler_elements_per_shader_stage={}",limits.max_binding_array_sampler_elements_per_shader_stage), "reuse material image samplers or reduce material image inputs"));
+            crate::gpu_memory::device_limit("scene material samplers", format_args!("{} samplers",slang.samplers), format_args!("max_binding_array_sampler_elements_per_shader_stage={}",limits.max_binding_array_sampler_elements_per_shader_stage), "reuse material image samplers or reduce material image inputs"));
         ensure!(descriptor_elements <= u64::from(limits.max_binding_array_elements_per_shader_stage),
-            "{}", crate::gpu_memory::limit_message("scene material/ray tables", format_args!("{descriptor_elements} descriptors"), format_args!("max_binding_array_elements_per_shader_stage={}",limits.max_binding_array_elements_per_shader_stage), "reduce material image inputs or geometry buffer pool sizes"));
+            crate::gpu_memory::device_limit("scene material/ray tables", format_args!("{descriptor_elements} descriptors"), format_args!("max_binding_array_elements_per_shader_stage={}",limits.max_binding_array_elements_per_shader_stage), "reduce material image inputs or geometry buffer pool sizes"));
         // The shared builtin registry is point-capable. Preserve the no-point
         // proof by using the scene-keyed registry for its lean hit variants.
-        let builtin=!slang.no_points && propagation.is_none() && !spectral && camera_programs.is_empty() && slang.environment.is_none() && programs.is_none() && medium.is_none()
+        let builtin=!slang.gaussians && !slang.software_raster && !slang.no_points && propagation.is_none() && !spectral && camera_programs.is_empty() && slang.environment.is_none() && programs.is_none() && medium.is_none()
             && !ray_shadows && !slang.ray_refraction && !slang.connection_transmission && !slang.surface_coverage && !effects.denoise && !effects.probes && render.aovs.is_empty()
             && slang.attributes==0 && slang.textures==vork_slang::registry::MATERIAL_TEXTURE_CAPACITY && slang.samplers==vork_slang::registry::MATERIAL_SAMPLER_CAPACITY;
-        let pipelines = if builtin {r.cached_pipelines(raster_samples)} else {r.program_pipelines(programs.as_ref().map_or("", |p| p.identity.as_str()),
-            RESOLVE,
-            raster_samples, ray_shadows, slang.clone())?};
-        let effects_compiler=Some({let pipelines=pipelines.clone(); scope.spawn(move ||pipelines.ensure_effects(r,effects))});
-        let mat_layout=pipelines.mat_layout.clone();
-        let cached = &*pipelines;
+        // Material bindings can be prepared before kernel planning. The final
+        // registry creates the same descriptor layout from these installed facts.
+        let mat_layout=r.device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {label:Some("material"),entries:&pipelines::material_entries_for(slang.textures.max(1),slang.samplers.max(1))});
         for d in &draws {
             if let Some(a) = &d.deform {
                 if a.native.is_none() {
@@ -1798,7 +1919,7 @@ impl InstalledScene {
             let missing = materials[draw.material].uv_sets() & !draw.uv_sets;
             ensure!(
                 missing == 0,
-                "a material texture reads TEXCOORD_{} (uv{}), which its geometry lacks",
+                "a material texture reads TEXCOORD_{} (uv{}), which its geometry lacks; add that UV set to the geometry or change the texture binding",
                 materials[draw.material].uv_sources[missing.trailing_zeros() as usize],
                 materials[draw.material].uv_sources[missing.trailing_zeros() as usize]
             );
@@ -1808,6 +1929,8 @@ impl InstalledScene {
         let mut records = Vec::with_capacity(materials.len().max(1));
         for material in &materials {
             let mut record = material.record;
+            // Every fact it reads is final here: programs, tracks and imports are installed.
+            if material.null_connection() {record.tag[2] |= vork_slang::registry::FLAG_NULL_CONNECTION;}
             if !material.taps.is_empty() {
                 let words: Vec<u32> = material.taps.iter().flatten().copied().collect();
                 record.tag[1] = *tap_offsets.entry(words).or_insert_with_key(|words| {
@@ -1830,7 +1953,7 @@ impl InstalledScene {
             camera.offset+=record_words as usize;
         }
         if let Some(primary)=&environment.primary {
-            ensure!(records.len()==1 && materials.is_empty(),"spatial environments require an empty geometry table");
+            ensure!(!primary.spatial || (records.len()==1 && materials.is_empty()),"spatial environments require an empty geometry table");
             programs::bind_inputs(&mut animation,&primary.material,&primary.layout,
                 &mut material_words[..primary.words.len()],record_words as usize,0.)?;
         }
@@ -1886,13 +2009,16 @@ impl InstalledScene {
         for (draw_index, draw) in draws.iter().enumerate() {
             let (minimum, maximum) = draw.generated_bounds;
             let extent = maximum - minimum;
-            let (lo, hi) = draw.bounds;
+            let (lo, hi) = if draw.splats.is_some() {draw.generated_bounds} else {draw.bounds};
             // Deformation may leave the installed bounds; keep those instances eligible.
             let bounded = !draw.evaluated() && lo.is_finite() && hi.is_finite();
             let words = [minimum.x, minimum.y, minimum.z, extent.x, extent.y, extent.z,
                 lo.x, lo.y, lo.z, hi.x, hi.y, hi.z, if bounded { 1. } else { 0. }].map(f32::to_bits);
             let provenance = programs.as_ref().is_some_and(|p|p.native.is_some()).then_some(draw.exit_geometry.as_ref()).flatten();
-            let identity=provenance.map(|geometry|(std::sync::Arc::as_ptr(geometry) as usize,draw.primitive_start,draw.count));
+            let identity=provenance.map(|geometry|(false,std::sync::Arc::as_ptr(geometry) as usize,draw.primitive_start,draw.count))
+                // Gaussian source IDs are the identity map for the complete
+                // capture. Every storage chunk of an object shares this row.
+                .or_else(||draw.splats.as_ref().map(|geometry|(true,0,0,geometry.capture_count)));
             for object in draw.instances.clone() {
                 let root = &roots[object as usize];
                 let node = &nodes[root.node].node;
@@ -1937,6 +2063,8 @@ impl InstalledScene {
                     if let Some(geometry)=provenance {
                         let first=draw.primitive_start as usize;
                         material_words.extend_from_slice(&geometry.primitive_ids[first..first+draw.count as usize/3]);
+                    } else if let Some(geometry)=&draw.splats {
+                        material_words.extend(0..geometry.capture_count);
                     }
                     offset
                 });
@@ -1971,10 +2099,9 @@ impl InstalledScene {
         // compositor images sample the nominal output clock after accumulation.
         let mut sampled_media:std::collections::BTreeSet<_>=textures.footage.keys().cloned().collect();
         for name in &planned_image_order {
-            let image=input.images[name].render.as_ref().unwrap();
-            sampled_media.extend(compositor::image_reads(&compositor,&image.compositor));
+            sampled_media.extend(compositor::image_reads(&compositor,input.images[name].compositor()));
         }
-        let final_media=if output_dependencies.color {compositor::image_reads(&compositor,&input.render.compositor)} else {Default::default()};
+        let final_media=if output_dependencies.color {compositor::image_reads(&compositor,input.compositor())} else {Default::default()};
         let mut file_images = std::collections::BTreeMap::new();
         // Compositor image handles reuse the exact scene texture installation.
         let mut post_materials=std::collections::BTreeSet::new();
@@ -1982,8 +2109,8 @@ impl InstalledScene {
             let (_,live)=compositor::dependencies(&compositor,names);
             post_materials.extend(names.iter().zip(live).filter(|(_,live)|*live).map(|(entry,_)|entry.material().clone()));
         };
-        if output_dependencies.color {add(&input.render.compositor);}
-        for name in &planned_image_order {add(&input.images[name].render.as_ref().unwrap().compositor);}
+        if output_dependencies.color {add(input.compositor());}
+        for name in &planned_image_order {add(input.images[name].compositor());}
         for name in post_materials {
             let material=&input.materials[&name];
             for (field,value) in &material.inputs {
@@ -2006,6 +2133,9 @@ impl InstalledScene {
             .into_iter()
             .map(materials::PendingMaterial::finish)
             .collect();
+        // Camera refraction reaches off-camera materials too. Use the complete
+        // installed union before raster variant budgeting widens its keys.
+        slang.no_film = materials::installed_features(&materials) & materials::FEATURE_FILM == 0;
         if rays {
             crate::rt::prepare_coverage(&mut draws, &materials)?;
         }
@@ -2201,8 +2331,9 @@ impl InstalledScene {
         };
         // Only beauty views consume solid exit traversal. Path controls and
         // shadow passes do not. Include every reachable render-image capture.
-        if views.iter().any(|view|view.settings.integrator.raster().is_some_and(|r|r.refraction==vork_scene::Refraction::Screen)) {
-            refuse_screen_contents(&draws,&roots,&objects,&materials)?;
+        for view in views.iter().filter(|view|view.settings.integrator.raster().is_some_and(|r|r.refraction==vork_scene::Refraction::Screen)) {
+            let included=crate::render_images::included_nodes(&nodes,view.root.as_deref())?;
+            refuse_screen_contents(&draws,&roots,&included,&objects,&materials,&records)?;
         }
         let mut needs_raster_solid_exit = vec![false; nodes.len()];
         if !effects.path {
@@ -2434,6 +2565,7 @@ impl InstalledScene {
             render.duration.clone(),
             geometry_inputs,
             None,
+            opened,
         )?} else {None};
         if let Some(compute) = &mut compute {
             compute.bind_material_attributes(program_buffers.as_ref().unwrap(), material_attribute_sources)?;
@@ -2484,7 +2616,7 @@ impl InstalledScene {
         let mut solids = if plan.effects.path || ray_refraction || shadow_occupancy {
             crate::passes::path::solids(&draws, &roots, &materials)?
         } else { Default::default() };
-        if ray_refraction && solids.boundaries.is_empty() {
+        if (ray_refraction || plan.effects.path) && solids.boundaries.is_empty() {
             // Thin-only transport still queries the common per-object/instance
             // identity tables. Every entry explicitly denotes no solid owner.
             solids.boundaries.resize(objects.len(),u32::MAX);
@@ -2492,6 +2624,19 @@ impl InstalledScene {
         }
         let (occupancy_solids, installed_capacity)=crate::passes::path::occupancy(&solids,&draws,&roots,&nodes,&objects,compute.as_ref(),&animation,&targets);
         let boundary_capacity=crate::passes::path::kernel_boundaries(installed_capacity);
+        // Camera containment can only find an interior if some sample starts
+        // within a solid's bounds. Prove that none does, for every reachable
+        // camera at every view size and for the whole install, or keep the query.
+        // A scene without solids holds the proof whatever its cameras do, so its
+        // kernel key does not depend on them.
+        let camera_exterior = occupancy_solids.is_empty() || {
+            let resolutions:Vec<[u32;2]>=std::iter::once(render.resolution)
+                .chain(input.images.values().filter_map(|i|i.render.as_ref()).map(|view|view.resolution))
+                .chain(crate::camera_program::views(input,&nodes,&animation,&options.initial_time).into_values().flatten()).collect();
+            let origins=crate::camera_program::origin_balls(&camera_programs,&nodes,&materials::animated_inputs(input)?,&resolutions,
+                |node|crate::passes::path::position_at_rest(node,&nodes,&animation,&targets))?;
+            crate::passes::path::camera_exterior(&occupancy_solids,origins.as_deref())
+        };
         // A thin-only walk retains an empty occupancy state. One unused slot
         // keeps the existing transport specialization distinct from no transport;
         // real solid capacity remains the geometry-derived bound.
@@ -2561,33 +2706,41 @@ impl InstalledScene {
                 }
             }
         }
-        let path = if plan.effects.path {
-            // Hits and mesh-light connections can reach every installed material,
-            // including off-camera draws. Capture the union before raster's variant
-            // budget can replace individual material keys with its generic fallback.
-            let features = materials.iter().fold(materials::FEATURE_SPECIALIZED, |union, m| union | m.features);
-            // A programmed lit receiver evaluates the shared direct-light service
-            // at path hits. Its variant needs the installed light capabilities
-            // as well as the material response proofs.
-            let features = if features & materials::FEATURE_LIT != 0 { features | light_features } else { features };
-            // Geometry is fixed at install: animation/compute can change field values,
-            // but cannot introduce a new implicit draw. Include off-camera fields and
-            // non-emitting fields; material emission/visibility can change at runtime.
-            let features = features | if draws.iter().any(|draw| draw.implicit.is_some()) {
-                crate::forward_variant::FEATURE_IMPLICIT_GEOMETRY
-            } else { 0 };
-            // Beauty convergence does not establish independently authored AOV convergence.
-            Some(crate::passes::path::Pipeline::new(r, crate::constants::PATH_USE_ADAPTIVE_SAMPLING && render.aovs.is_empty() && !crate::catcher::has_catchers(input), crate::catcher::has_catchers(input), random_walk, features, boundary_capacity, !emitter_profiles.is_empty(), path_media, options, &pipelines)?)
-        } else { None };
-        // Reflections can hit every material, before raster variant budgeting.
+        // Ray hits can reach every installed material, including off-camera draws.
+        // Capture the union before raster's variant budget can replace individual
+        // material keys with its generic fallback.
         let hit_material_features = materials.iter().fold(materials::FEATURE_SPECIALIZED, |union, m| union | m.features);
+        let path_kernel = if plan.effects.path {
+            // One rule, every scene: the path kernel's key is the union of what is
+            // installed. Materials give their response and transport capabilities
+            // (table values, textures, tracks and compiled program proofs); lights
+            // give their kind when a scene installs exactly one, the one light fact
+            // transport folds on (no light or several kinds compile every kind, and
+            // the raster shadow and shape bits select nothing here: either would
+            // only split the cache); geometry gives its implicit fields, and the
+            // cameras and solids give the proof that no camera origin starts inside one.
+            // Each is fixed at install: animation and compute change values, never
+            // which capability exists. The same scene always derives the same key, and an
+            // edit that adds or removes a used capability derives a different one
+            // at its next install.
+            let features = materials::installed_features(&materials)
+                | crate::forward_variant::folded_light_kinds(light_features)
+                | if draws.iter().any(|draw| draw.implicit.is_some()) {
+                    crate::forward_variant::FEATURE_IMPLICIT_GEOMETRY
+                } else { 0 }
+                // The one key that may carry this proof: absence is the safe value, so
+                // it is never part of a union.
+                | if camera_exterior { crate::forward_variant::FEATURE_CAMERA_EXTERIOR } else { 0 };
+            // Beauty convergence does not establish independently authored AOV convergence.
+            Some(pipelines::ProgramKernel::Path {adaptive:crate::constants::PATH_USE_ADAPTIVE_SAMPLING && render.aovs.is_empty() && !crate::catcher::has_catchers(input),catchers:crate::catcher::has_catchers(input),random_walk,features,boundaries:boundary_capacity,emitter_profiles:!emitter_profiles.is_empty(),media:path_media})
+        } else { None };
         if let Some(compute) = &mut compute {
             compute.prepare_bridge(r, &draws, &objects)?;
         }
         let material_bind_ms = material_bind_start.elapsed().as_secs_f64() * 1000.;
         // Ray shadow candidates read other materials' opacity, not only the
         // receiver's textures. Never prune that lookup using the receiver key.
-        let ray_alpha = if cached.ray_shadows {
+        let ray_alpha = if ray_shadows {
             materials::texture_feature("geometry_opacity")
         } else {
             0
@@ -2612,10 +2765,11 @@ impl InstalledScene {
         materials::bound_features(&mut materials, draws.iter().map(|d| (d.layout, d.material)));
         // Controls and camera evaluations compile the same authored source for
         // independent GPU stages. Install both concurrently before any draw.
-        let geometry_keys =
+        let geometry_keys:std::collections::HashSet<pipelines::GeometryKey> =
             draws
                 .iter()
                 .zip(&plan.draws)
+                .filter(|(draw,_)|draw.rasterized())
                 .flat_map(|(draw, flags)| {
                     pipelines::Role::kinds(flags, plan.decoupled).iter().copied().chain(crate::fibre_transport::Stage::ALL.into_iter().filter(|_|plan.effects.fibre && flags.hair).map(|stage|crate::bundles::Kind::Fibre(stage,false))).filter(|&kind|graph.draws(kind)).map(|kind| {
                         (
@@ -2625,6 +2779,20 @@ impl InstalledScene {
                     })
                 })
                 .collect();
+        let camera_kernels=plan.decoupled.then(||crate::passes::decoupled::KernelPlan::new(&draws,features,&plan,&render,&visibility,&records,&camera_program_features,ray_refraction,refraction_capacity,!emitter_profiles.is_empty(),variants,slang.programs.is_none()));
+        let mut kernels:Vec<_>=path_kernel.into_iter().chain(camera_kernels.iter().flat_map(|plan|plan.kernels.iter().copied())).collect();
+        if let Some(pipelines::ProgramKernel::Path {adaptive,..})=path_kernel {
+            if slang.path_environment_prepass() {kernels.push(pipelines::ProgramKernel::PathEnvironment {adaptive});}
+        }
+        if plan.effects.reflections {kernels.push(pipelines::ProgramKernel::Reflections {features});}
+        if plan.effects.ray_indirect {kernels.push(pipelines::ProgramKernel::Gi {features});}
+        if plan.effects.probes {kernels.extend([false,true].map(|directional|pipelines::ProgramKernel::Probes {features,directional}));}
+        let pipelines=if builtin {r.cached_pipelines(raster_samples)} else {r.program_pipelines(RESOLVE,raster_samples,ray_shadows,slang.clone(),&geometry_keys,&kernels)?};
+        let cached=&*pipelines;
+        let effects_compiler=Some({let pipelines=pipelines.clone();scope.spawn(move ||pipelines.ensure_effects(r,effects))});
+        let path=if let Some(pipelines::ProgramKernel::Path {adaptive,catchers,random_walk,features,boundaries,emitter_profiles,media})=path_kernel {
+            Some(crate::passes::path::Pipeline::new(r,adaptive,catchers,random_walk,features,boundaries,emitter_profiles,media,slang.path_environment_prepass(),options,&pipelines)?)
+        } else {None};
         let asset_pipeline_start = Instant::now();
         let (decoupled, reflections, gi, geometry_pipelines) = std::thread::scope(|scope| {
             let assets = scope.spawn(|| cached.ensure_assets(r, &plan));
@@ -2634,7 +2802,7 @@ impl InstalledScene {
             let gi = plan.effects.ray_indirect.then(|| scope.spawn(||
                 crate::passes::ao::ray_pipeline(r, &pipelines, features, plan.effects.probes, variants)));
             let decoupled = plan.decoupled.then(||
-                crate::passes::decoupled::Install::new(r, &pipelines, &draws, features, &plan, &render, &visibility, &records, &camera_program_features, ray_refraction, refraction_capacity, !emitter_profiles.is_empty(), variants)).transpose();
+                crate::passes::decoupled::Install::new(r, &pipelines, &draws, &plan, &render, ray_refraction, refraction_capacity, variants, camera_kernels.as_ref().expect("planned camera kernels"))).transpose();
             use pipelines::join;
             join(assets)?;
             anyhow::Ok((decoupled?,
@@ -2642,6 +2810,7 @@ impl InstalledScene {
              gi.map(join).transpose()?,
              join(geometry)?))
         })?;
+        let software_geometry = (pipelines.software_raster && !plan.decoupled).then(|| crate::passes::decoupled::RasterGeometry::new(r,&draws,&plan)).transpose()?;
         // Stop at a driver failure creating these pipelines instead of building
         // the rest of the scene on a lost device.
         r.errors.check()?;
@@ -2670,7 +2839,7 @@ impl InstalledScene {
         let object_limit = limits.max_buffer_size.min(limits.max_storage_buffer_binding_size);
         ensure!(
             object_bytes <= object_limit,
-            "{}", crate::gpu_memory::limit_message(format_args!("object storage (backend {:?}, adapter {:?}, driver {:?})",r.adapter_info.backend,r.adapter_info.name,r.adapter_info.driver), format_args!("{object_bytes} bytes"), format_args!("{object_limit} bytes"), "reduce geometry instance count")
+            crate::gpu_memory::device_limit(format_args!("object storage (backend {:?}, adapter {:?}, driver {:?})",r.adapter_info.backend,r.adapter_info.name,r.adapter_info.driver), format_args!("{object_bytes} bytes"), format_args!("{object_limit} bytes"), "reduce geometry instance count")
         );
         let geometry_vertex_bytes = draws
             .iter()
@@ -2707,7 +2876,6 @@ impl InstalledScene {
         }
         let capture_controls = input.materials.values().any(|m| {
             m.program != "std/openpbr"
-                && m.program != "std/fog"
                 && m.inputs.values().any(|v| {
                     let name = match v {
                         vork_scene::v2::Input::Texture(t) => Some(&t.image),
@@ -2741,7 +2909,7 @@ impl InstalledScene {
 
         let effect_wait = Instant::now();
         if let Some(compiler) = effects_compiler {
-            compiler.join().map_err(|_| anyhow::anyhow!("scene effect pipeline compiler panicked"))??;
+            compiler.join().map_err(|panic| crate::failure::panicked("scene effect pipeline compiler", panic))??;
         }
         pipeline_ms += effect_wait.elapsed().as_secs_f64() * 1000.;
         let sampling = crate::sampling::Parameters::new(&r.device, &scene, &render);
@@ -2769,6 +2937,7 @@ impl InstalledScene {
             path,
             reflections,
             decoupled,
+            software_geometry,
             gi,
             probes,
             fibre,
@@ -2781,6 +2950,7 @@ impl InstalledScene {
             spectral,
             links,
             medium_base,
+            environment_base: record_words,
             has_media: medium.is_some(),
             medium_certified_times: medium.as_ref().filter(|m|m.native.tracking).map(|_|medium::certification_times(input)),
             emitter_profiles,
@@ -2893,7 +3063,7 @@ impl InstalledScene {
                     Ok(()) => {},
                     // A refused successor keeps no completed frame: it is resubmitted
                     // after the redo, and the frame loop handles its refusal then.
-                    Err(error) if error.downcast_ref::<crate::FrameRefused>().is_some() => {},
+                    Err(error) if crate::failure::cause::<crate::FrameRefused>(&error).is_some() => {},
                     Err(error) => match error.downcast_ref::<crate::FrameRedo>() {
                         Some(redo) => {
                             demand=demand.max(redo.0);
@@ -2905,8 +3075,8 @@ impl InstalledScene {
             }
             let grown = self.reservations.max(demand);
             ensure!(grown != self.reservations,
-                "frame storage cannot grow beyond {:?}: a shading band of camera evaluations, or a merge batch of transparent fragments, needs more records than the device can address",
-                self.reservations);
+                crate::gpu_memory::DeviceLimit(format!("frame storage cannot grow beyond {:?}: a shading band of camera evaluations, or a merge batch of transparent fragments, needs more records than the device can address",
+                    self.reservations)));
 
             if grown.probe_pages>self.reservations.probe_pages {
                 self.probes.as_mut().context("probe demand without installed probes")?.rebuild(r)?;
@@ -2944,7 +3114,7 @@ impl InstalledScene {
             match warm {
                 Ok(()) => return Ok(growths),
                 // The previous frame was refused and skipped; its replay is too.
-                Err(error) if error.downcast_ref::<crate::FrameRefused>().is_some() => return Ok(growths),
+                Err(error) if crate::failure::cause::<crate::FrameRefused>(&error).is_some() => return Ok(growths),
                 Err(error) => match error.downcast_ref::<crate::FrameRedo>() {
                     Some(redo) => {demand=redo.0;},
                     None => return Err(error),

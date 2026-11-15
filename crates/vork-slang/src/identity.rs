@@ -19,18 +19,79 @@ pub struct PreparedModules {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct InputIdentity {
     pub identity: Vec<u8>,
-    /// Retired bundled modules actually read by Slang; retained on cache hits.
-    pub compatibility_modules: Vec<String>,
+    supplied_only: bool,
     // File loads are digests; path types, absence and canonical identities retain
     // their exact values. Raw source bytes live only in the in-flight snapshot.
     #[serde(with = "filesystem::observations_serde")]
     observations: filesystem::Observations,
 }
+
+/// A captured closure made entirely from supplied modules. The only external
+/// observations it may carry are missing path-type probes in declared search
+/// roots. Relocation rechecks those exact probes, including binary-module
+/// precedence, before returning an ordinary host-local receipt.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct ClosedInputIdentity {
+    identity: Vec<u8>,
+    roots: usize,
+    missing: Vec<(usize, Vec<String>)>,
+}
+impl ClosedInputIdentity {
+    pub fn relocate(&self, roots: &[PathBuf]) -> Option<InputIdentity> {
+        if roots.len() != self.roots { return None; }
+        let mut observations = filesystem::Observations::new();
+        for (index, relative) in &self.missing {
+            if relative.is_empty() || relative.iter().any(|c| c.is_empty() || matches!(c.as_str(), "." | "..") || c.contains(['/', '\\'])) { return None; }
+            let path=relative.iter().fold(roots.get(*index)?.clone(),|path,part|path.join(part));
+            let query = filesystem::Query { op: 2, path };
+            if filesystem::observe(&query).is_some() { return None; }
+            observations.insert(query, None);
+        }
+        Some(InputIdentity { identity: self.identity.clone(), supplied_only: true, observations })
+    }
+}
 impl InputIdentity {
+    pub fn closed(&self, roots: &[PathBuf]) -> Option<ClosedInputIdentity> {
+        if !self.supplied_only { return None; }
+        let mut missing = Vec::new();
+        for (query, value) in &self.observations {
+            if query.op != 2 || value.is_some() { return None; }
+            let before = missing.len();
+            // A query can belong to several overlapping/aliased roots. Retain
+            // every mapping: after relocation they may name different paths.
+            missing.extend(roots.iter().enumerate().filter_map(|(i, root)| {
+                let relative = query.path.strip_prefix(root).ok()?;
+                let parts:Option<Vec<String>>=relative.components().map(|c| match c {
+                    std::path::Component::Normal(part)=>part.to_str().map(str::to_owned),_=>None,
+                }).collect();
+                let parts=parts?;
+                (!parts.is_empty()).then_some((i,parts))
+            }));
+            if missing.len() == before { return None; }
+        }
+        Some(ClosedInputIdentity { identity: self.identity.clone(), roots: roots.len(), missing })
+    }
     pub fn valid(&self) -> bool { self.current() }
     fn current(&self) -> bool {
-        self.observations.iter().all(|(query,value)|
-            filesystem::fingerprint(query, &filesystem::observe(query)) == *value)
+        // Failed searches commonly probe hundreds of module names below one
+        // missing include directory. Resolve that parent once for this check;
+        // existing directories still use the exact original filesystem query.
+        let mut parents = BTreeMap::new();
+        for (query, value) in &self.observations {
+            if query.op == 2 && value.is_none() && query.path.is_absolute() && let Some(parent) = query.path.parent() {
+                *parents.entry(parent).or_insert(0usize) += 1;
+            }
+        }
+        let missing = |parent: &Path| fs::metadata(parent)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound);
+        let absent: std::collections::BTreeSet<_> = parents.into_iter()
+            .filter_map(|(parent, count)| (count >= 8 && missing(parent)).then_some(parent)).collect();
+        self.observations.iter().all(|(query, value)| {
+            (query.op == 2 && value.is_none() && query.path.parent().is_some_and(|parent| absent.contains(parent)))
+                || filesystem::fingerprint(query, &filesystem::observe(query)) == *value
+        }) && absent.iter().all(|parent| missing(parent))
+        // No absence survives this validation. A new include directory, even
+        // one appearing during the check, must force compiler resolution.
     }
     /// A portable proof key must cover every resolver input of code generation.
     /// Native composition separately permits target-only inputs through `verify`.
@@ -55,6 +116,7 @@ pub(super) struct Snapshot {
     files: BTreeMap<PathBuf, Vec<u8>>,
     resolved: BTreeMap<PathBuf, PathBuf>,
     observations: filesystem::Observations,
+    supplied_only: bool,
 }
 
 /// Verify the retained inputs used to produce each actual proof pass.
@@ -72,6 +134,7 @@ pub(super) fn check_imports(
         let mut captured = captured.lock().unwrap();
         if let Some(previous) = captured.as_mut() {
             receipt.verify(previous)?;
+            previous.supplied_only &= receipt.supplied_only;
             previous.observations.extend(receipt.observations);
         } else {
             *captured = Some(receipt);
@@ -88,16 +151,18 @@ fn part(out: &mut Vec<u8>, bytes: &[u8]) {
 /// The compiler discovers dependencies, but never supplies serialized filesystem
 /// state. Only code produced from our retained files may be published.
 impl Snapshot {
+    fn has_supplied_files(&self, supplied: &BTreeSet<PathBuf>) -> bool {
+        self.files.keys().all(|p|supplied.contains(p))
+            && self.observations.iter().filter(|(q,value)|q.op==0 && value.is_some()).all(|(q,_)|supplied.contains(&q.path))
+    }
     fn compile(&self, command: &Command) -> Result<std::process::Output> {
         Ok(filesystem::compile(command, Some(&self.observations))?.0)
     }
 
     fn receipt(&self, work: &Workspace, identity: Vec<u8>) -> InputIdentity {
         InputIdentity {
-            compatibility_modules: vork_scene::libraries::COMPATIBILITY_MODULES.iter()
-                .filter(|name| self.files.contains_key(&work.0.join(format!("{name}.slang"))))
-                .map(|name| (*name).to_owned()).collect(),
             identity,
+            supplied_only: self.supplied_only,
             observations: self.observations.iter().filter(|(q,_)| !q.path.starts_with(&work.0))
                 .map(|(q,v)|(q.clone(),filesystem::fingerprint(q,v))).collect(),
         }
@@ -119,10 +184,25 @@ pub(super) fn capture_command(
     depfile: &Path,
 ) -> Result<(std::process::Output, Snapshot)> {
     let (output, observations) = filesystem::compile(command, None)?;
-    ensure!(output.status.success(), "Slang identity: {}", String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        let diagnostics = String::from_utf8_lossy(&output.stderr);
+        // Slang owns import resolution, including nested imports and preprocessing.
+        // Condense its missing-file diagnostic only for the retired bundled names.
+        for line in diagnostics.lines() {
+            if let Some(name) = line.strip_prefix("error[E00001]: cannot open file '")
+                .and_then(|name| name.strip_suffix(".slang'"))
+                && let Some(message) = vork_scene::libraries::removed_module(name) {
+                bail!("{message}");
+            }
+        }
+        if let Some(message) = enums::missing_members(&work.0, &diagnostics)? {
+            bail!("Slang identity: {message}");
+        }
+        bail!("Slang identity: {diagnostics}");
+    }
     let mut snapshot = Snapshot {
         files: BTreeMap::new(),
-        resolved: BTreeMap::new(), observations,
+        resolved: BTreeMap::new(), observations, supplied_only: false,
     };
     for (query, value) in &snapshot.observations {
         if query.op == 1 && !query.path.starts_with(&work.0) {
@@ -147,9 +227,32 @@ pub(super) fn capture_command(
     Ok((output, snapshot))
 }
 
-impl Compiler {
+/// The compiler's part of every receipt key. Only an admitted compiler has one, so no
+/// receipt is looked up, reused or written for an executable that has not been checked.
+impl Admitted<'_> {
+    pub fn portable_input_policy(&self) -> String {
+        format!("closed-filesystem-inputs-v1:{}:{INITIALIZATION}:{}",self.version(),std::env::consts::OS)
+    }
     pub fn input_policy(&self) -> String {
-        format!("filesystem-callbacks-v2:{VERSION}:{}", self.executable.display())
+        format!("filesystem-callbacks-v2:{}:{}", self.version(), self.compiler.executable.display())
+    }
+}
+
+impl Compiler {
+    /// Search roots used by the filesystem adapter, in request order. Unknown
+    /// external observations cannot be exported as a closed-input receipt.
+    pub fn input_roots(&self, includes: &[PathBuf]) -> Result<Vec<PathBuf>> {
+        let cwd = std::env::current_dir()?;
+        let mut roots: Vec<_> = includes.iter().map(|p| cwd.join(p)).collect();
+        roots.push(self.executable.canonicalize()?.parent().context("Slang compiler directory")?.to_path_buf());
+        // Windows canonicalize adds a verbatim prefix that the adapter removes
+        // before handing paths to Slang. Compare roots in that same spelling.
+        #[cfg(windows)]
+        let roots = roots.iter().map(|p| PathBuf::from(filesystem::compiler_path(p))).collect();
+        Ok(roots)
+    }
+    pub fn program_input_roots(&self, origin: &Path) -> Result<Vec<PathBuf>> {
+        self.input_roots(&include_paths(origin))
     }
     pub fn with_identity(&self, identity: &InputIdentity) -> Self {
         Self {
@@ -215,7 +318,7 @@ impl Compiler {
         normalize_root: Option<bool>,
         identities: &BTreeMap<String, Vec<u8>>,
     ) -> Result<PreparedModules> {
-        let _progress = crate::progress::Job::start(false);
+        let _progress = crate::progress::Job::front_end().named(main);
         self.version()?;
         let cwd = std::env::current_dir()?;
         let mut include = false;
@@ -243,7 +346,7 @@ impl Compiler {
             .arg(&work.0);
         // The API reports dependencies without emitting code or a serialized
         // module. Resolve/type-check once before looking up the native artifact.
-        command.args(args).arg("-no-codegen");
+        command.args(args).args(["-no-codegen", "-dump-ast"]);
         for (entry, stage) in entries {
             command.args(["-entry", entry, "-stage", stage]);
         }
@@ -251,7 +354,11 @@ impl Compiler {
                 .args(["-notes-disable", "88"])
                 .arg("-depfile")
                 .arg(&depfile);
-        let (output, snapshot) = capture_command(&work, &mut command, &depfile)?;
+        let (output, mut snapshot) = capture_command(&work, &mut command, &depfile)?;
+        // Exact supplied filenames also exclude case-folded or parent-path
+        // aliases whose resolution could differ on the installed filesystem.
+        let supplied:BTreeSet<_>=modules.iter().map(|(name,_)|work.0.join(format!("{name}.slang"))).collect();
+        snapshot.supplied_only=snapshot.has_supplied_files(&supplied);
         ensure!(
             output.status.success(),
             "Slang identity: {}",
@@ -472,7 +579,7 @@ impl PreparedModules {
         self.snapshot.receipt(&self.work, self.identity.clone())
     }
     pub fn compile(&self) -> Result<Vec<u8>> {
-        let _progress = crate::progress::Job::start(false);
+        let _progress = crate::progress::Job::start(false).named(&self.main.file_stem().unwrap_or_default().to_string_lossy());
         let output = self.work.0.join("out");
         let mut command = Command::new(&self.executable);
         // Replay source with the immutable filesystem observations. Slang's
@@ -592,7 +699,7 @@ mod tests {
         let helper=work.0.join("helper.slang");
         fs::write(&helper,"public float value(){return 0.25;}")?;
         let origin=work.0.join("main.slang");
-        let source="import helper; struct Inputs {}; float3 display(DisplayContext ctx, Inputs inputs){return float3(value());}";
+        let source="import helper; struct Inputs {}; import std.view; ViewResult view(ViewContext ctx, Inputs inputs){return finish_view(float3(value()),ctx,1.);}";
         let compiler=Compiler::discover();
         let result=compiler.capture_inputs(|compiler| {
             compiler.compile_display(&Abi { aov_count: 0, context: Abi::spec_context(), closure: openpbr_fields() },source,&origin,"first")?;
@@ -622,6 +729,32 @@ mod tests {
             let entries = [("main", "compute")];
             let prepared = compiler.prepare_modules(&modules, "main", &entries, &args)?;
             assert_eq!(prepared.compile()?, compiler.compile_modules(&modules, "main", &entries, &args)?, "{target}: captured replay must preserve imported functions");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn missing_search_parents_are_rechecked() -> Result<()> {
+        let work = Workspace::new()?;
+        let parent = work.0.join("new-include");
+        let receipt = InputIdentity {
+            identity: Vec::new(), supplied_only: true,
+            observations: (0..16).map(|i| (filesystem::Query {op: 2, path: parent.join(format!("module{i}.slang"))}, None)).collect(),
+        };
+        assert!(receipt.valid());
+        fs::create_dir(&parent)?;
+        fs::write(parent.join("module7.slang"), "public int value=7;")?;
+        assert!(!receipt.valid(), "a newly populated include directory must invalidate every subsequent check");
+        fs::remove_file(parent.join("module7.slang"))?;
+        assert!(receipt.valid(), "existing directories retain exact failed probes");
+        #[cfg(unix)] {
+            fs::remove_dir(&parent)?;
+            let target = work.0.join("target");
+            fs::create_dir(&target)?;
+            std::os::unix::fs::symlink(&target, &parent)?;
+            assert!(receipt.valid());
+            fs::write(target.join("module7.slang"), "public int value=7;")?;
+            assert!(!receipt.valid(), "include-directory symlinks retain ordinary filesystem resolution");
         }
         Ok(())
     }
@@ -1073,3 +1206,66 @@ mod tests {
 #[cfg(test)]
 #[path = "identity_matrix.rs"]
 mod matrix;
+
+#[cfg(test)]
+mod closed_input_tests {
+    use super::*;
+
+    #[test]
+    fn closed_input_rejects_filesystem_dependent_supplied_aliases() {
+        let path=PathBuf::from("/workspace/helper.slang");
+        let supplied=[path.clone()].into();
+        let mut snapshot=Snapshot {files:[(path.clone(),vec![])].into(),resolved:Default::default(),
+            observations:[(filesystem::Query {op:0,path},Some(vec![]))].into(),supplied_only:false};
+        assert!(snapshot.has_supplied_files(&supplied));
+        for alias in ["/workspace/HELPER.slang","/workspace/nested/../helper.slang","/external/helper.slang"] {
+            snapshot.observations.clear();
+            snapshot.observations.insert(filesystem::Query {op:0,path:PathBuf::from(alias)},Some(vec![]));
+            assert!(!snapshot.has_supplied_files(&supplied),"captured alias {alias} must be resolved again");
+        }
+    }
+
+    #[test]
+    fn closed_input_requires_only_mapped_absent_type_probes() {
+        let roots=vec![PathBuf::from("/build/includes")];
+        let query=filesystem::Query {op:2,path:roots[0].join("helper.slang-module")};
+        let mut input=InputIdentity {identity:vec![1,2,3],supplied_only:true,observations:[(query.clone(),None)].into()};
+        assert!(input.closed(&roots).is_some());
+        input.supplied_only=false;
+        assert!(input.closed(&roots).is_none(),"every loaded dependency must be supplied");
+        input.supplied_only=true;
+        input.observations.insert(query.clone(),Some(vec![1]));
+        assert!(input.closed(&roots).is_none(),"existing external files are not closed");
+        input.observations.clear();
+        input.observations.insert(filesystem::Query {op:0,..query.clone()},None);
+        assert!(input.closed(&roots).is_none(),"even absent file loads require ordinary capture");
+        input.observations.clear();input.observations.insert(query,None);
+        assert!(input.closed(&[PathBuf::from("/elsewhere")]).is_none());
+    }
+
+    #[test]
+    fn closed_input_rechecks_each_relocated_root_and_rejects_escape() -> Result<()> {
+        let root=std::env::temp_dir().join(format!("vork-closed-input-{}",std::process::id()));
+        let roots=vec![root.join("first"),root.join("second")];
+        for path in &roots {fs::create_dir_all(path)?;}
+        // Identical source roots can become distinct after relocation. Neither
+        // occurrence may lose its absent-file proof.
+        let old=PathBuf::from("/closed-input-build");
+        let input=InputIdentity {identity:vec![4,5],supplied_only:true,observations:[(filesystem::Query {op:2,path:old.join("helper.slang-module")},None)].into()};
+        let closed=input.closed(&[old.clone(),old]).unwrap();
+        assert_eq!(closed.missing.len(),2);
+        assert_eq!(closed.relocate(&roots).unwrap().identity,input.identity);
+        for path in &roots {
+            let file=path.join("helper.slang-module");fs::write(&file,b"new module")?;
+            assert!(closed.relocate(&roots).is_none(),"new import precedence must miss");
+            fs::remove_file(file)?;
+        }
+        assert!(closed.relocate(&roots[..1]).is_none());
+        let mut invalid=closed.clone();invalid.missing[0].1=vec!["..".into(),"escape".into()];
+        assert!(invalid.relocate(&roots).is_none());
+        invalid.missing[0].1=vec!["/absolute".into()];assert!(invalid.relocate(&roots).is_none());
+        invalid.missing[0].1=vec!["nested\\helper".into()];assert!(invalid.relocate(&roots).is_none());
+        invalid.missing[0]=(9,vec!["helper".into()]);assert!(invalid.relocate(&roots).is_none());
+        fs::remove_dir_all(root)?;Ok(())
+    }
+}

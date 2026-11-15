@@ -56,14 +56,14 @@ float tex_fractal(float4 p, int dimensions, float detail, float roughness,
                   float lacunarity, bool normalize, NoiseType type, float offset, float gain) {
     detail=clamp(detail,0.,15.); roughness=max(roughness,0.);
     float sum=0., amplitude=1., amplitude_sum=0., previous=1., weight=1.;
-    if(type==NoiseType.Multifractal) sum=1.;
+    if(int(type) == int(NoiseType.Multifractal)) sum=1.;
     int whole=int(floor(detail));
     for(int i=0;i<=whole+1;i++) {
         float n=tex_perlin_nd(p,dimensions), next=sum;
-        if(type==NoiseType.FBM) next=sum+n*amplitude;
-        else if(type==NoiseType.Multifractal) next=sum*(1.+n*amplitude);
-        else if(type==NoiseType.Hetero_Terrain) next=i==0?offset+n:sum+(offset+n)*amplitude*sum;
-        else if(type==NoiseType.Hybrid_Multifractal) {
+        if(int(type) == int(NoiseType.FBM)) next=sum+n*amplitude;
+        else if(int(type) == int(NoiseType.Multifractal)) next=sum*(1.+n*amplitude);
+        else if(int(type) == int(NoiseType.Hetero_Terrain)) next=i==0?offset+n:sum+(offset+n)*amplitude*sum;
+        else if(int(type) == int(NoiseType.Hybrid_Multifractal)) {
             float signal=(n+offset)*amplitude;
             if(i==0) { next=signal; weight=gain*signal; }
             else { weight=saturate(weight); next=sum+weight*signal; weight*=gain*signal; }
@@ -73,7 +73,7 @@ float tex_fractal(float4 p, int dimensions, float detail, float roughness,
             next=sum+signal*amplitude; previous=signal;
         }
         if(i==whole+1) {
-            if(type==NoiseType.FBM && normalize)
+            if(int(type) == int(NoiseType.FBM) && normalize)
                 return lerp(0.5+0.5*sum/amplitude_sum,0.5+0.5*next/(amplitude_sum+amplitude),frac(detail));
             return lerp(sum,next,frac(detail));
         }
@@ -130,25 +130,25 @@ float tex_distance_nd(float4 v,int dimensions,DistanceMetric metric,float expone
     float sum=0.,hi=0.;
     for(int i=0;i<dimensions;i++) {
         float a=abs(v[i]);hi=max(hi,a);
-        sum+=metric==DistanceMetric.Manhattan?a:metric==DistanceMetric.Minkowski?pow(a,exponent):a*a;
+        sum+=int(metric) == int(DistanceMetric.Manhattan)?a:int(metric) == int(DistanceMetric.Minkowski)?pow(a,exponent):a*a;
     }
-    if(metric==DistanceMetric.Chebychev) return hi;
-    if(metric==DistanceMetric.Manhattan) return sum;
-    if(metric==DistanceMetric.Minkowski) return pow(sum,1./exponent);
+    if(int(metric) == int(DistanceMetric.Chebychev)) return hi;
+    if(int(metric) == int(DistanceMetric.Manhattan)) return sum;
+    if(int(metric) == int(DistanceMetric.Minkowski)) return pow(sum,1./exponent);
     return sqrt(sum);
 }
 VoronoiResult tex_voronoi(float4 p,float scale,int dimensions,float randomness,
     VoronoiFeature feature,DistanceMetric metric,float smoothness,float exponent) {
     int4 cell=int4(floor(p));float4 local=frac(p);
     float d1=1.e20,d2=1.e20;float4 pos1=0.,pos2=0.;float3 col1=0.,col2=0.;
-    int extent=feature==VoronoiFeature.Smooth_F1?2:1;
+    int extent=int(feature) == int(VoronoiFeature.Smooth_F1)?2:1;
     int ey=dimensions>1?extent:0,ez=dimensions>2?extent:0,ew=dimensions>3?extent:0;
     for(int w=-ew;w<=ew;w++) for(int z=-ez;z<=ez;z++) for(int y=-ey;y<=ey;y++) for(int x=-extent;x<=extent;x++) {
         int4 offset=int4(x,y,z,w);float4 point=float4(offset)+randomness*tex_point_random(cell+offset,dimensions);
         for(int axis=dimensions;axis<4;axis++) point[axis]=0.;
         float d=tex_distance_nd(point-local,dimensions,metric,max(exponent,0.000001));
         float3 color=tex_point_random(cell+offset,dimensions).xyz;
-        if(feature==VoronoiFeature.Smooth_F1 && smoothness>0.) {
+        if(int(feature) == int(VoronoiFeature.Smooth_F1) && smoothness>0.) {
             // d1 starts as a sentinel, not a distance, so it never enters lerp.
             if(d1==1.e20) {d1=d;pos1=point;col1=color;continue;}
             float h=smoothstep(0.,1.,0.5+0.5*(d1-d)/smoothness),correction=smoothness*h*(1.-h);
@@ -158,11 +158,11 @@ VoronoiResult tex_voronoi(float4 p,float scale,int dimensions,float randomness,
         else if(d<d2) {d2=d;pos2=point;col2=color;}
     }
     VoronoiResult result;result.distance=d1;result.color=col1;result.radius=0.;
-    if(feature==VoronoiFeature.F2) {result.distance=d2;result.color=col2;pos1=pos2;}
+    if(int(feature) == int(VoronoiFeature.F2)) {result.distance=d2;result.color=col2;pos1=pos2;}
     float4 position=scale==0.?float4(0.):(pos1+float4(cell))/scale;
     result.position=position.xyz;result.w=dimensions==1?position.x:position.w;
     if(dimensions==1) result.position=float3(0.);
-    if(feature==VoronoiFeature.Distance_To_Edge || feature==VoronoiFeature.N_Sphere_Radius) {
+    if(int(feature) == int(VoronoiFeature.Distance_To_Edge) || int(feature) == int(VoronoiFeature.N_Sphere_Radius)) {
         float edge=1.e20,radius=1.e20;int4 nearest=int4(floor(pos1));
         for(int w=dimensions>3?-1:0;w<=(dimensions>3?1:0);w++)
         for(int z=dimensions>2?-1:0;z<=(dimensions>2?1:0);z++)
@@ -173,7 +173,7 @@ VoronoiResult tex_voronoi(float4 p,float scale,int dimensions,float randomness,
             float4 between=point-pos1;float len=length(between);
             if(len>0.0001) {radius=min(radius,len*0.5);edge=min(edge,dot((point+pos1)*0.5-local,between/len));}
         }
-        result.radius=radius;if(feature==VoronoiFeature.Distance_To_Edge) result.distance=edge;
+        result.radius=radius;if(int(feature) == int(VoronoiFeature.Distance_To_Edge)) result.distance=edge;
     }
     return result;
 }
@@ -187,10 +187,10 @@ public VoronoiResult voronoi(float3 vector,float scale=5.,float randomness=1.,
     detail=clamp(detail,0.,15.);roughness=saturate(roughness);
     VoronoiResult result={};float amplitude=1.,weight=0.,frequency=1.;
     int whole=int(floor(detail));
-    if(feature==VoronoiFeature.N_Sphere_Radius) whole=0;
+    if(int(feature) == int(VoronoiFeature.N_Sphere_Radius)) whole=0;
     for(int octave=0;octave<=whole+1;octave++) {
         float blend=octave==whole+1?frac(detail):1.;
-        if(feature==VoronoiFeature.N_Sphere_Radius && octave>0) break;
+        if(int(feature) == int(VoronoiFeature.N_Sphere_Radius) && octave>0) break;
         if(blend==0.) break;
         VoronoiResult sample=tex_voronoi(p*frequency,scale*frequency,dimensions,saturate(randomness),feature,metric,clamp(smoothness*0.5,0.,0.5),exponent);
         float a=amplitude*blend;
@@ -200,8 +200,8 @@ public VoronoiResult voronoi(float3 vector,float scale=5.,float randomness=1.,
     }
     if(normalize && weight>0.) {
         // Normalize Euclidean distance to the diagonal of the jitter cell.
-        float maximum=metric==DistanceMetric.Manhattan?float(dimensions):metric==DistanceMetric.Chebychev?1.:
-            metric==DistanceMetric.Minkowski?pow(float(dimensions),1./max(exponent,0.000001)):sqrt(float(dimensions));
+        float maximum=int(metric) == int(DistanceMetric.Manhattan)?float(dimensions):int(metric) == int(DistanceMetric.Chebychev)?1.:
+            int(metric) == int(DistanceMetric.Minkowski)?pow(float(dimensions),1./max(exponent,0.000001)):sqrt(float(dimensions));
         result.distance/=weight*maximum;
     }
     // Color/position identify the average feature independently of normalization.
@@ -265,13 +265,13 @@ public float wave(float3 vector, float scale=5., float distortion=0., float deta
     WaveType type=WaveType.Bands, WaveDirection direction=WaveDirection.X,
     WaveProfile profile=WaveProfile.Sin) {
     float3 p=vector*scale; float n;
-    if(type==WaveType.Bands) n=(direction==WaveDirection.X?p.x:direction==WaveDirection.Y?p.y:direction==WaveDirection.Z?p.z:p.x+p.y+p.z)*20.;
-    else n=length(direction==WaveDirection.X?p.yz:direction==WaveDirection.Y?p.xz:p.xy)*20.;
-    if(type==WaveType.Rings && direction==WaveDirection.Diagonal) n=length(p)*20.;
+    if(int(type) == int(WaveType.Bands)) n=(int(direction) == int(WaveDirection.X)?p.x:int(direction) == int(WaveDirection.Y)?p.y:int(direction) == int(WaveDirection.Z)?p.z:p.x+p.y+p.z)*20.;
+    else n=length(int(direction) == int(WaveDirection.X)?p.yz:int(direction) == int(WaveDirection.Y)?p.xz:p.xy)*20.;
+    if(int(type) == int(WaveType.Rings) && int(direction) == int(WaveDirection.Diagonal)) n=length(p)*20.;
     n+=phase_offset;
     if(distortion!=0.) n+=distortion*(noise(p*detail_scale,1.,detail,detail_roughness)*2.-1.);
-    if(profile==WaveProfile.Saw) return frac(n/(2.*BLENDER_TEX_PI));
-    if(profile==WaveProfile.Tri) return abs(frac(n/(2.*BLENDER_TEX_PI)+0.5)*2.-1.);
+    if(int(profile) == int(WaveProfile.Saw)) return frac(n/(2.*BLENDER_TEX_PI));
+    if(int(profile) == int(WaveProfile.Tri)) return abs(frac(n/(2.*BLENDER_TEX_PI)+0.5)*2.-1.);
     return 0.5+0.5*sin(n-BLENDER_TEX_PI*0.5);
 }
 public struct BrickResult { public float3 color; public float factor; };

@@ -59,6 +59,12 @@ impl Session {
     pub fn prepare_live(renderer: Renderer, mut scene: vork_scene::Scene, base: &Path, inputs: Vec<LiveInput>) -> Result<Self> {
         ensure!(!scene.render.settings.integrator.is_path(),
             "interactive session requires raster settings; choose std/previs or std/draft");
+        // A resident session must retain its requested quality for every frame.
+        // Open before installation, whose offline policy can drop unavailable OIDN.
+        if scene.render.settings.integrator.denoiser().is_some() {
+            crate::denoise::ensure_runtime(&renderer)
+                .context("interactive denoising unavailable; set VORK_OIDN to the bundled OIDN library or choose std/previs")?;
+        }
         let targets = declare_inputs(&mut scene, &inputs)?;
         let mut scene = renderer.install_with_options(scene, base, crate::InstallOptions {
             raster_only: true,
@@ -241,7 +247,7 @@ mod tests {
     #[test]
     #[ignore = "requires a GPU; scheduled explicitly by the main GPU contracts"]
     fn gpu_live_frames_match_fresh_installs_and_retain_view_and_pipelines() -> Result<()> {
-        let Some(r) = crate::test_renderer()? else { return Ok(()); };
+        let r = crate::test_renderer()?;
         let mut document: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/closed-glass-slab.json"))?;
         document["nodes"][2]["materials"] = serde_json::json!(["emitter"]);
         document["materials"].as_object_mut().unwrap().remove("glass");

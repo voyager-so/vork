@@ -47,6 +47,7 @@ def main():
     parser.add_argument('--scan', type=Path, help='scan existing MSL instead of installing scenes')
     parser.add_argument('--apple', action='store_true', help='also invoke Apple metal compiler')
     parser.add_argument('--release', action='store_true')
+    parser.add_argument('--executable', type=Path, help='use the producer renderer test executable')
     args = parser.parse_args()
     with tempfile.TemporaryDirectory(prefix='vork-metal-generated-') as temporary:
         directory = (args.scan or args.output or Path(temporary)).resolve()
@@ -58,7 +59,10 @@ def main():
             if args.release:
                 command.append('--release')
             command += ['metal_generated_tests::installed_scene_modules', '--', '--exact', '--ignored', '--nocapture']
-            subprocess.run(command, check=True, env={**os.environ,
+            if args.executable:
+                command = [str(args.executable.resolve()), 'metal_generated_tests::installed_scene_modules',
+                           '--exact', '--ignored', '--nocapture']
+            subprocess.run(command, check=True, cwd=Path(__file__).resolve().parent.parent / 'crates/vork-render' if args.executable else None, env={**os.environ,
                 'VORK_INSTALLED_METAL_DIR': str(directory),
                 'VORK_SHADER_TARGETS': 'spirv,metal',
                 'VORK_CACHE_DIR': str(Path(temporary) / 'cache')})

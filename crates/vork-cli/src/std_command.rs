@@ -34,9 +34,10 @@ impl Args {
                 vork_std::environment::prepare_frames(&argument,&inputs,&times,|time|source.frame(time,fps,u32::MAX),read,write)?
             } else {vork_std::environment::prepare(&argument,read,write)?}
         } else {vork_std::evaluate(&self.function,&argument)?}) })().map_err(|error| {
-            if serde_json::from_str::<serde_json::Value>(&argument).is_err() {
+            // A std function evaluates its argument on the CPU: what it refuses is the authored call.
+            vork_render::failure::scene(if serde_json::from_str::<serde_json::Value>(&argument).is_err() {
                 error.context(format!("vork std {} expects a JSON argument, not a filename; pass JSON directly or read a file with `vork std {} - < scene.json`", self.function, self.function))
-            } else { error }
+            } else { error })
         })?;
         output!("{result}");
         Ok(())

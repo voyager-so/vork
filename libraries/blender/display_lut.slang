@@ -1,5 +1,5 @@
 import vork;
-public float3 display_lut(DisplayContext ctx,Image lut,int look,float looks) {
+public float3 display_lut(ViewContext ctx,Image lut,int look,float looks) {
     float n = 65.;
     float step = (12.5260688117 - (-12.47393)) / (n - 1.);
     float first = exp2((-12.47393) + step);

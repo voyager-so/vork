@@ -151,9 +151,44 @@ pipelines, so it is not a dependable warm path. Regression:
 pipelines through `PipelineCache`. `metal::release_archive_files_for_exit` removes
 live caches' backing files for a process exit that skips destructors (vork's
 one-shot `_exit`) and stops new ones; regression `exit_release_removes_backing_files_and_stops_new_ones`
-and vork-cli `tests/metal_archive.rs`.
+and vork-cli `tests/metal_archive.rs`. `metal::Device::archive_additions` counts the archive misses a device
+recorded, so the renderer serializes its archive only when it gained a pipeline. Creating a
+pipeline never waits for a serialization, which holds the archive's lock for 0.02 to 0.1 s per
+megabyte: an addition that meets one is deferred to whoever next holds the lock; regression
+`additions_after_a_serialization_are_in_the_next_serialization`.
+
+Local patch: `src/metal/compile_admission.rs` bounds the Metal compiler work of the
+whole process. Metal compiles in one out-of-process `MTLCompilerService` per client
+process; concurrent compilations share its memory, and when its allocator runs out
+the service dies and every compilation in flight fails with
+`XPC_ERROR_CONNECTION_INTERRUPTED`. Every library compilation (`ShaderInput::Msl`,
+Naga MSL, flexible passthrough tables) and every pipeline-state compilation (render,
+mesh and compute, including a binary archive miss together with its recording in the
+archive, which is a compiler request too) is admitted by estimated service
+memory: source bytes times the measured service bytes per source byte, against the
+smaller of the measured service ceiling and half of physical memory. Archive hits do
+not compile and are not admitted. A compilation starts when its estimate fits beside
+the ones in flight, passing larger ones that wait, and one larger than the limit runs
+alone. Passing is bounded: once later arrivals worth one full limit have passed a
+waiting compilation, later arrivals wait behind it, so every compilation starts.
+A compilation that fails with the interruption is retried once with nothing else
+compiling; other failures are returned unchanged. The interruption is recognised
+by the `NSError`'s own description beginning with the driver's report; Metal uses
+several domains and codes for it, and a compiler diagnostic begins with its source
+location, so a source that quotes the report is not retried. `PassthroughShader` and
+`CompiledShader` carry their source size for this. Regression:
+`metal::compile_admission::tests` (no GPU needed). Remove when Metal's compiler
+service bounds its own memory across a client's concurrent compilations.
 
 Local no-op test oracle: `src/noop/command.rs` retains the native acceleration
 structure Build/Update modes in its command stream and exposes per-queue submitted Build/Update counters. Nonzero mock scratch sizes keep core from skipping descriptor recording; no native acceleration structure executes. The renderer's `rt_refit_tests.rs` observes actual
 wgpu-core selection, including force_rebuild, without GPU hardware. Remove when
 upstream provides equivalent no-op command inspection.
+
+Local patch: `TlasInstanceLayout` describes the backend's triangle option word and
+cull-disable/non-opaque masks. The renderer installs material sidedness there while
+retaining backend-owned native references. Vulkan uses packed instance flags; Metal
+uses `MTLAccelerationStructureInstanceOptions`; the no-op ABI mirrors Vulkan.
+Regression: renderer `opaque_material_sides_use_hardware_traversal` exercises an
+installed TLAS, both material sides and zero opaque candidate callbacks. Remove
+when upstream exposes equivalent native-descriptor instance traversal options.

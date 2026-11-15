@@ -5,6 +5,8 @@ use super::*;
 
 fn bounds(v: &Value) -> Option<(f64, f64)> {
     let (mut a,mut b)=match *v {
+        Value::Integer(n) => (n as f64,n as f64),
+        Value::IntegerRange(a,b) if a<=b => (a as f64,b as f64),
         Value::Number(n) if n.is_finite() => (n,n),
         Value::NumberRange(a,b) if a.is_finite() && b.is_finite() && a<=b => (a,b),
         _ => return None,
@@ -27,7 +29,7 @@ fn enclosure_ulps(lo: f64, hi: f64, ulps:usize) -> Value {
     Value::NumberRange(if lo>0. && lo<f64::from(f32::MIN_POSITIVE) {0.}else{lo},
         if hi<0. && hi> -f64::from(f32::MIN_POSITIVE) {0.}else{hi})
 }
-fn binary(op:naga::BinaryOperator,a:Value,b:Value) -> Value {
+pub(super) fn binary(op:naga::BinaryOperator,a:Value,b:Value) -> Value {
     use naga::BinaryOperator as B;
     match (a,b) {
         (Value::Parts(a),Value::Parts(b)) if a.len()==b.len()=>Value::Parts(a.into_iter().zip(b).map(|(a,b)|binary(op,a,b)).collect()),
@@ -47,6 +49,12 @@ fn binary(op:naga::BinaryOperator,a:Value,b:Value) -> Value {
                     // Vulkan OpFDiv permits 2.5 ULP, not correctly rounded division.
                     enclosure_ulps(values.into_iter().fold(f64::INFINITY,f64::min),values.into_iter().fold(f64::NEG_INFINITY,f64::max),if op==B::Divide {4}else{1})
                 },
+                B::Equal if a==b && c==d && a==c=>Value::Bool(true),
+                B::Equal if b<c || d<a=>Value::Bool(false),
+                B::NotEqual if a==b && c==d && a==c=>Value::Bool(false),
+                B::NotEqual if b<c || d<a=>Value::Bool(true),
+                B::LessEqual if b<=c=>Value::Bool(true), B::LessEqual if a>d=>Value::Bool(false),
+                B::GreaterEqual if a>=d=>Value::Bool(true), B::GreaterEqual if b<c=>Value::Bool(false),
                 B::Less if b<c=>Value::Bool(true), B::Less if a>=d=>Value::Bool(false),
                 B::Greater if a>d=>Value::Bool(true),B::Greater if b<=c=>Value::Bool(false),
                 _=>Value::Unknown,
@@ -60,9 +68,12 @@ fn extrema(a:Value,b:Value,maximum:bool)->Value {
         (Value::Parts(a),b)=>Value::Parts(a.into_iter().map(|a|extrema(a,b.clone(),maximum)).collect()),
         (a,Value::Parts(b))=>Value::Parts(b.into_iter().map(|b|extrema(a.clone(),b,maximum)).collect()),
         (a,b)=> {
+            let integers=matches!(a,Value::Integer(_)|Value::IntegerRange(..)) && matches!(b,Value::Integer(_)|Value::IntegerRange(..));
             let (Some((a,b)),Some((c,d)))=(bounds(&a),bounds(&b)) else {return Value::Unknown;};
             let (lo,hi)=if maximum {(a.max(c),b.max(d))}else{(a.min(c),b.min(d))};
-            if lo==hi {Value::Number(lo)}else{Value::NumberRange(lo,hi)}
+            if integers {
+                if lo==hi {Value::Integer(lo as i64)}else{Value::IntegerRange(lo as i64,hi as i64)}
+            }else if lo==hi {Value::Number(lo)}else{Value::NumberRange(lo,hi)}
         }
     }
 }
@@ -77,6 +88,15 @@ fn clamp(value:Value,lo:Value,hi:Value)->Value {
             if !matches!((bounds(&lo),bounds(&hi)),(Some((_,a)),Some((b,_))) if a<=b) {return Value::Unknown;}
             extrema(extrema(value,lo,true),hi,false)
         }
+    }
+}
+fn floor(v:Value)->Value {
+    match v {
+        Value::Parts(v)=>Value::Parts(v.into_iter().map(floor).collect()),
+        v=>bounds(&v).map_or(Value::Unknown,|(a,b)| {
+            let (a,b)=(a.floor(),b.floor());
+            if a==b {Value::Number(a)}else{Value::NumberRange(a,b)}
+        }),
     }
 }
 fn negate(v:Value)->Value {
@@ -137,6 +157,13 @@ fn exponential_base(v:Value,base_two:bool)->Value {
 }
 fn absolute(v:Value)->Value {
     match v {
+        Value::Integer(n)=>integer_result(n.checked_abs()),
+        Value::IntegerRange(a,b)=> {
+            let (Some(a_abs),Some(b_abs))=(a.checked_abs(),b.checked_abs()) else {return Value::Unknown;};
+            let lo=if a<=0 && b>=0 {0}else{a_abs.min(b_abs)};
+            let hi=a_abs.max(b_abs);
+            if hi<=i32::MAX as i64 {Value::IntegerRange(lo,hi)}else{Value::Unknown}
+        },
         Value::Parts(v)=>Value::Parts(v.into_iter().map(absolute).collect()),
         v=>bounds(&v).map_or(Value::Unknown,|(a,b)|Value::NumberRange(if a<=0. && b>=0. {0.}else{a.abs().min(b.abs())},a.abs().max(b.abs()))),
     }
@@ -162,6 +189,7 @@ pub(super) fn operator(e:&E,get:&impl Fn(naga::Handle<E>)->Value)->Option<Value>
         E::Binary {op,left,right} if floating(get(left)) || floating(get(right))=>binary(op,get(left),get(right)),
         E::Unary {op:naga::UnaryOperator::Negate,expr} if floating(get(expr))=>negate(get(expr)),
         E::Swizzle {size,vector,pattern}=>Value::Parts(pattern[..size as usize].iter().map(|c|get(vector).part(*c as usize)).collect()),
+        E::Math {fun:M::Floor,arg,..}=>floor(get(arg)),
         E::Math {fun:M::Abs,arg,..}=>absolute(get(arg)),
         E::Math {fun:M::Sqrt,arg,..}=>square_root(get(arg)),
         E::Math {fun:M::Exp,arg,..}=>exponential(get(arg)),
@@ -210,6 +238,26 @@ pub(super) fn majorant(module:&naga::Module,entry:&str,words:&[Option<u32>],posi
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn discrete_bounds_and_float_branches() {
+        use naga::BinaryOperator as B;
+        assert_eq!(clamp(Value::Integer(7),Value::Integer(1),Value::Integer(4)),Value::Integer(4));
+        assert_eq!(clamp(Value::IntegerRange(-2,3),Value::Integer(1),Value::Integer(4)),Value::IntegerRange(1,3));
+        assert_eq!(absolute(Value::Integer(-3)),Value::Integer(3));
+        assert_eq!(absolute(Value::Integer(i32::MIN as i64)),Value::Unknown);
+        assert_eq!(floor(Value::Number(2.75)),Value::Number(2.));
+        assert_eq!(floor(Value::NumberRange(-0.5,2.75)),Value::NumberRange(-1.,2.));
+        for (op,a,b,expected) in [
+            (B::Equal,Value::Number(0.),Value::Number(0.),Value::Bool(true)),
+            (B::NotEqual,Value::Number(0.),Value::Number(0.),Value::Bool(false)),
+            (B::NotEqual,Value::NumberRange(1.,2.),Value::Number(0.),Value::Bool(true)),
+            (B::Equal,Value::NumberRange(1.,2.),Value::Number(0.),Value::Bool(false)),
+            (B::Equal,Value::NumberRange(0.,2.),Value::Number(0.),Value::Unknown),
+            (B::LessEqual,Value::NumberRange(0.,2.),Value::Number(2.),Value::Bool(true)),
+            (B::GreaterEqual,Value::NumberRange(0.,2.),Value::Number(0.),Value::Bool(true)),
+            (B::NotEqual,Value::Number(f64::NAN),Value::Number(0.),Value::Unknown),
+        ] {assert_eq!(binary(op,a,b),expected);}
+    }
     fn prove(body:&str)->Result<f32> {
         let source=format!("struct Coefficients {{absorption:vec3<f32>,scattering:vec3<f32>,emission:vec3<f32>,phase:f32}}\nfn point(p:vec3<f32>,time:f32,base:u32,world:vec3<f32>)->Coefficients {{var m:Coefficients;{body} return m;}}");
         let module=naga::front::wgsl::parse_str(&source)?;

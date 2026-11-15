@@ -552,27 +552,7 @@ pub(crate) fn deformation(
     sets: usize,
     targets: usize,
 ) -> Result<Deform> {
-    ensure!(
-        joint_count > 0 && sets > 0 && influences.len() == source.len() * sets,
-        "invalid deformation influences"
-    );
-    for vertex in influences.chunks_mut(sets) {
-        let total: f32 = vertex.iter().flat_map(|v| v.WEIGHTS_0).sum();
-        ensure!(
-            total.is_finite() && total > 0.,
-            "skin weights require a finite positive sum"
-        );
-        for influence in vertex {
-            ensure!(
-                influence.JOINTS_0.iter().all(|j| (*j as usize) < joint_count)
-                    && influence.WEIGHTS_0.iter().all(|w| w.is_finite() && *w >= 0.),
-                "invalid skin influence"
-            );
-            for weight in &mut influence.WEIGHTS_0 {
-                *weight /= total;
-            }
-        }
-    }
+    crate::deformation::normalize(&mut influences, source.len(), sets, joint_count)?;
     ensure!(
         targets == 0 || morphs.len() == targets * source.len() * constants::MORPH_FLOATS,
         "morph delta count differs from geometry"

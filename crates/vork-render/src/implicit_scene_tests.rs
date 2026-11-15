@@ -25,8 +25,9 @@ fn implicit_scene_contract() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn implicit_solver_status_reports_node_and_remedy() -> Result<()> {
-    let Some(renderer)=crate::test_renderer()? else {return Ok(());};
+    let renderer = crate::test_renderer()?;
     let mut document=sphere_document();
     document["nodes"][0]["name"]="falling drop".into();
     document["buffers"]["status"]=serde_json::json!({"type":"u32","data":[7]});
@@ -39,7 +40,7 @@ fn implicit_solver_status_reports_node_and_remedy() -> Result<()> {
     let message=format!("{error:#}");
     for part in ["falling drop","fluid reconstruction","increase surface_grid","7"] {ensure!(message.contains(part),"{message}");}
     ensure!(!message.contains("implicit grid has"),"{message}");
-    ensure!(error.is::<crate::failure::FailureKind>(),"solver failure must remain a scene error");
+    ensure!(crate::failure::exit_code(&error)==3,"solver failure must remain a scene error");
     let error=frame.submit(&installed,&renderer,0.).unwrap_err();
     ensure!(format!("{error:#}").contains("reinstall"),"{error:#}");
     Ok(())
@@ -299,6 +300,55 @@ fn implicit_liquid_state_and_seek() -> Result<()> {
     assert_ne!(snapshots[0],snapshots[1],"liquid must advance");
     assert_eq!(&snapshots[1],snapshots.last().unwrap(),"backward seek must replay identical field bytes");
     assert!(volume_errors.iter().all(|(_,error)|*error<0.002),"visible liquid volume exceeds 0.2% physical ceiling: {volume_errors:?}");
+    Ok(())
+}
+
+#[test]
+#[ignore = "requires a real ray-query GPU and pinned Slang"]
+fn implicit_emitter_does_not_light_its_own_surface() -> Result<()> {
+    let mut renderer=Renderer::new()?;
+    // A tiny convex octahedron has no surface-to-surface light paths. Its
+    // diffuse response must not add energy to its constant unit emission.
+    let mut values=Vec::new();
+    for z in 0..5 {for y in 0..5 {for x in 0..5 {
+        let p=[x,y,z].map(|c| (c as f32-2.)*0.4);
+        values.push(p.iter().map(|v|v.abs()).sum::<f32>()-0.6);
+    }}}
+    for direct_only in [false,true] {
+    // Keep the production path render, then isolate next-event energy from
+    // later BSDF hits at the octahedron's reconstructed smooth normals.
+    renderer.reference_transport_bounces=direct_only.then_some(0);
+    for rotation in [[0.,0.,0.],[0.21,0.37,0.13]] {
+        let document=serde_json::json!({"version":2,
+            "buffers":{"field":{"type":"f32","dims":[5,5,5],"data":values}},
+            "geometry":{"source":{"topology":"implicit","attributes":{"phi":"field"}}},
+            "materials":{"source":{"inputs":{"base_color":[0.8,0.8,0.8],"specular_weight":0,
+                "emission_luminance":1,"emission_color":[1,1,1]}}},
+            "nodes":[
+                {"type":"mesh","geometry":"source","materials":["source"],
+                    "scale":[0.8,1.1,0.6],"translation":[0.1,0.2,0.3],"rotation":{"euler":rotation}},
+                {"type":"camera","name":"camera","translation":[0.1,0.2,3.3],"target":[0.1,0.2,0.3],
+                    "material":{"program":"std/camera","inputs":{"lens":50}}},
+                {"type":"light","shape":"environment","color":[0,0,0]}],
+            "render":{"camera":"camera","resolution":[24,24],"background":[0,0,0]}});
+        let mut scene=crate::test_scene(document,Path::new("."))?;
+        scene.render.settings=vork_scene::Settings::for_level(2,Default::default());
+        scene.render.settings.samples=16;
+        scene.render.settings.disable_denoiser();
+        let installed=renderer.install(scene,Path::new("."))?;
+        assert_eq!(installed.rays.as_ref().unwrap().implicit[3],1);
+        let mut frame=installed.create_frame_slot(&renderer,ReadbackPrecision::Float)?;
+        frame.submit(&installed,&renderer,0.)?;
+        let pixels=frame.collect(&renderer)?.linear_rgba.context("linear frame")?;
+        assert!(pixels.iter().flatten().all(|v|v.is_finite()),"rotation {rotation:?}");
+        let peak=pixels.iter().flat_map(|p|&p[..3]).copied().fold(0_f32,f32::max);
+        eprintln!("implicit emitter: direct_only={direct_only}, rotation={rotation:?}, peak={peak}");
+        assert!(peak>0.9,"emissive grid must be visible: {peak}, rotation {rotation:?}");
+        if direct_only {
+            assert!(peak<=1.00001,"convex emitter must not illuminate itself: {peak}, rotation {rotation:?}");
+        }
+    }
+    }
     Ok(())
 }
 
@@ -626,7 +676,7 @@ fn implicit_caster_shadows_medium_illumination() -> Result<()> {
             document["nodes"][1]["translation"]=serde_json::json!([0,0,4]);
             document["nodes"][1]["material"]["inputs"]=serde_json::json!({"projection":"ortho","ortho_scale":4,"clip_start":0.1,"clip_end":6});
             document["nodes"].as_array_mut().unwrap().extend([
-                serde_json::json!({"type":"light","shape":"environment","color":[0,0,0],"energy":0,"medium":{"program":"std/fog","inputs":{"density":0.05,"scattering":[1,1,1]}}}),
+                serde_json::json!({"type":"light","shape":"environment","color":[0,0,0],"energy":0,"medium":{"program":{"source":include_str!("../../vork-scene/tests/fixtures/medium.slang")},"inputs":{"density":0.05,"scattering":[1,1,1]}}}),
                 // Keep the point source outside the image: unresolved 1/r falloff
                 // at the image edge must not dominate this field-shadow oracle.
                 serde_json::json!({"type":"light","shape":"point","translation":[-3,0,0],"energy":100,"radius":0}),
@@ -669,8 +719,9 @@ fn fluid_fixture(kind:&str,n:u32) -> Result<serde_json::Value> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn fluid_impossible_container_reports_its_cause() -> Result<()> {
-    let Some(renderer)=crate::test_renderer()? else {return Ok(());};
+    let renderer = crate::test_renderer()?;
     let document=fluid_fixture("drop_blocked",120)?;
     let installed=renderer.install(crate::test_scene(document,Path::new("."))?,Path::new("."))?;
     let mut frame=installed.create_frame_slot(&renderer,Default::default())?;
@@ -682,8 +733,9 @@ fn fluid_impossible_container_reports_its_cause() -> Result<()> {
 }
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn fluid_zero_cell_reports_its_cause() -> Result<()> {
-    let Some(renderer)=crate::test_renderer()? else {return Ok(());};
+    let renderer = crate::test_renderer()?;
     let mut document=fluid_fixture("drop_empty",120)?;
     // A zero wall over an empty domain publishes identically-zero interior
     // cells. The library must reject them through its own receipt, even when
@@ -836,7 +888,7 @@ fn water_040_fixture() -> Result<(Scene,PathBuf)> {
 #[ignore = "requires pinned Slang and production-size fluid buffers; no GPU"]
 fn water_040_without_status_checks_on_cpu() -> Result<()> {
     let (scene,base)=water_040_fixture()?;
-    let mut renderer=pollster::block_on(Renderer::create(|_|Ok(true),true))?;
+    let mut renderer=pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
     renderer.check_only=true;
     renderer.install(scene,&base)?;
     Ok(())

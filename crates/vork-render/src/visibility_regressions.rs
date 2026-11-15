@@ -3,8 +3,9 @@ use super::*;
 mod capture_test;
 
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn hidden_world_medium_has_no_absorption_or_emission() -> Result<()> {
-    let Some(renderer) = crate::test_renderer()? else { return Ok(()); };
+    let renderer = crate::test_renderer()?;
     let base = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures");
     // Point into the dense lower exterior: constant-emission height fog diverges
     // upward. Keep the bounded volume and capture screen centered on this view.
@@ -12,7 +13,7 @@ fn hidden_world_medium_has_no_absorption_or_emission() -> Result<()> {
         eprintln!("world visibility: falloff={falloff}, capture={capture}, bounded={bounded}");
         let mut input = serde_json::json!({"version":2,
             "render":{"resolution":[8,8],"background":[0.4,0.4,0.4],"settings":{"samples":1}},
-            "materials":{"fog":{"program":"std/fog","inputs":{"density":0.5,"scattering":[0,0,0],"absorption":[1,1,1],"emission":[0.3,0,0],"height_falloff":falloff}},"camera_settings":{"program":"std/camera","inputs":{"clip_end":10}}},
+            "materials":{"fog":{"program":{"source":include_str!("../../vork-scene/tests/fixtures/medium.slang")},"inputs":{"density":0.5,"scattering":[0,0,0],"absorption":[1,1,1],"emission":[0.3,0,0],"height_falloff":falloff}},"camera_settings":{"program":"std/camera","inputs":{"clip_end":10}}},
             "nodes":[{"type":"camera","name":"cam","target":[0,-0.6,-0.8],"material":"camera_settings"},
                 {"type":"node","name":"parent","children":[{"type":"light","shape":"environment","medium":"fog","color":[0,0,0]}]}],
             "animation":[{"tracks":[{"path":["nodes","parent","visible"],"keys":[[0,false],[1,true]]}]}]
@@ -30,13 +31,20 @@ fn hidden_world_medium_has_no_absorption_or_emission() -> Result<()> {
             // Consume a whole-scene capture without a monitor surface inside
             // the medium or unsupported path subtree membership.
             input["images"] = serde_json::json!({"feed":{"render":{"camera":"cam","resolution":[8,8],"background":[0.4,0.4,0.4]}}});
-            input["render"]["compositor"] = capture_test::compositor(&mut input, "feed");
+            input["composition"]["space"] = "3d".into(); input["composition"]["compositor"] = capture_test::compositor(&mut input, "feed");
         }
         if falloff > 0. && !bounded {
-            let error = renderer.install(vork_scene::v2::from_test_value(input)?, &base)
-                .err().expect("varying world fog must require a finite domain");
+            // Certified exponential-height world fog installs and renders below.
+            // A varying world profile without that certificate (Gaussian in
+            // height here) still requires a finite domain.
+            let certified = include_str!("../../vork-scene/tests/fixtures/medium.slang");
+            let uncertified = certified.replace("exp(-inputs.height_falloff*ctx.position.y)", "exp(-inputs.height_falloff*ctx.position.y*ctx.position.y)");
+            assert_ne!(uncertified, certified, "fixture height profile changed");
+            let mut refused = input.clone();
+            refused["materials"]["fog"]["program"]["source"] = serde_json::Value::String(uncertified);
+            let error = renderer.install(vork_scene::v2::from_test_value(refused)?, &base)
+                .err().expect("uncertified varying world fog must require a finite domain");
             assert!(format!("{error:#}").contains("sampled heterogeneous world medium fog needs a finite domain"), "{error:#}");
-            continue;
         }
         let mut installed = renderer.install(vork_scene::v2::from_test_value(input.clone())?,&base)?;
         let mut frame = installed.create_frame_slot(&renderer,Default::default())?;
@@ -66,8 +74,9 @@ fn hidden_world_medium_has_no_absorption_or_emission() -> Result<()> {
 
 /// BB105: a hidden middle TLAS slot must not corrupt the later live slot on CPU.
 #[test]
+#[ignore = "requires supported GPU and pinned Slang; set VORK_GPU_TESTS=1"]
 fn hidden_geometry_matches_deleted_geometry() -> Result<()> {
-    let Some(r) = crate::test_renderer()? else { return Ok(()); };
+    let r = crate::test_renderer()?;
     let input: serde_json::Value = serde_json::from_str(include_str!("../tests/fixtures/hidden-geometry-bb105.json"))?;
     let render = |input: serde_json::Value, times: &[f32]| -> Result<Vec<Vec<[f32; 4]>>> {
         let mut scene = crate::test_scene(input, Path::new("."))?;

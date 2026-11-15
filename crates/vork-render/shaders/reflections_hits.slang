@@ -21,16 +21,16 @@ import ray_coverage;
 import surface_lighting;
 import subsurface_transport;
 // rt::reflections_hits_entries: the scene globals (frame.slang) occupy bindings 0-9.
-[[vk::binding(10,0)]] Texture2D<float4> color : register(t4);
-[[vk::binding(11,0)]] Texture2D<float4> receivers : register(t5);
-[[vk::binding(12,0)]] Texture2D<float4> normals : register(t6);
-[[vk::binding(13,0)]] Texture2D<float4> ambient : register(t7);
-[[vk::binding(14,0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> output : register(u8);
-[[vk::binding(15,0)]] RaytracingAccelerationStructure ray_scene : register(t5);
-[[vk::binding(16,0)]] StructuredBuffer<uint> ray_alpha : register(t6);
-[[vk::binding(17,0)]] StructuredBuffer<uint> sampling : register(t7);
-[[vk::binding(18,0)]] StructuredBuffer<uint> reflection_slots : register(t8);
-[[vk::binding(19,0)]] StructuredBuffer<uint> reflection_guides : register(t9);
+[[vk::binding(11,0)]] Texture2D<float4> color : register(t4);
+[[vk::binding(12,0)]] Texture2D<float4> receivers : register(t5);
+[[vk::binding(13,0)]] Texture2D<float4> normals : register(t6);
+[[vk::binding(14,0)]] Texture2D<float4> ambient : register(t7);
+[[vk::binding(15,0)]] [[vk::image_format("rgba16f")]] RWTexture2DArray<float4> output : register(u8);
+[[vk::binding(16,0)]] RaytracingAccelerationStructure ray_scene : register(t6);
+[[vk::binding(17,0)]] StructuredBuffer<uint> ray_alpha : register(t7);
+[[vk::binding(18,0)]] StructuredBuffer<uint> sampling : register(t8);
+[[vk::binding(19,0)]] StructuredBuffer<uint> reflection_slots : register(t9);
+[[vk::binding(20,0)]] StructuredBuffer<uint> reflection_guides : register(t10);
 #ifdef VORK_METAL
 struct ReflectionFields {StructuredBuffer<uint> buffers[REG_VISIBILITY_REFLECTION_WORDS];};
 [[vk::binding(1,3)]] ParameterBlock<ReflectionFields> reflection_fields : register(VORK_REFLECTION_FIELDS_REGISTER);
@@ -40,10 +40,10 @@ struct ReflectionFields {StructuredBuffer<uint> buffers[REG_VISIBILITY_REFLECTIO
 #define reflection_records reflection_fields
 #endif
 struct ReflectionDispatch {uint4 work;uint4 packet;};
-[[vk::binding(20,0)]] ConstantBuffer<ReflectionDispatch> reflection_dispatch : register(b10);
+[[vk::binding(21,0)]] ConstantBuffer<ReflectionDispatch> reflection_dispatch : register(b11);
 #define reflection_range reflection_dispatch.work
-[[vk::binding(21,0)]] RWStructuredBuffer<float4> reflection_accumulation : register(u11);
-[[vk::binding(22,0)]] StructuredBuffer<float> reflection_emitter_weights : register(t12);
+[[vk::binding(22,0)]] RWStructuredBuffer<float4> reflection_accumulation : register(u12);
+[[vk::binding(23,0)]] StructuredBuffer<float> reflection_emitter_weights : register(t13);
 // Raster geometry buffers ray hits read in place (rt::hit_record, rt::hits_layout).
 #ifdef VORK_METAL
 [[vk::binding(0,3)]] ParameterBlock<RayHitBuffersTable> ray_hit_buffers : register(VORK_HIT_REGISTER);
@@ -61,13 +61,13 @@ export TraceHit native_geometric_trace(float3 origin,float3 direction,float mini
 #endif
 
 // Sample the physical emitter and its visibility together at reflection hits.
-struct ReflectionShadows<P:IProgram> : IShadows {
+struct ReflectionShadows<V:IVariant,P:IProgram> : IShadows {
     static const bool probe_rays=true;
     static bool probe_visible(float3 world,float3 normal,float3 position_error,float3 probe) {return probe_connection_visible<P,ReflectionGeometry>(ReflectionGeometry(ray_alpha,ray_hit_buffers),ray_scene,ray_alpha,world,normal,position_error,probe);}
     static uint integration_count(uint index,out float3 normalization) {let count=index==0xffffffffu ? sample_count() : 1u;normalization=float3(float(count));return count;}
     static float3 integration_sample(uint tap,inout uint index,inout float3 world) {if(index==0xffffffffu) {index=tap;}return float3(1.);}
     static uint sample_count() {return uint(frame.temporal.y)*max(frame.sampling.w,1u);}
-    static float3 visibility_direction(float3 world,float3 normal,LightValues record,uint light,float3 direction,float distance,float3 position_error,uint index,uint count,bool fibre=false) {return hit_shadow_direction<P,ReflectionGeometry>(ReflectionGeometry(ray_alpha,ray_hit_buffers),ray_scene,ray_alpha,light,world,normal,position_error,direction,distance,index,count,false);}
+    static float3 visibility_direction(float3 world,float3 normal,LightValues record,uint light,float3 direction,float distance,float3 position_error,uint index,uint count,bool fibre=false) {return hit_shadow_direction<P,ReflectionGeometry,V>(ReflectionGeometry(ray_alpha,ray_hit_buffers),ray_scene,ray_alpha,light,world,normal,position_error,direction,distance,index,count,false);}
     static const bool subsurface=true;
     static float thickness(uint object,float3 world,float3 direction) {return subsurface_exit(ray_scene,object,world,direction);}
 };
@@ -113,7 +113,7 @@ struct SurfaceHits<V:IVariant,P:IProgram> : IReflectionTrace {
                         || (candidate.instance_custom_data==closest.object && candidate.primitive_index>=closest.primitive))) {continue;}
                 }
                 let inverse=query.CandidateWorldToObject3x4();
-                if(!reflection_candidate_accepts<P,ReflectionGeometry>(ReflectionGeometry(ray_alpha,ray_hit_buffers),ray_alpha,candidate,inverse,ray,footprint,cell,index,ReflectionShadows<P>.sample_count())) {continue;}
+                if(!reflection_candidate_accepts<P,ReflectionGeometry>(ReflectionGeometry(ray_alpha,ray_hit_buffers),ray_alpha,candidate,query.CandidateTriangleFrontFace(),inverse,ray,footprint,cell,index,ReflectionShadows<V,P>.sample_count())) {continue;}
                 closest.t=t;closest.instance=candidate.instance_index;closest.object=candidate.instance_custom_data;
                 closest.primitive=candidate.primitive_index;closest.barycentrics=candidate.barycentrics;closest.world_to_object=inverse;
                 closest_coverage=coverage;
@@ -125,12 +125,13 @@ struct SurfaceHits<V:IVariant,P:IProgram> : IReflectionTrace {
         // query may prune ties, so only the second query chooses their owner.
         DielectricHit closest={};closest.t=-1.;
         {
-            RayQuery<RAY_FLAG_NONE> query;
+            // Instance flags preserve double-sided and solid-boundary rules.
+            RayQuery<RAY_FLAG_CULL_BACK_FACING_TRIANGLES> query;
             query.TraceRayInline(ray_scene,RAY_FLAG_NONE,REG_RAY_SPECULAR,desc);
             while (query.Proceed()) {
                 if (query.CandidateType()!=CANDIDATE_NON_OPAQUE_TRIANGLE) {continue;}
                 let candidate=RayIntersection(query.CandidateInstanceIndex(),query.CandidateInstanceID(),query.CandidatePrimitiveIndex(),query.CandidateTriangleBarycentrics());
-                if (reflection_candidate_accepts<P,ReflectionGeometry>(ReflectionGeometry(ray_alpha,ray_hit_buffers),ray_alpha,candidate,query.CandidateWorldToObject3x4(),ray,footprint,cell,index,ReflectionShadows<P>.sample_count())) {query.CommitNonOpaqueTriangleHit();}
+                if (reflection_candidate_accepts<P,ReflectionGeometry>(ReflectionGeometry(ray_alpha,ray_hit_buffers),ray_alpha,candidate,query.CandidateTriangleFrontFace(),query.CandidateWorldToObject3x4(),ray,footprint,cell,index,ReflectionShadows<V,P>.sample_count())) {query.CommitNonOpaqueTriangleHit();}
             }
             if(query.CommittedStatus()==COMMITTED_TRIANGLE_HIT) {
                 closest.t=query.CommittedRayT();closest.instance=query.CommittedInstanceIndex();closest.object=query.CommittedInstanceID();
@@ -156,7 +157,7 @@ struct SurfaceHits<V:IVariant,P:IProgram> : IReflectionTrace {
                 if(closest_coverage==coverage && (candidate.instance_custom_data>closest.object
                     || (candidate.instance_custom_data==closest.object && candidate.primitive_index>=closest.primitive))) {continue;}
                 let inverse=query.CandidateWorldToObject3x4();
-                if(!reflection_candidate_accepts<P,ReflectionGeometry>(ReflectionGeometry(ray_alpha,ray_hit_buffers),ray_alpha,candidate,inverse,ray,footprint,cell,index,ReflectionShadows<P>.sample_count())) {continue;}
+                if(!reflection_candidate_accepts<P,ReflectionGeometry>(ReflectionGeometry(ray_alpha,ray_hit_buffers),ray_alpha,candidate,query.CandidateTriangleFrontFace(),inverse,ray,footprint,cell,index,ReflectionShadows<V,P>.sample_count())) {continue;}
                 closest.instance=candidate.instance_index;closest.object=candidate.instance_custom_data;
                 closest.primitive=candidate.primitive_index;closest.barycentrics=candidate.barycentrics;closest.world_to_object=inverse;
                 closest_coverage=coverage;
@@ -186,7 +187,7 @@ struct SurfaceHits<V:IVariant,P:IProgram> : IReflectionTrace {
         let builtin=material_records[objects[h.v.object].material_index].tag.x==0u;
         let light_pdf=(!closest.field && (!builtin || any(h.s.closure.emission_color*h.s.closure.emission_luminance!=float3(0.)))) ? emitter_pdf(hit,inverse,position) : 0.;
         float3 emitted;
-        let radiance=finalized_hit_radiance<V,ReflectionShadows<P>,P>(h,cell,index,REG_RAY_DIFFUSE|REG_RAY_SPECULAR,emitted);
+        let radiance=finalized_hit_radiance<V,ReflectionShadows<V,P>,P>(h,cell,index,REG_RAY_DIFFUSE|REG_RAY_SPECULAR,emitted);
         let mis=pdf/(pdf+light_pdf);
         return (source+transmission*(radiance-emitted+emitted*mis))*receiver.reflected*frame.radiance.w;
     }

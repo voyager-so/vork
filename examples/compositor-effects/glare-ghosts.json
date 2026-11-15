@@ -1,6 +1,11 @@
 {"programs":{"white_balance":{"source":"import vork; import blender.white_balance;\nstruct Inputs {\n    [InputRange(1800.0,100000.0,true,true)] float temperature=6500.;\n    [InputRange(-500.0,500.0,true,true)] float tint=10.;\n};\nfloat4 composite(CompositeContext c,Inputs i) {\n    WhiteBalanceInputs w;w.temperature=i.temperature;w.tint=i.tint;\n    float4 color=compositor_sample(c.uv);\n    return float4(white_balance(color.rgb,w),color.a);\n}\n"}},
   "version": 2,
-  "render": {
+  "composition":{"space":"3d","compositor":[
+      {"name":"glare0.original","material":{"program":{"source":"import vork; struct Inputs { Image source; }; float4 composite(CompositeContext c, Inputs i) { return compositor_load(i.source,int2(c.uv*c.size)); }"},"inputs":{"source":{"channel":"color"}}}},
+      "effect",
+      {"material":{"program":{"source":"import vork; struct Inputs { Image original; }; float4 composite(CompositeContext c, Inputs i) { return compositor_sample(i.original,c.uv)+compositor_sample(c.uv); }"},"inputs":{"original":{"step":"glare0.original"}}}},
+      {"program":"white_balance","inputs":{"temperature":6500,"tint":10}}
+    ]},"render": {
     "resolution": [
       384,
       216
@@ -11,12 +16,6 @@
       0,
       0,
       0
-    ],
-    "compositor": [
-      {"name":"glare0.original","material":{"program":{"source":"import vork; struct Inputs { Image source; }; float4 composite(CompositeContext c, Inputs i) { return compositor_load(i.source,int2(c.uv*c.size)); }"},"inputs":{"source":{"channel":"color"}}}},
-      "effect",
-      {"material":{"program":{"source":"import vork; struct Inputs { Image original; }; float4 composite(CompositeContext c, Inputs i) { return compositor_sample(i.original,c.uv)+compositor_sample(c.uv); }"},"inputs":{"original":{"node":"glare0.original"}}}},
-      {"program":"white_balance","inputs":{"temperature":6500,"tint":10}}
     ]
   },
   "nodes": [

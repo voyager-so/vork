@@ -75,6 +75,9 @@ const LAYER_UNIT: f32 = 1.;
 pub(super) fn layer_unit() -> f32 {
     LAYER_UNIT
 }
+/// Node clock defaults: local time begins at content second 0, at real-time speed.
+pub(super) fn clock_zero() -> vork_time::Clock { vork_time::Clock::from(0.) }
+pub(super) fn clock_one() -> vork_time::Clock { vork_time::Clock::from(1.) }
 
 /// Blender 5.2.1 sun full angular diameter, radians (0.526 degrees).
 pub(super) fn sun_angle() -> f32 {
@@ -91,3 +94,7 @@ pub(super) fn spot_size() -> f32 { SPOT_SIZE }
 
 /// The geometry chain default; absence preserves existing scene behavior.
 pub fn geometry_stages()->Vec<super::GeometryStage> {super::GeometryStage::DEFAULT.to_vec()}
+/// SVG 2 stroke-width initial value.
+pub(super) fn stroke_width() -> f32 { 1. }
+/// SVG 2 stroke-miterlimit initial value.
+pub(super) fn miter_limit() -> f32 { 4. }

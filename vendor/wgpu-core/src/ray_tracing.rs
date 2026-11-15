@@ -32,6 +32,8 @@ use crate::{
 
 #[derive(Clone, Debug, Error)]
 pub enum CreateBlasError {
+    #[error("AABB geometry does not support flag {0:?}")]
+    InvalidAabbFlag(wgt::AccelerationStructureFlags),
     #[error(transparent)]
     Device(#[from] DeviceError),
     #[error(transparent)]
@@ -56,6 +58,7 @@ impl WebGpuError for CreateBlasError {
             Self::Device(e) => e.webgpu_error_type(),
             Self::MissingFeatures(e) => e.webgpu_error_type(),
             Self::MissingIndexData
+            | Self::InvalidAabbFlag(..)
             | Self::InvalidVertexFormat(..)
             | Self::TooManyGeometries(..)
             | Self::TooManyPrimitives(..) => ErrorType::Validation,
@@ -88,6 +91,10 @@ impl WebGpuError for CreateTlasError {
 /// Error encountered while attempting to do a copy on a command encoder.
 #[derive(Clone, Debug, Error)]
 pub enum BuildAccelerationStructureError {
+    #[error("AABB geometry requires an 8-byte aligned offset and stride >= 24 aligned to 8 bytes")]
+    InvalidAabbLayout,
+    #[error("AABB buffer range overflows the address space")]
+    AabbRangeOverflow,
     #[error(transparent)]
     EncoderState(#[from] EncoderStateError),
 
@@ -202,6 +209,8 @@ impl WebGpuError for BuildAccelerationStructureError {
             Self::MissingBufferUsage(e) => e.webgpu_error_type(),
             Self::MissingFeatures(e) => e.webgpu_error_type(),
             Self::InsufficientBufferSize(..)
+            | Self::InvalidAabbLayout
+            | Self::AabbRangeOverflow
             | Self::UnalignedIndexBufferOffset(..)
             | Self::UnalignedTransformBufferOffset(..)
             | Self::InvalidIndexCount(..)
@@ -273,7 +282,41 @@ pub struct BlasTriangleGeometry<'a> {
 }
 
 pub enum BlasGeometries<'a> {
+    AabbGeometries(Box<dyn Iterator<Item = BlasAabbGeometry<'a>> + 'a>),
     TriangleGeometries(Box<dyn Iterator<Item = BlasTriangleGeometry<'a>> + 'a>),
+}
+
+pub struct BlasAabbGeometry<'a> {
+    pub size: &'a wgt::BlasAabbGeometrySizeDescriptor,
+    pub buffer: BufferId,
+    pub offset: BufferAddress,
+    pub stride: BufferAddress,
+}
+
+/// Checked range of six-float AABBs. HAL currently uses a u32 byte offset.
+pub(crate) fn aabb_buffer_end(offset: u64, stride: u64, count: u32) -> Result<u64, BuildAccelerationStructureError> {
+    if offset % 8 != 0 || offset > u64::from(u32::MAX) || stride < 24 || stride % 8 != 0 {
+        return Err(BuildAccelerationStructureError::InvalidAabbLayout);
+    }
+    if count == 0 { return Ok(offset); }
+    u64::from(count - 1).checked_mul(stride)
+        .and_then(|n| n.checked_add(24)).and_then(|n| offset.checked_add(n))
+        .ok_or(BuildAccelerationStructureError::AabbRangeOverflow)
+}
+
+#[cfg(test)]
+mod aabb_tests {
+    use super::*;
+    #[test]
+    fn ranges_include_last_box_without_requiring_trailing_padding() {
+        assert_eq!(aabb_buffer_end(8,32,2).unwrap(),64);
+        assert_eq!(aabb_buffer_end(8,24,0).unwrap(),8);
+        assert!(aabb_buffer_end(4,24,1).is_err());
+        assert!(aabb_buffer_end(0,20,1).is_err());
+        assert!(aabb_buffer_end(0,28,1).is_err());
+        assert!(aabb_buffer_end(1u64<<32,24,1).is_err());
+        assert!(aabb_buffer_end(0,u64::MAX-7,2).is_err());
+    }
 }
 
 pub struct BlasBuildEntry<'a> {
@@ -307,7 +350,15 @@ pub struct TlasPackage<'a> {
 pub(crate) struct TlasBuild {
     pub tlas: Arc<Tlas>,
     pub dependencies: Vec<Arc<Blas>>,
-    pub refit: Option<(Option<core::num::NonZeroU64>, u32)>,
+    pub refit: Option<TlasRefit>,
+}
+
+/// A `PreferUpdate` TLAS build: the instance count it leaves, and whether it
+/// was recorded as a native UPDATE of the build preceding it in queue order.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TlasRefit {
+    pub update: bool,
+    pub count: u32,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -370,7 +421,8 @@ pub(crate) struct SubmittedBlasRefit {
 pub(crate) struct BlasRefitBuild {
     pub blas: Arc<Blas>,
     pub geometries: Vec<ArcBlasTriangleGeometry>,
-    pub source: Option<core::num::NonZeroU64>,
+    /// Recorded as a native UPDATE of the build preceding it in queue order.
+    pub update: bool,
 }
 
 pub(crate) fn refit_compatible(a: &[ArcBlasTriangleGeometry], b: &[ArcBlasTriangleGeometry]) -> bool {
@@ -393,7 +445,17 @@ pub type TraceBlasTriangleGeometry = OwnedBlasTriangleGeometry<IdReferences>;
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", apply(serde_object_reference_struct))]
 pub enum OwnedBlasGeometries<R: ReferenceType> {
+    AabbGeometries(Vec<OwnedBlasAabbGeometry<R>>),
     TriangleGeometries(Vec<OwnedBlasTriangleGeometry<R>>),
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", apply(serde_object_reference_struct))]
+pub struct OwnedBlasAabbGeometry<R: ReferenceType> {
+    pub size: wgt::BlasAabbGeometrySizeDescriptor,
+    pub buffer: R::Buffer,
+    pub offset: BufferAddress,
+    pub stride: BufferAddress,
 }
 
 pub type ArcBlasGeometries = OwnedBlasGeometries<ArcReferences>;

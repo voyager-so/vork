@@ -109,7 +109,7 @@ def display_source(program, *, curves=None, white_balance=None):
         helpers += wb.replace('WhiteBalanceInputs', 'BlenderWhiteBalanceInputs')
         temperature, tint = white_balance
         operations += f'    BlenderWhiteBalanceInputs wb; wb.temperature = {float(temperature)!r}; wb.tint = {float(tint)!r};\n    ctx.color = white_balance(ctx.color, wb);\n'
-    entry = 'public float3 display(DisplayContext ctx, Inputs inputs) {'
+    entry = 'public ViewResult view(ViewContext ctx, Inputs inputs) {'
     if source.count(entry) != 1:
         raise ValueError(f'{program}: bundled display entry changed')
     return helpers + source.replace(entry, entry + '\n' + operations)

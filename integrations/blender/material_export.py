@@ -52,12 +52,9 @@ class MaterialWriter:
         if curve_lookups and not best_effort:
             raise ValueError('curve lookup baking requires best_effort=True')
         self.best_effort = best_effort
-        self.transmission_omission = None
-        self.subsurface_omission = None
         self.curve_lookups = curve_lookups
         self.curve_images = {}
         self.reports = {}
-        self.source_variants = {}
         self.asset_reports = []
         self.directory = Path(directory)
         self.directory.mkdir(parents=True, exist_ok=True)
@@ -237,23 +234,12 @@ class MaterialWriter:
                            bake_object=bake_object, bake_resolution=bake_resolution,
                            available_attributes=available_attributes)
 
-    def restrict_transport(self, *, transmission=None, subsurface=None):
-        """Re-lower the bound variants in place for a known transport limitation."""
-        self.transmission_omission = transmission
-        self.subsurface_omission = subsurface
-        for key, receipt in list(self.reports.items()):
-            if receipt.get('medium'):
-                continue
-            self._write(key,**self.source_variants[key])
-            self.reports[key] = receipt | self.reports[key]
-
     def _write(self, key, material, *, bake_object=None, bake_resolution=None, available_attributes=None):
-        self.source_variants[key] = dict(material=material,bake_object=bake_object,
-                                         bake_resolution=bake_resolution,available_attributes=available_attributes)
         engine = bpy.context.scene.render.engine
         target = 'CYCLES' if engine == 'CYCLES' else 'EEVEE'
         output = material.node_tree.get_output_node(target) if material.use_nodes else None
-        if output is not None and output.inputs['Volume'].is_linked:
+        from .volume import empty_volume
+        if output is not None and not empty_volume(output.inputs['Volume']):
             if output.inputs['Surface'].is_linked or output.inputs['Displacement'].is_linked:
                 raise UnsupportedMaterial(
                     f'{material.name}: mixed surface/displacement and Volume export not supported; '
@@ -294,8 +280,7 @@ class MaterialWriter:
                 baked[pointer] = encoded
             return baked[pointer]
         compiler = Compiler(material, self.image, engine=bpy.context.scene.render.engine,
-                            best_effort=self.best_effort, transmission_omission=self.transmission_omission,
-                            subsurface_omission=self.subsurface_omission,
+                            best_effort=self.best_effort,
                             bake_input=bake if bake_object is not None else None,
                             curve_input=self.curve_image if self.curve_lookups else None,
                             available_attributes=available_attributes)
