@@ -50,6 +50,11 @@ Dense imported transmitting geometry has not been qualified on Metal. Large scen
 with dense transparency can lose the device in final even at small resolutions;
 try path and test the full shot before committing to a batch.
 
+Startup BRDF lookup generation uses bounded row submissions on Metal, retaining
+the full lookup resolution and integration sample counts. This bounds the
+scene-independent startup workload; lowering scene resolution does not reduce
+that workload.
+
 A scene that draws meshes or imported models can bind a limited number of distinct
 attribute names across all its materials. Apple Silicon Metal fits 17. On Vulkan the
 device's vertex-input and inter-stage limits decide; the refusal states the device's
