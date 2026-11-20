@@ -49,9 +49,10 @@ with no world, view or compositor shows authored colours as they are and reports
 a linear canvas, or a Display P3 canvas shown as sRGB, passes its view and reports one.
 
 Setup separates required checks from optional shader warming. Required stage
-errors/timeouts fail; only the default shader-warmup deadline can end successfully
-with compilation deferred. Use setup --skip-warmup for checks or setup --all for
-unbounded shader warming; completed device-local cache entries survive reruns.
+errors/timeouts fail; the default shader-warmup deadline or an interrupted warmup
+(a driver crash, say) can end successfully with compilation deferred. Use
+setup --skip-warmup for checks or setup --all for unbounded shader warming;
+completed device-local cache entries survive reruns.
 
 Progress on stderr reports frames delivered and sample passes recorded within a frame.
 Recorded passes are CPU preparation. GPU completion counts advance at existing

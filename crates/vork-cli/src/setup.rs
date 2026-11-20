@@ -34,8 +34,20 @@ pub fn bounded(all: bool, skip_warmup: bool, verbose: bool, gpu: Option<vork_ren
         Ok(None)
     })();
     drop(file);
+    // The worker records its stage before each phase. A non-zero exit while the
+    // stage is WARMING means the required checks finished and only the optional
+    // shader warmup failed. Warmup is cache preparation, not a rendering
+    // prerequisite ("Without setup, nothing breaks"), so a driver crash there
+    // must not turn a working install into a failed `setup` and a failing
+    // installer. Report it, keep the completed cache entries, and let rendering
+    // compile the remaining pipelines on demand.
+    let stage = std::fs::read_to_string(&path).unwrap_or_default();
     let _ = std::fs::remove_file(path);
     if let Some(status) = result? {
+        if stage.trim() == WARMING {
+            output!("Shader warmup did not complete ({status}); completed cache entries are retained. Rendering will compile pipelines on demand. Run `vork setup` again to continue.");
+            return Ok(());
+        }
         // Preserve the worker’s diagnostic and typed CLI failure code.
         std::process::exit(status.code().unwrap_or(1));
     }
