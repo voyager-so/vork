@@ -105,9 +105,19 @@ else
     fi
     fetch "$archive"
 fi
+# Run as root, tar gives extracted files the owner recorded in the archive, which fails where that
+# chown is denied (rootless containers and other user namespaces). Keep the installing user as owner.
+# GNU tar, bsdtar and busybox take --no-same-owner; -o is the short form busybox builds without long
+# options take. Try each on an empty archive (one zero block); a tar that takes neither extracts as before.
+owner_flag=''
+for flag in --no-same-owner -o; do
+    if dd if=/dev/zero bs=1024 count=1 2>/dev/null | tar -x "$flag" -f - 2>/dev/null; then owner_flag=$flag; break; fi
+done
 # List or extract the verified archive ($1 is t or x; further arguments go to tar).
 unpack() {
     mode=$1; shift
+    # Only extraction takes the owner flag; bsdtar refuses -o when listing.
+    if [ "$mode" = x ] && [ -n "$owner_flag" ]; then set -- "$owner_flag" "$@"; fi
     case "$archive" in
         *.tar.gz) tar "-${mode}zf" "$work/$archive" "$@" ;;
         *) if [ "$unxz" = xz ]; then xz -dc "$work/$archive" | tar "-${mode}f" - "$@"
@@ -135,9 +145,9 @@ prefix=$(cd "$prefix" && pwd -P)
 # do not survive an upgrade, and a failed install leaves the old one working.
 stage=$(mktemp -d "$prefix/lib/.vork-new.XXXXXX")
 if ! unpack x -C "$stage" 2>"$work/extract.log"; then
-    echo "Could not extract vork into $stage; the existing install was not changed." >&2
-    echo "Check free space and write permissions on $prefix (the expanded release must fit beside the existing install). The downloaded archive also occupies space in $work." >&2
+    echo "Could not extract vork into $stage; the existing install was not changed. The extractor reported:" >&2
     head -n 8 "$work/extract.log" >&2
+    echo "If that does not name the cause, it may be too little free space on $prefix (the expanded release must fit beside the existing install; the download also occupies $work) or no write permission there." >&2
     exit 1
 fi
 chmod 755 "$stage"

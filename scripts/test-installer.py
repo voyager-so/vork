@@ -338,6 +338,36 @@ class InstallerTests(unittest.TestCase):
         self.assertEqual((self.root / 'prefix/lib/vork/NOTICE').read_bytes(), notice)
         self.assertEqual([p.name for p in (self.root / 'prefix/lib').iterdir()], ['vork'])
 
+    def tar_calls(self, refuse=()):
+        # A tar that records its arguments and refuses the given flags, like a tar that lacks them.
+        tools = self.root / 'tools'; tools.mkdir()
+        log = self.root / 'tar-calls'
+        checks = ''.join(f'[ "$a" = {flag} ] && exit 2; ' for flag in refuse)
+        write_executable(tools / 'tar', '#!/bin/sh\nprintf "%s\\n" "$*" >> "' + str(log) + '"\nfor a in "$@"; do ' +
+                         (checks or ':; ') + 'done\nexec "' + shutil.which('tar') + '" "$@"\n')
+        self.env['PATH'] = str(tools) + os.pathsep + os.environ['PATH']
+        result = self.run_installer()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        calls = log.read_text().splitlines()
+        extract = [c for c in calls if c.startswith('-xzf')]
+        listing = [c for c in calls if c.startswith('-tzf')]
+        self.assertEqual((len(extract), len(listing)), (1, 1), calls)
+        return extract[0].split(), listing[0].split()
+
+    def test_extraction_keeps_the_installing_user_as_owner(self):
+        extract, listing = self.tar_calls()
+        self.assertIn('--no-same-owner', extract)
+        self.assertNotIn('--no-same-owner', listing)
+
+    def test_owner_flag_falls_back_to_the_short_form_then_to_none(self):
+        extract, listing = self.tar_calls(refuse=('--no-same-owner',))
+        self.assertIn('-o', extract)
+        self.assertNotIn('-o', listing)
+        shutil.rmtree(self.root / 'tools'); (self.root / 'tar-calls').unlink()
+        extract, _ = self.tar_calls(refuse=('--no-same-owner', '-o'))
+        self.assertFalse({'--no-same-owner', '-o'} & set(extract), extract)
+        self.assertTrue((self.root / 'prefix/lib/vork/NOTICE').exists())
+
     def test_failed_publication_restores_previous_tree(self):
         self.assertEqual(self.run_installer().returncode, 0)
         tools = self.root / 'tools'; tools.mkdir()
