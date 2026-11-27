@@ -398,57 +398,25 @@ fn layouts(d: &wgpu::Device, adaptive: bool, material: &wgpu::BindGroupLayout) -
 }
 
 /// The identity of one prebuilt engine family's driver pipeline over the material
-/// table's shared capacity. It is the key an install of that family remembers
-/// (CachedPipelines::kernel_content_key), so a family created by either is warm
-/// to both. The ledger belongs to this build, driver and GPU (disk_cache::Store).
+/// table's shared capacity. An install names the same family through
+/// `CachedPipelines::kernel_content_key`, so a pipeline published by a render is
+/// found warm by later renders. Setup deliberately does not create these
+/// pipelines itself: `create_engines()` used to eagerly build all four families
+/// to populate the driver cache, which submits every shipped superset module on
+/// every setup even though a render only ever needs the kernel its own scene
+/// selects. On some NVIDIA driver compilers one of them (`path_engine_1_1`,
+/// adaptive sampling with one dielectric boundary) faults inside
+/// `nvgpucomp64.dll` while creating the compute pipeline. Warming now stays with
+/// the starter install (`std_warm::warm_startup`), which uses the render's
+/// install/specialization route and compiles only the kernel it draws. The test
+/// below keeps the family/key equality explicit.
+#[cfg(test)]
 fn engine_pipeline_key(r: &Renderer, family: crate::surface_native::PathEngine, shader: &crate::native::Compiled) -> blake3::Hash {
     crate::pipelines::compute_pipeline_key(shader.input_key(r.adapter_info.backend == wgpu::Backend::Metal),
         &crate::pipelines::path_groups(layout_entries(family.adaptive), crate::pipelines::material_entries(true),
             crate::rt::hit_buffers_entry(0, wgpu::ShaderStages::COMPUTE)))
 }
 
-type ColdEngine = (crate::surface_native::PathEngine, &'static crate::native::Compiled, blake3::Hash);
-
-/// The prebuilt engine families whose driver pipeline this device's persistent
-/// cache does not hold. None where no later process could reuse one, or where
-/// path transport cannot run.
-fn cold_engines(r: &Renderer) -> Vec<ColdEngine> {
-    if r.release_preparation || (r.cache.is_none() && r.adapter_info.backend != wgpu::Backend::Metal)
-        || !r.device.features().contains(wgpu::Features::EXPERIMENTAL_RAY_QUERY | crate::rt::HIT_BUFFER_FEATURES) {
-        return Vec::new();
-    }
-    crate::native::PATH_ENGINES.iter()
-        .map(|&(family, shader)| (family, shader, engine_pipeline_key(r, family, shader)))
-        .filter(|(_, _, key)| !r.compiler.is_known(key)).collect()
-}
-
-/// Create these families' driver pipelines, all at once, each exactly as an
-/// install creates it, through the persistent pipeline cache (a Metal binary
-/// archive on macOS). Only explicit setup warms unrelated families.
-fn create_engines(d: &wgpu::Device, compiler: &crate::pipelines::Compiler, cold: &[ColdEngine]) {
-    if cold.is_empty() { return; }
-    let material = d.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-        label: Some("material"), entries: &crate::pipelines::material_entries(true) });
-    std::thread::scope(|scope| {
-        let jobs: Vec<_> = cold.iter().map(|&(family, shader, key)| {
-            let material = &material;
-            scope.spawn(move || {
-                let (_, layout) = layouts(d, family.adaptive, material);
-                let module = crate::native::shader_module(d, shader);
-                drop(compiler.compute_entry(&layout, &module, shader.entry, "unidirectional path"));
-                compiler.remember(key);
-            })
-        }).collect();
-        jobs.into_iter().for_each(crate::pipelines::join);
-    });
-}
-
-/// `vork setup`: every engine family is in the cache before any scene exists, so
-/// the first path render of a scene the engine draws starts from it.
-pub(crate) fn warm_engines(r: &Renderer) -> Result<()> {
-    create_engines(&r.device, &r.compiler, &cold_engines(r));
-    r.errors.check()
-}
 
 pub(crate) struct Pipeline {
     volume_bounces: u32,
@@ -726,16 +694,15 @@ pub(crate) fn record(
 #[cfg(test)]
 mod tests {
     #[test]
-    fn engine_warming_names_each_family_and_creates_nothing_it_cannot_persist() -> Result<()> {
+    fn install_names_each_prebuilt_family_by_one_key() -> Result<()> {
         // Release preparation runs on the no-op device: no driver cache to fill.
         let r = pollster::block_on(Renderer::create(crate::DeviceNeeds::ALL, true))?;
-        warm_engines(&r)?;
-        assert_eq!(r.compiler.created(), 0);
         let keys: std::collections::HashSet<_> = crate::native::PATH_ENGINES.iter()
             .map(|&(family, shader)| engine_pipeline_key(&r, family, shader)).collect();
         assert_eq!(keys.len(), crate::native::PATH_ENGINES.len(), "each family is its own driver pipeline");
-        // Warming and installation name one pipeline by one key: what either
-        // remembers, the other finds warm.
+        // An install and the ledger name one pipeline by one key: what a render
+        // publishes, a later render finds warm. Setup no longer has a separate
+        // path that creates these superset modules.
         let scene = crate::slang_forward::SlangScene { no_points: true,
             camera: Some(std::sync::Arc::new(crate::camera_program::Native { standard_camera: true, ..Default::default() })),
             ..Default::default() };

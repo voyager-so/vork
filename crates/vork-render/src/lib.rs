@@ -593,28 +593,19 @@ impl Renderer {
     pub fn warm_shaders(&self) -> Result<()> {
         pipelines::warm_builtin(self)?;
         passes::decoupled::warm_shaders(self);
-        self.warm_path_engines()?;
         std_warm::warm(self)?;
         // A release's shaders say nothing of the FFmpeg on the machine that prepared them.
         if !self.release_preparation { ffmpeg_cache::warm(); }
         self.finish_shader_warmup()
     }
 
-    /// Warm the init starter at the default render profile and the prebuilt path
-    /// engine, which is the same few pipelines for every scene. Other scenes and
-    /// profiles compile on demand, or through exhaustive setup.
+    /// Warm the init starter at the default render profile. Path transport is
+    /// warmed by that install through the same specialization path a render uses;
+    /// other scenes and profiles compile on demand, or through exhaustive setup.
     pub fn warm_startup_shaders(&self) -> Result<()> {
-        self.warm_path_engines()?;
         std_warm::warm_startup(self, pipelines::VariantCompile::Fallback)?;
         ffmpeg_cache::warm();
         self.finish_shader_warmup()
-    }
-
-    /// The prebuilt path engine's driver pipelines, so the first path render of
-    /// any scene the engine draws finds them in this driver and GPU's cache.
-    fn warm_path_engines(&self) -> Result<()> {
-        vork_slang::progress::phase("Setup: warming the prebuilt path engine", 0);
-        passes::path::warm_engines(self)
     }
 
     fn finish_shader_warmup(&self) -> Result<()> {
